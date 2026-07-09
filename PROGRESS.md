@@ -101,3 +101,100 @@ was a documentation/traceability fix only.
   push these doc fixes (I can't push to GitHub myself — no credentials for
   `johnchk250/Conduit`; let me know if you want a token added, or I can hand
   you a patch/diff instead).
+
+---
+
+## 2026-07-10 (new task) — Ad-hoc send UI bug: targeted fix
+
+**User report:** ad-hoc "Send to Conduit" is erratic — when Conduit's window
+is already open, the send UI sometimes doesn't open at all, or opens but the
+send never starts. Framed as: prior multi-window fix (Phase 3d single-
+instance guarantee) didn't fully resolve window/UI integration. Scope for
+this task: fix *only* this, nothing else.
+
+**Plan:**
+1. ☑ Re-clone repo fresh, re-orient (new session/container; previous
+   session's local commits didn't persist — expected, no push credentials).
+2. ☑ Trace the whole ad-hoc-send path end to end: `windows/runner/main.cpp`
+   (single-instance + WM_COPYDATA) → `flutter_window.cpp` (method channel
+   forwarding) → `app_state.dart` (`_onIncomingSharedFiles`, `sendWidgetMode`)
+   → `dashboard_screen.dart` (routing) → `send_widget_screen.dart` (window
+   geometry) → `send_flow_view.dart` (shared send engine/UI) → `tray.dart`
+   (bounds suppression).
+3. ☑ Root-caused two concrete bugs (below), both inside the send-widget
+   integration layer specifically — native single-instance/WM_COPYDATA
+   plumbing checks out correctly.
+4. ☐ Apply targeted fixes, updating this file at each checkpoint.
+5. ☐ Report back; flag the no-Flutter-SDK verification caveat again.
+
+### Bug 1 (primary): `notifyListeners()` fired mid-build/mid-mount
+
+`SendFlowView.didChangeDependencies()` (`lib/src/ui/send_flow_view.dart`)
+snapshots `AppState.pendingSharedFiles` into local fields — correct — but
+then calls `state.clearPendingSharedFiles()` synchronously, which calls
+`notifyListeners()`. `didChangeDependencies` runs while a widget is being
+*mounted*, and for both send-UI hosts (`SendWidgetScreen` **and** the
+full-shell `SendPanel`) that mount happens **inside** an ancestor's own
+`build()` call (`DashboardScreen.build()`, either directly returning
+`SendWidgetScreen`, or via the `_index = 3` tab switch for `SendPanel`).
+Notifying the very `ChangeNotifier` an ancestor is currently watching, from
+inside that ancestor's build, is the textbook "setState()/markNeedsBuild()
+called during build" hazard — depending on framework/provider timing this
+either throws (the send UI fails to render — "doesn't open") or the
+resulting rebuild gets dropped/coalesced (the UI opens but nothing reacts
+to the state change — "send doesn't start"). This matches the erratic,
+timing-dependent symptoms reported, and it hits the send widget's *first*
+mount — the common case, not an edge case — matching "not thorough," not
+"occasionally flaky."
+
+The code already knew the general shape of this problem — the second
+pickup site in `build()` (for files arriving while already mounted) is
+correctly deferred via `addPostFrameCallback` before touching AppState —
+just not the first one (initial mount), which is the path a fresh
+"Send to Conduit" trigger actually takes.
+
+**Fix:** `didChangeDependencies()` still snapshots synchronously (so the
+first `build()` already has the files, no visible delay), but the
+`AppState.clearPendingSharedFiles()` call is deferred to a post-frame
+callback — same safe pattern already used elsewhere in this file. Added an
+`!identical(...)` guard on the second (build-time) pickup site so it
+doesn't redundantly re-schedule a second clear for the same list on the
+same frame — harmless before, just tidier now.
+
+### Bug 2: stale window-close cleanup can race a fresh reopen
+
+`SendWidgetScreen._close()` (`lib/src/ui/send_widget_screen.dart`) fires
+`windowManager.setAlwaysOnTop(false)` and `DesktopTray.restoreNormalBounds()`
+*unawaited* (deliberately, so a window-manager stall can't hang the close),
+then immediately calls `AppState.exitSendWidgetMode()`. If a new "Send to
+Conduit" arrives while that fire-and-forget cleanup is still in flight (two
+files sent back-to-back, or one send auto-closing right as a second is
+triggered), a brand-new `SendWidgetScreen` mounts and starts its own
+resize/always-on-top/focus sequence — racing the old instance's stale
+restore. Whichever finishes last wins, so depending on timing the window
+can end up back at full size, not focused, or not on top right after the
+new send widget opens — technically there, but the user doesn't see it
+("doesn't open"), or sees it briefly then it visually reverts.
+
+**Fix:** added a small monotonic "epoch" counter (`tray.dart`, alongside
+the existing `suppressWindowBoundsPersistence` flag it already exports).
+Each `SendWidgetScreen` mount claims the next epoch in `initState`
+(synchronous, so ordering is deterministic even across rapid mounts). Its
+`_close()` cleanup captures the epoch it's closing for and re-checks it's
+still current before applying `setAlwaysOnTop(false)`/restoring bounds — if
+a newer send-widget session has started since, the stale cleanup is a no-op
+and leaves the new session's geometry alone. `_enterWidgetGeometry()` also
+bails early if superseded, for the (rarer) reverse race.
+
+**Not touched (out of scope for this fix):** native WM_COPYDATA/single-
+instance code (`main.cpp`, `flutter_window.cpp`) — traced carefully, found
+correct; throughput/pipelining code from the prior session's review;
+anything on the `desktop_multi_window` follow-up mentioned in the Phase 4
+doc (still a legitimate future improvement, not this bug).
+
+**Verification caveat (same as every session so far):** no Flutter/Dart SDK
+in this sandbox and no network path to fetch one, so this is a careful
+manual review — signatures, call sites, control flow, Flutter/provider
+framework semantics cross-checked against current documentation/known-issue
+reports — not a `flutter analyze`/`flutter test` run. Please run
+`_run_analyze.bat` and `_run_test.bat` before shipping.
