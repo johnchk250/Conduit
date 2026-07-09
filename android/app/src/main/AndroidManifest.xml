@@ -1,0 +1,111 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- LAN networking -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+
+    <!-- Foreground sync service (keeps sync alive in background) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <!-- Wake lock so sync can finish during doze -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <!-- Phase 1 background survival: prompt the user to ignore battery
+         optimizations for Conduit (the stock-Android whitelist path; OEM
+         ROMs still need their own autostart/battery settings). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+
+    <!-- Phase 1 background survival: restart the foreground service after a
+         reboot, so a phone that was powered off resumes syncing on its own. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+
+    <!-- NOTE: no SCHEDULE_EXACT_ALARM / USE_EXACT_ALARM declared. onTaskRemoved
+         uses AlarmManager.set(ELAPSED_REALTIME, ...) which is an inexact alarm
+         and requires neither permission on any API level. Declaring them would
+         be dead permissions (and SCHEDULE_EXACT_ALARM needs user grant on
+         Android 12+). -->
+
+    <!-- Optional: all-files access is NOT requested. We use SAF document trees. -->
+
+    <application
+        android:label="Conduit"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:documentLaunchMode="never"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+
+            <!-- Phase 3d: appear in the Android share sheet for any single file -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="*/*"/>
+            </intent-filter>
+
+            <!-- Phase 3d: appear in the share sheet for multi-file selections -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="*/*"/>
+            </intent-filter>
+        </activity>
+
+        <!-- Foreground sync service -->
+        <service
+            android:name=".SyncService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false"/>
+
+        <!-- Phase 1 background survival: restart the service after boot. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- Phase 1 background survival (audit Issue #8): watchdog receiver
+             fired by the repeating inexact alarm armed in
+             SyncService.scheduleWatchdog. Relaunches the foreground service if
+             it was killed after the one-shot onTaskRemoved restart (OOM, OEM
+             killer, or the Android 14+ 6h dataSync cap). Not exported — only
+             the system AlarmManager delivers to it. -->
+        <receiver
+            android:name=".RestartReceiver"
+            android:enabled="true"
+            android:exported="false"/>
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>

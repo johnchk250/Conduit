@@ -1,0 +1,52 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace = "com.conduit.conduit"
+    // Plugins require SDK 35. The android-35 core-for-system-modules.jar
+    // jlink transform only fails under JDK 21; we build with JDK 17 (see
+    // `flutter config --jdk-dir`), where it transforms cleanly.
+    compileSdk = 35
+    ndkVersion = flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        applicationId = "com.conduit.conduit"
+        // minSdk 21+ for SAF document trees; 26+ for foreground service channels.
+        minSdk = 24
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+
+    buildTypes {
+        release {
+            // TODO: Add your own signing config for the release build.
+            // Signing with the debug keys for now, so `flutter run --release` works.
+            signingConfig = signingConfigs.debug
+        }
+    }
+}
+
+flutter {
+    source = "../.."
+}
+
+dependencies {
+    // Storage Access Framework helpers (DocumentFile tree access)
+    implementation "androidx.documentfile:documentfile:1.0.1"
+    // Core KTX for NotificationCompat etc.
+    implementation "androidx.core:core-ktx:1.13.1"
+}
