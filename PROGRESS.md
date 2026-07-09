@@ -124,8 +124,8 @@ this task: fix *only* this, nothing else.
 3. ☑ Root-caused two concrete bugs (below), both inside the send-widget
    integration layer specifically — native single-instance/WM_COPYDATA
    plumbing checks out correctly.
-4. ☐ Apply targeted fixes, updating this file at each checkpoint.
-5. ☐ Report back; flag the no-Flutter-SDK verification caveat again.
+4. ☑ Applied targeted fixes (see below).
+5. ☑ Report back; flag the no-Flutter-SDK verification caveat again.
 
 ### Bug 1 (primary): `notifyListeners()` fired mid-build/mid-mount
 
@@ -192,9 +192,53 @@ correct; throughput/pipelining code from the prior session's review;
 anything on the `desktop_multi_window` follow-up mentioned in the Phase 4
 doc (still a legitimate future improvement, not this bug).
 
+## Checkpoint — fixes applied
+
+**Diff applied (4 files):**
+- `lib/src/ui/send_flow_view.dart` — `didChangeDependencies()` no longer
+  calls `AppState.clearPendingSharedFiles()` synchronously (Bug 1's fix);
+  the build()-time pickup gained an `!identical(...)` guard so it doesn't
+  redundantly re-schedule for the same snapshot.
+- `lib/src/desktop/tray.dart` — new `sendWidgetEpoch` counter +
+  `beginSendWidgetEpoch()` / `isCurrentSendWidgetEpoch()` helpers, exported
+  alongside the existing `suppressWindowBoundsPersistence` flag.
+- `lib/src/ui/send_widget_screen.dart` — claims an epoch in `initState`;
+  `_enterWidgetGeometry()` and `_close()` both re-check it before applying
+  window-manager calls (Bug 2's fix).
+- `PROGRESS.md` — this log.
+
+**Sanity checks performed (no Flutter SDK available, see caveat below):**
+- Re-read every touched function in full after editing, in place, to
+  re-verify control flow (not just diffed the change in isolation).
+- Bracket/paren/brace balance check on all 3 touched Dart files — balanced.
+- Grepped the whole tree for every symbol touched
+  (`clearPendingSharedFiles`, `pendingSharedFiles`, `SendFlowView`,
+  `SendWidgetScreen`, `sendWidgetEpoch`) to confirm no other call site
+  needed a matching update, and confirmed `SendPanel` (the full-shell "Send"
+  tab, the other `SendFlowView` host) benefits from the Bug 1 fix
+  automatically since it shares the exact same widget.
+- Confirmed the general Flutter hazard behind Bug 1 (`notifyListeners()` /
+  `markNeedsBuild()` fired on a ChangeNotifier an ancestor is mid-build on)
+  is a real, documented class of bug via a web search cross-check, not just
+  an assumption from memory.
+
 **Verification caveat (same as every session so far):** no Flutter/Dart SDK
 in this sandbox and no network path to fetch one, so this is a careful
 manual review — signatures, call sites, control flow, Flutter/provider
 framework semantics cross-checked against current documentation/known-issue
-reports — not a `flutter analyze`/`flutter test` run. Please run
-`_run_analyze.bat` and `_run_test.bat` before shipping.
+reports — not a `flutter analyze`/`flutter test` run. **Please run
+`_run_analyze.bat` and `_run_test.bat` before shipping.** No existing test
+in `test/` covers this UI flow (the one `flutter_test`-based file,
+`widget_test.dart`, is a first-frame-only smoke test that avoids
+`AppState.start()` because it touches real sockets/platform channels) — a
+widget test that pre-populates `AppState.pendingSharedFiles` and mounts
+`SendFlowView` under a `ChangeNotifierProvider` to assert no exception is
+thrown during mount would directly cover Bug 1's fix, but building one
+would need a real `AppState` instance (its constructor pulls in
+identity/config/fs/engine dependencies) and I can't run it to confirm it's
+correct — flagging as a good next step rather than guessing blind.
+
+**Status: fix complete, not pushed** (no GitHub credentials for
+`johnchk250/Conduit` in this session — same limitation as before). Local
+commit made after this checkpoint; happy to produce a patch/diff file
+instead if that's easier to apply on your end.

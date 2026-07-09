@@ -38,9 +38,17 @@ class _SendWidgetScreenState extends State<SendWidgetScreen> {
 
   bool _closing = false;
 
+  // Bug fix: claimed synchronously in initState (see tray.dart's
+  // sendWidgetEpoch doc comment) so this session can tell whether it's still
+  // the current one before applying each step of its open/close geometry
+  // sequence — guards against racing a previous session's still-in-flight
+  // close, or a newer session that supersedes this one mid-open.
+  late final int _epoch;
+
   @override
   void initState() {
     super.initState();
+    _epoch = beginSendWidgetEpoch();
     WidgetsBinding.instance
         .addPostFrameCallback((_) => _enterWidgetGeometry());
   }
@@ -48,6 +56,7 @@ class _SendWidgetScreenState extends State<SendWidgetScreen> {
   Future<void> _enterWidgetGeometry() async {
     try {
       await windowManager.ensureInitialized();
+      if (!isCurrentSendWidgetEpoch(_epoch)) return;
       // Set BEFORE resizing: the resize below is exactly the kind of
       // programmatic move _CloseHandler (desktop/tray.dart) must not mistake
       // for the user dragging/resizing their normal window.
@@ -57,6 +66,7 @@ class _SendWidgetScreenState extends State<SendWidgetScreen> {
         size: const Size(_popupWidth, _popupHeight),
         animate: true,
       );
+      if (!isCurrentSendWidgetEpoch(_epoch)) return;
       await windowManager.center();
       // A small utility popup that loses itself behind other windows would
       // defeat the point of a quick "send this file" action.
@@ -77,13 +87,28 @@ class _SendWidgetScreenState extends State<SendWidgetScreen> {
   Future<void> _close() async {
     if (_closing) return;
     _closing = true;
-    suppressWindowBoundsPersistence = false;
-    try {
-      // Fire-and-forget: do not await these native calls so that any window manager
-      // stall or deadlock does not hang the Dart thread or prevent closing the widget.
-      unawaited(windowManager.setAlwaysOnTop(false).catchError((_) {}));
-      unawaited(DesktopTray.restoreNormalBounds().catchError((_) {}));
-    } catch (_) {}
+    // Only touch the shared suppression flag / fire the restore if no newer
+    // send-widget session has already taken over the window (see
+    // tray.dart's sendWidgetEpoch doc comment) — otherwise this stale close
+    // would stomp the new session's compact geometry/always-on-top state
+    // right after it was set, which is exactly what made the send widget
+    // intermittently seem to "not open" when a new send arrived while a
+    // previous one was still closing.
+    if (isCurrentSendWidgetEpoch(_epoch)) {
+      suppressWindowBoundsPersistence = false;
+      try {
+        // Fire-and-forget: do not await these native calls so that any window
+        // manager stall or deadlock does not hang the Dart thread or prevent
+        // closing the widget. Each step re-checks the epoch first/last since
+        // a newer session can start at any point during these awaits.
+        unawaited(() async {
+          if (!isCurrentSendWidgetEpoch(_epoch)) return;
+          await windowManager.setAlwaysOnTop(false).catchError((_) {});
+          if (!isCurrentSendWidgetEpoch(_epoch)) return;
+          await DesktopTray.restoreNormalBounds().catchError((_) {});
+        }());
+      } catch (_) {}
+    }
     if (mounted) {
       context.read<AppState>().exitSendWidgetMode();
     }

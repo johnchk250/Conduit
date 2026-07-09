@@ -19,6 +19,34 @@ import '../app_state.dart';
 /// user's real saved window size/position with the tiny popup's geometry.
 bool suppressWindowBoundsPersistence = false;
 
+/// Roadmap Phase 4 bug fix: monotonic counter identifying the current
+/// "send widget" session (one open→close cycle of [SendWidgetScreen]).
+///
+/// [SendWidgetScreen] claims a new epoch synchronously in `initState`, and
+/// its `_close()` cleanup — which fires `setAlwaysOnTop(false)` and
+/// [DesktopTray.restoreNormalBounds] *unawaited*, deliberately, so a stalled
+/// window-manager call can't hang the close — re-checks its epoch is still
+/// current before actually applying each step. Without this, a new "Send to
+/// Conduit" arriving while a previous send widget's cleanup is still
+/// in-flight (e.g. two files sent back-to-back, or a second send triggered
+/// right as the first auto-closes) could race: the new widget resizes/
+/// focuses/pins itself, then the *old* widget's stale cleanup finishes a
+/// moment later and undoes it — leaving the window at full size, unfocused,
+/// or not on top right after the new send widget was supposed to open. From
+/// the user's side that looks exactly like "the send UI doesn't open" (it's
+/// there, just not visible/focused) or opens and then visibly reverts.
+int sendWidgetEpoch = 0;
+
+/// Claims and returns the next send-widget epoch. Call once, synchronously,
+/// from [SendWidgetScreen.initState] — synchronous so ordering across rapid
+/// mounts is deterministic (no await gap where two mounts could race to
+/// claim the same epoch).
+int beginSendWidgetEpoch() => ++sendWidgetEpoch;
+
+/// True if [epoch] is still the current send-widget session — i.e. no newer
+/// [SendWidgetScreen] has been mounted since [epoch] was claimed.
+bool isCurrentSendWidgetEpoch(int epoch) => epoch == sendWidgetEpoch;
+
 /// Desktop close-to-tray + system tray integration (Roadmap Phase 1).
 ///
 /// On Windows the user expects closing the window to keep Conduit running

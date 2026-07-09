@@ -76,8 +76,29 @@ class _SendFlowViewState extends State<SendFlowView> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     // Phase 3d: if the OS dropped files into the app via the share sheet or
-    // "Send to" menu, snapshot them here and clear the AppState queue so a
-    // rebuild doesn't re-snapshot stale data.
+    // "Send to" menu, snapshot them here so the very first build already has
+    // them.
+    //
+    // Bug fix: this used to also call state.clearPendingSharedFiles() right
+    // here, synchronously. didChangeDependencies runs while this widget is
+    // being *mounted*, and for both hosts of SendFlowView that mount happens
+    // *inside* an ancestor's own build() — DashboardScreen.build() either
+    // returns SendWidgetScreen directly, or switches SendPanel in via
+    // setState(() => _index = 3). clearPendingSharedFiles() calls
+    // notifyListeners(), and notifying the very ChangeNotifier an ancestor is
+    // currently watching, from mid-build, is the classic Flutter
+    // "setState()/markNeedsBuild() called during build" hazard — depending on
+    // timing that either throws (the send UI fails to render at all) or the
+    // resulting rebuild gets dropped (the UI opens but nothing reacts, so the
+    // send never starts). That matched the reported "erratic ... doesn't
+    // open, or opens but send doesn't start" symptom exactly, and since this
+    // is the widget's *first* mount it's the common path, not an edge case.
+    //
+    // Fix: keep the synchronous local-field snapshot (so the first build()
+    // already has the files — no visible delay), but defer the actual
+    // AppState mutation to a post-frame callback, once this build/mount pass
+    // is over. Same safe pattern already used below in build() for files
+    // arriving while the widget is already mounted.
     final state = context.read<AppState>();
     final pending = state.pendingSharedFiles;
     if (pending != null && pending.isNotEmpty) {
@@ -85,7 +106,11 @@ class _SendFlowViewState extends State<SendFlowView> {
       _pickedFiles = null;
       _autoStartSharedFiles = state.pendingSharedFilesAutoStart;
       _autoStartScheduled = false;
-      state.clearPendingSharedFiles();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          state.clearPendingSharedFiles();
+        }
+      });
     }
   }
 
@@ -359,9 +384,14 @@ class _SendFlowViewState extends State<SendFlowView> {
     // only ever fires once for that). Skipped mid-send so a share that lands
     // while a previous batch is still going can't clobber that batch out
     // from under it; it's picked up on the very next build once we're idle.
+    // The `!identical` check skips the list didChangeDependencies already
+    // snapshotted this same frame (its AppState clear is merely deferred to
+    // a post-frame callback now, not yet applied) — without it this would
+    // harmlessly double-schedule a pickup for the exact same data.
     final newPending = state.pendingSharedFiles;
     if (newPending != null &&
         newPending.isNotEmpty &&
+        !identical(newPending, _sharedFiles) &&
         _phase != _SendPhase.sending) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
