@@ -311,6 +311,19 @@ no effect on ongoing sync; notification fires; folder row shows correct badge
 state across Idle/Syncing/Error. Explorer right-click "Send to" works on Windows,
 and Android share-sheet targets Conduit directly.
 
+**2026-07-09 follow-on (throughput + compact send widget):** see
+`docs/2026-07-05-send-widget-and-throughput.md` and the 2026-07-09
+`ARCHITECTURE.md` Appendix B entry. TCP_NODELAY + pipelined ad-hoc block fetch
+(depth 8) + a compact Windows popup send flow. **Note:** the sync engine's own
+needs-queue fetch is now also pipelined at depth 4 (`_syncPipelineDepth` in
+`engine.dart`) — this goes further than the doc's "left alone here
+deliberately" follow-up list said, and has no dedicated end-to-end regression
+test yet (only the primitive is tested at depth >1, via a fake `sendRequest`).
+Reviewed by inspection and looks engine-safe (no `localSha`/version-vector
+path touched, FIFO request/response order preserved), but **flag for a real
+`flutter analyze` + `flutter test` + a needs-queue-level pipelining regression
+test** before treating it as fully verified — see `PROGRESS.md`.
+
 ---
 
 ### Phase 4 — Remote command from phone→PC (owner feature #3)
