@@ -341,3 +341,142 @@ that as a sanity check.
 directly (single new file, simpler than a patch) with `git add`/commit/push
 instructions rather than another `.patch`, since I still have no push
 credentials for their repo.
+
+---
+
+## 2026-07-11 — Investigated repeated peer-disconnect cycling during Android Doze / Battery Saver
+
+User shared two Activity-log screenshots showing a repeating
+disconnect → heartbeat-timeout → reconnect → sync → disconnect cycle
+(roughly every 72–90s) while the Android phone's screen was off and
+battery saver was active on the phone. One event includes the desktop-side
+error `SocketException: The semaphore timeout period has expired (OS
+Error, errno 121)`, address/port of the Android peer. Asked: is this
+normal, and why does it repeat so often?
+
+**Investigation (read-only, no code changes this session):**
+
+- `lib/src/net/peer_session.dart`: app-level heartbeat is a fixed
+  `_hbInterval = 12s`, `_hbMissedThreshold = 6` → exactly 72s of silence
+  before a session is declared dead (`hb_dead`) and torn down. This lines
+  up with the ~72–90s gaps in the screenshots.
+- Android side already does the right AOSP-level things: `SyncService` is
+  a proper foreground service (`foregroundServiceType="dataSync"`,
+  `FOREGROUND_SERVICE_DATA_SYNC` permission, persistent notification), it
+  owns the connection/transfer wake locks (post `b452888` fix) with a 45s
+  renewal timer, holds a `MulticastLock` for discovery, and requests
+  `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`. Per current Android docs
+  (developer.android.com/training/monitoring-device-state/doze-standby),
+  an app on that exemption list is allowed to use the network and hold
+  partial wake locks *during* Doze — so on stock AOSP behavior alone this
+  should be fairly resilient.
+- **Found a real, undocumented behavior in `lib/src/app_state.dart`
+  `_applyBeaconMode()` (line 591):**
+  `_setConnectionWakeLockEnabled(anyLive && !_config.batterySaverMode)`.
+  When Conduit's own in-app **"Battery saver mode"** toggle
+  (`dashboard_screen.dart`, `config_store.dart`) is on, the connection
+  wake lock is deliberately *never* acquired — even while a peer session
+  is live. The UI subtitle for that toggle only mentions the 1-hour
+  watcher poll cadence ("Scan folders every hour instead of every 4s...");
+  it does not disclose that it also stops holding the CPU awake for an
+  active connection. With that lock off, the CPU is free to deep-sleep
+  mid-session, the Dart heartbeat timer stalls, the Windows side blocks on
+  `send()` until its own internal timeout fires (the "semaphore timeout"
+  error, errno 121 — classic symptom of the remote side going dark),
+  and Conduit's own 72s heartbeat-dead timer then closes the session. As
+  soon as any Android-side wakeup happens (motion, notification, etc.)
+  discovery/reconnect brings it back up, syncs the backlog, and the same
+  thing repeats — hence the tight, repeating cycle.
+- If Conduit's in-app battery saver toggle is **off** and this is purely
+  the *phone's OS-level* Battery Saver + Doze, the exemptions above should
+  mostly hold on stock Android, but this is a very well-documented pain
+  point on OEM skins (Samsung/Xiaomi/OnePlus-style extra battery managers
+  layered on top of AOSP, tracked by projects like dontkillmyapp.com) that
+  can still suspend network/CPU for a foreground service despite the
+  standard exemptions being granted. Distinguishing which of these is
+  happening for this user needs one more piece of info (whether Conduit's
+  own battery-saver toggle was on) — asked in chat, not yet confirmed.
+
+**Assessment:** the cyclical reconnect pattern itself is not data-unsafe
+(the log shows a clean resync — "3 files in sync" / "2 files in sync" —
+immediately after each reconnect), so it's a battery-vs-reliability
+trade-off rather than a bug causing loss. But the in-app toggle's
+undisclosed side effect is worth fixing — either by updating the UI
+copy to be accurate, or by decoupling "relax watcher polling" from
+"allow the live connection to be dropped during idle" into two clearly
+separate behaviors.
+
+**Files touched:** none (read-only investigation this session).
+**Status:** diagnosis delivered in chat; no code change made yet — holding
+until the user confirms which condition (in-app toggle vs. OS-level
+Battery Saver alone) actually applies, since the right fix differs
+(UI copy / behavior split vs. Android-settings guidance to the user).
+Logged as a candidate follow-up item below.
+
+**Follow-up candidates (not yet actioned):**
+1. Split Conduit's "Battery saver mode" toggle behavior: keep the 1-hour
+   watcher-polling relaxation, but stop it from silently disabling the
+   connection wake lock for an already-live session — or make that
+   consequence explicit in the UI subtitle.
+2. Consider whether the heartbeat's fixed 72s dead-timer should be more
+   forgiving specifically when Conduit's own battery-saver mode is
+   active, since the user opted into a laxer, battery-first mode.
+
+**Confirmed:** user has the in-app "Battery saver mode" toggle **on**.
+Root cause is confirmed as hypothesis 4 in `THINKING.md` — the connection
+wake lock is intentionally never held while that toggle is on, so any
+live session is exposed to Doze and gets cycled roughly every 72s whenever
+the phone is idle long enough for CPU sleep to actually stall the
+heartbeat. Presenting fix-direction options to the user next; no code
+changed yet pending their choice (see `THINKING.md` for the options laid
+out).
+
+---
+
+## 2026-07-11 (continued) — New session, resuming the disconnect-cycling fix
+
+**Environment notes (same as prior sessions):** no `flutter`/`dart` SDK, no
+push credentials for `johnchk250/Conduit` — manual review + careful static
+checking again, changes committed locally and handed over as
+patch/file(s), same as every prior session.
+
+**Housekeeping done first:**
+- Re-cloned the repo fresh (`main`, up to date through commit `21f4c4d`).
+- The 2026-07-11 disconnect-cycling investigation entry existed in the
+  user-held copy of `PROGRESS.md` but had never actually been committed to
+  the repo (that session was read-only, so nothing got committed) —
+  appended it here now so the repo's own history is complete.
+- `THINKING.md` (reasoning-trail companion log, mirroring this file) did
+  not exist in the repo before now — added it, seeded with the existing
+  reasoning trail for the disconnect-cycling investigation, plus a new
+  entry below.
+
+**Re-examined the two candidate fixes before writing code** (full
+reasoning in `THINKING.md`): confirmed via re-reading `_applyBeaconMode()`
+that the connection wake lock is *only ever requested while a peer session
+is already live* — the idle-battery savings from battery-saver mode come
+entirely from a separate mechanism (watcher poll interval +
+discovery-lock timing), untouched by this fix. So decoupling "relax
+watcher polling" from "let the live connection lock lapse" has no idle-
+battery cost; it only changes behavior while a peer is actively connected,
+where the current behavior is actively worse anyway (repeated
+teardown/rediscover/resync every ~72–90s). Treating this as the
+recommended default fix, paired with correcting the UI copy — asking the
+user for a quick confirm rather than assuming, since it's a live behavior
+change to their app.
+
+**Plan for this session:**
+1. ✅ Re-clone, reconcile `PROGRESS.md`, add `THINKING.md`.
+2. ☐ Get user confirmation on fix direction (recommended: decouple +
+   fix UI copy).
+3. ☐ Implement in `app_state.dart` (`_applyBeaconMode`) and
+   `dashboard_screen.dart` (UI copy).
+4. ☐ Manually verify call sites / no regressions to the idle-battery path.
+5. ☐ Update `ARCHITECTURE.md` Appendix B changelog + `Roadmap.md` Phase 0.6
+   row per project convention (every prior fix session has done this).
+6. ☐ Commit locally, produce patch/diff for the user to apply + push.
+
+Checkpoints will be appended below as each step finishes — never leaving
+this file mid-step. `THINKING.md` gets a matching entry for any non-obvious
+reasoning.
+
