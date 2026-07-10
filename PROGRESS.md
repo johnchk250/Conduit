@@ -242,3 +242,44 @@ correct — flagging as a good next step rather than guessing blind.
 `johnchk250/Conduit` in this session — same limitation as before). Local
 commit made after this checkpoint; happy to produce a patch/diff file
 instead if that's easier to apply on your end.
+
+---
+
+## 2026-07-10 — Confirmed pushed to GitHub; added .gitignore
+
+User applied `0001-adhoc-send-ui-fix.patch` via `git am` on their own
+machine and pushed to `origin/main`. Verified from this side with a fresh
+clone: both commits (`6164b3a` progress log, `a45f6d9` the actual fix) are
+present on GitHub with the right content — spot-checked the epoch-guard
+symbols and the deferred `clearPendingSharedFiles()` call are actually in
+the pushed files, not just present in commit messages.
+
+**Follow-up found while verifying:** the repo has **no `.gitignore`** at
+all — makes sense, since it was being managed via GitHub's manual file
+upload rather than git before now. This is a real risk given the workflow
+now in place: `git add -A` (used earlier in this session) stages
+everything with no exceptions, so once the user builds locally
+(`flutter build windows`, `build_release.bat`, etc.), the `build/` output
+folder and other generated junk would get swept into the repo on the next
+`git add -A` + push unless something excludes it. Confirmed nothing like
+that has happened yet — a fresh clone has no `build/`, `.dart_tool/`, or
+similar tracked.
+
+**Fix:** added a standard Flutter `.gitignore` (the one `flutter create`
+would generate) plus a couple of project-specific entries:
+- `/logs/` — `capture_pc.bat`/`capture_android.bat` write timestamped
+  diagnostic logs here; not something to version.
+- Windows/Linux desktop `ephemeral/`/generated-plugin-registrant paths,
+  for completeness alongside the top-level `/build/` rule.
+
+User has already built the Windows app locally on their machine (before
+this .gitignore existed), so their local `build/` folder currently exists
+un-tracked. Once they add this `.gitignore` and run `git status`, it
+should now show as ignored rather than untracked — told them to verify
+that as a sanity check.
+
+**Files touched:** `.gitignore` (new), `PROGRESS.md`.
+**Status:** committed locally on this side; handed the file to the user
+directly (single new file, simpler than a patch) with `git add`/commit/push
+instructions rather than another `.patch`, since I still have no push
+credentials for their repo.
