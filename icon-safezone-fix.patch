@@ -1,0 +1,26 @@
+diff --git a/android/app/src/main/res/drawable/ic_launcher_foreground.xml b/android/app/src/main/res/drawable/ic_launcher_foreground.xml
+index c1e888b..ff7fd06 100644
+--- a/android/app/src/main/res/drawable/ic_launcher_foreground.xml
++++ b/android/app/src/main/res/drawable/ic_launcher_foreground.xml
+@@ -3,15 +3,16 @@
+     android:height="108dp"
+     android:viewportWidth="108"
+     android:viewportHeight="108">
+-    <!-- The mark stays within Android's adaptive-icon safe zone so any launcher mask remains clean. -->
++    <!-- The mark stays within Android's adaptive-icon safe zone (66dp circle centered at 54,54)
++         so any launcher mask (circle, squircle, rounded square, etc.) keeps it intact. -->
+     <path
+         android:fillColor="@android:color/transparent"
+-        android:pathData="M78,31 C70,23 61,19 51,19 C29,19 12,35 12,54 C12,73 29,89 51,89 C61,89 70,85 78,77"
++        android:pathData="M69.36,39.28 C64.24,34.16 58.48,31.6 52.08,31.6 C38,31.6 27.12,41.84 27.12,54 C27.12,66.16 38,76.4 52.08,76.4 C58.48,76.4 64.24,73.84 69.36,68.72"
+         android:strokeColor="#FFFFFFFF"
+-        android:strokeWidth="9"
++        android:strokeWidth="5.8"
+         android:strokeLineCap="round"
+         android:strokeLineJoin="round" />
+     <path
+         android:fillColor="#FFCFCBFF"
+-        android:pathData="M80,27 L89,27 L89,36 L80,36 Z M80,72 L89,72 L89,81 L80,81 Z" />
++        android:pathData="M70.64,36.72 L76.4,36.72 L76.4,42.48 L70.64,42.48 Z M70.64,65.52 L76.4,65.52 L76.4,71.28 L70.64,71.28 Z" />
+ </vector>
+\ No newline at end of file
