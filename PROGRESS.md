@@ -511,3 +511,25 @@ credentials for `johnchk250/Conduit` in this environment — same limitation
 as every prior session). Delivered as a patch file — see delivery note
 below.
 
+---
+
+## 2026-07-11 (continued) — Confirmed pushed to GitHub
+
+User applied both patches (`0001-progress-reconcile-disconnect-cycling...`,
+`0002-fix-decouple-battery-saver-mode...`) via `git am` on their own
+machine and pushed. Verified from this side with `git fetch origin` +
+`git log origin/main`: both commits present —
+`fd36436` (progress/THINKING reconcile) and `ca03805` (the actual fix) —
+on top of the prior tip `21f4c4d`. Didn't stop at the commit log:
+`git show origin/main:lib/src/app_state.dart` confirms the real code
+change (`_setConnectionWakeLockEnabled(anyLive)`, no longer gated on
+`batterySaverMode`) is present in the pushed file, and
+`git show origin/main:ARCHITECTURE.md` / `:Roadmap.md` confirm both
+doc updates landed too — not just asserted from the local commit, actually
+read back from the remote.
+
+**Files touched:** none this checkpoint (verification only).
+**Status:** disconnect-cycling fix is live on `origin/main`. This
+checkpoint entry itself was late — it was described in chat before it was
+actually written here; corrected once flagged.
+
