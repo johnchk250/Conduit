@@ -188,7 +188,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _navigateToSendIfSharedFiles(state, isWide);
 
     final desktopPages = [
-      _OverviewPage(state: state),
+      _OverviewPage(
+        state: state,
+        onNavigate: (i) => setState(() => _index = i),
+      ),
       const FolderPairsScreen(),
       const PairingScreen(),
       const SendPanel(),
@@ -199,7 +202,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     ];
 
     final mobilePages = [
-      _OverviewPage(state: state),
+      _OverviewPage(
+        state: state,
+        onNavigate: (i) => setState(() => _index = i),
+      ),
       const FolderPairsScreen(),
       const PairingScreen(),
       const ClipboardScreen(),
@@ -432,8 +438,9 @@ class _NavRail extends StatelessWidget {
 }
 
 class _OverviewPage extends StatelessWidget {
-  const _OverviewPage({required this.state});
+  const _OverviewPage({required this.state, required this.onNavigate});
   final AppState state;
+  final ValueChanged<int> onNavigate;
 
   @override
   Widget build(BuildContext ctx) {
@@ -553,23 +560,8 @@ class _OverviewPage extends StatelessWidget {
   void _goToDevices(BuildContext ctx) => _navigate(ctx, 2);
 
   void _navigate(BuildContext ctx, int i) {
-    final scope = Provider.of<AppState>(ctx, listen: false);
-    // We can't reach the dashboard's setState from here easily; the simplest
-    // path is to pop/push. For v1, navigate to a fresh dashboard with index.
-    Navigator.of(ctx).push(MaterialPageRoute(
-      builder: (_) => Provider.value(
-        value: scope,
-        child: const _IndexedDashboard(initial: 0),
-      ),
-    ));
+    onNavigate(i);
   }
-}
-
-class _IndexedDashboard extends StatelessWidget {
-  const _IndexedDashboard({required this.initial});
-  final int initial;
-  @override
-  Widget build(BuildContext ctx) => const DashboardScreen();
 }
 
 class _HeroBanner extends StatelessWidget {
