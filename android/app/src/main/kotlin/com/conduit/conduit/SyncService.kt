@@ -24,14 +24,30 @@ import androidx.core.app.NotificationCompat
  * service exists purely to satisfy Android's background-execution rules and
  * surface a persistent "Conduit is running" notification.
  *
- * ## Wake lock (Roadmap Phase 0.4)
+ * ## Wake locks (Roadmap Phase 0.4 + 0.6, ownership fixed post-audit)
  *
- * `onCreate` no longer holds a blanket 10-minute wake lock. Instead it exposes
- * an acquire/release pair (driven by the `conduit/wakelock` method channel
- * from the engine's transfer start/stop callbacks). A transfer acquires a
- * short, renewable 60s lock; an idle folder holds none, so Doze is free to take
- * over between syncs. The lock is reference-counted OFF (we manage a single
- * timed acquisition per active burst rather than nesting them).
+ * `onCreate` no longer holds a blanket 10-minute wake lock. Instead this
+ * service owns two independent, renewable partial wake locks, each exposed
+ * as an acquire/release pair over the `conduit/wakelock` method channel
+ * (forwarded here from MainActivity):
+ *
+ *   - **Transfer lock** (`Conduit::Transfer`): held only while bytes are
+ *     actively moving. Dart calls `acquire`/`release` on the 0→1/1→0
+ *     transitions of the engine's transfer-burst counter, and renews every
+ *     45s while a burst is in progress so multi-file bursts longer than the
+ *     lock's timeout don't silently lose protection.
+ *   - **Connection lock** (`Conduit::Connection`): held whenever at least one
+ *     peer session is live (and battery-saver mode is off), independently of
+ *     whether bytes are moving at that instant. Same 45s Dart renewal.
+ *
+ * Both locks are reference-counted OFF (a single timed acquisition per
+ * enable/renew, not nested), and both were moved here from MainActivity: an
+ * Activity-scoped lock is released the moment the Activity is destroyed
+ * (e.g. a swipe-from-recents, since MainActivity is `launchMode="singleTask"`
+ * with no `excludeFromRecents`), which defeated the entire point of a
+ * transfer surviving in the background. Owning them here ties their lifetime
+ * to the foreground service instead, which is what's actually meant to
+ * outlive the UI — mirroring how [multicastLock] already worked correctly.
  *
  * ## Restart on task removal (Roadmap Phase 1)
  *
@@ -71,6 +87,26 @@ class SyncService : Service() {
          * is live, (re)acquire the MulticastLock; false = at least one is,
          * release it. */
         const val EXTRA_NEEDED = "needed"
+
+        /** Sent by MainActivity, forwarding the engine's transfer start/stop
+         * signal (Roadmap Phase 0.4, fixed post-audit — see [transferWakeLock]
+         * doc for why this lives here instead of on the Activity). */
+        const val ACTION_SET_TRANSFER_LOCK = "com.conduit.conduit.SET_TRANSFER_LOCK"
+        /** Sent by MainActivity, forwarding Dart's "at least one live peer
+         * session" signal (Roadmap Phase 0.6). See [connectionWakeLock] doc. */
+        const val ACTION_SET_CONNECTION_LOCK = "com.conduit.conduit.SET_CONNECTION_LOCK"
+        /** Boolean extra shared by both SET_*_LOCK actions: true = acquire,
+         * false = release. */
+        const val EXTRA_LOCK_ENABLED = "enabled"
+
+        // Timed safety-net durations for the two renewable locks. The Dart side
+        // renews well before either deadline (see app_state.dart's
+        // _renewTransferWakeLock / _renewConnectionWakeLock, both on 45s
+        // periodic timers) — the timeout only protects against a lost
+        // release/renew call (e.g. a crashed isolate), it is not the intended
+        // hold duration.
+        private const val TRANSFER_LOCK_TIMEOUT_MS = 120_000L
+        private const val CONNECTION_LOCK_TIMEOUT_MS = 120_000L
 
         // Delay before restarting the service after a task-removal.
         private const val RESTART_DELAY_MS = 1_000L
@@ -137,6 +173,40 @@ class SyncService : Service() {
         }
 
         /**
+         * Ask the running service to acquire/renew or release the
+         * transfer-tied wake lock. [enabled] true = a transfer burst is in
+         * progress (acquire/renew); false = the burst ended (release).
+         */
+        fun setTransferLockEnabled(ctx: Context, enabled: Boolean) {
+            val intent = Intent(ctx, SyncService::class.java).apply {
+                action = ACTION_SET_TRANSFER_LOCK
+                putExtra(EXTRA_LOCK_ENABLED, enabled)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent)
+            } else {
+                ctx.startService(intent)
+            }
+        }
+
+        /**
+         * Ask the running service to acquire/renew or release the
+         * connection-tied wake lock. [enabled] true = at least one peer
+         * session is live; false = none are.
+         */
+        fun setConnectionLockEnabled(ctx: Context, enabled: Boolean) {
+            val intent = Intent(ctx, SyncService::class.java).apply {
+                action = ACTION_SET_CONNECTION_LOCK
+                putExtra(EXTRA_LOCK_ENABLED, enabled)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent)
+            } else {
+                ctx.startService(intent)
+            }
+        }
+
+        /**
          * Arm the repeating watchdog alarm (idempotent). Fired in [onStartCommand]
          * so every entry path sets it up; re-arming with FLAG_UPDATE_CURRENT
          * replaces any existing alarm rather than stacking. Also (re)armed in
@@ -185,6 +255,36 @@ class SyncService : Service() {
     private var baseWakeLock: PowerManager.WakeLock? = null
     private var intentionalStop = false
 
+    /**
+     * Transfer-tied partial wake lock (Roadmap Phase 0.4).
+     *
+     * Post-audit fix: this used to live on `MainActivity` as an
+     * Activity-scoped field. That was broken two ways: (1) `MainActivity`
+     * is `launchMode="singleTask"` with no `excludeFromRecents`, so a plain
+     * swipe-from-recents mid-transfer calls `onDestroy()`, which explicitly
+     * released the lock — even though the Dart sync engine and this service
+     * kept running underneath; (2) the lock had no renewal, just a flat
+     * timed acquisition, so any transfer burst longer than the timeout
+     * silently lost the lock even with the Activity alive. Living here
+     * instead ties the lock's lifetime to the foreground service, which is
+     * the thing that's actually supposed to outlive the UI — the same
+     * reasoning already applied correctly to [multicastLock] below. Dart
+     * renews this every 45s while a burst is active (see
+     * app_state.dart's `_renewTransferWakeLock`); [TRANSFER_LOCK_TIMEOUT_MS]
+     * is only a safety net against a lost renew/release call.
+     */
+    private var transferWakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * Connection-tied partial wake lock (Roadmap Phase 0.6), held whenever at
+     * least one peer session is live. Same ownership fix and rationale as
+     * [transferWakeLock] above — previously Activity-scoped and released on
+     * `MainActivity.onDestroy()`. Dart renews this every 45s (see
+     * `_renewConnectionWakeLock`); [CONNECTION_LOCK_TIMEOUT_MS] is a safety
+     * net only.
+     */
+    private var connectionWakeLock: PowerManager.WakeLock? = null
+
     // Current notification channel: true = normal (status-bar visible),
     // false = silent (IMPORTANCE_MIN, no status-bar icon).
     private var notifVisible = true
@@ -217,10 +317,13 @@ class SyncService : Service() {
         } else {
             startForeground(NOTIF_ID, notif)
         }
-        // NOTE (Roadmap Phase 0.4): a long-held blanket wake lock was removed.
-        // The transfer-tied wake lock is owned by MainActivity (acquire/release
-        // over the conduit/wakelock channel), so this service only keeps the
-        // process in the foreground — no blanket lock while idle.
+        // NOTE (Roadmap Phase 0.4, ownership fixed post-audit): a long-held
+        // blanket wake lock was removed. The transfer- and connection-tied
+        // wake locks are owned by THIS service (acquire/release/renew
+        // forwarded from MainActivity over the conduit/wakelock channel — see
+        // ACTION_SET_TRANSFER_LOCK / ACTION_SET_CONNECTION_LOCK), so they
+        // survive Activity destruction (e.g. swipe-from-recents) as long as
+        // this service is alive. No blanket lock is held while idle.
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         baseWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Conduit::Base")
         baseWakeLock?.setReferenceCounted(false)
@@ -257,6 +360,46 @@ class SyncService : Service() {
         } catch (_: Throwable) {}
     }
 
+    /** Acquire (or renew) the transfer-tied lock with a fresh timeout window.
+     * Safe to call repeatedly — each call re-arms the timer, which is exactly
+     * how Dart's 45s renewal keeps it alive for the duration of a burst. */
+    private fun acquireTransferWakeLock() {
+        if (transferWakeLock == null) {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            transferWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Conduit::Transfer")
+            transferWakeLock?.setReferenceCounted(false)
+        }
+        if (transferWakeLock?.isHeld == true) {
+            try { transferWakeLock?.release() } catch (_: Throwable) {}
+        }
+        transferWakeLock?.acquire(TRANSFER_LOCK_TIMEOUT_MS)
+    }
+
+    private fun releaseTransferWakeLock() {
+        if (transferWakeLock?.isHeld == true) {
+            try { transferWakeLock?.release() } catch (_: Throwable) {}
+        }
+    }
+
+    /** Acquire (or renew) the connection-tied lock. See [acquireTransferWakeLock]. */
+    private fun acquireConnectionWakeLock() {
+        if (connectionWakeLock == null) {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            connectionWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Conduit::Connection")
+            connectionWakeLock?.setReferenceCounted(false)
+        }
+        if (connectionWakeLock?.isHeld == true) {
+            try { connectionWakeLock?.release() } catch (_: Throwable) {}
+        }
+        connectionWakeLock?.acquire(CONNECTION_LOCK_TIMEOUT_MS)
+    }
+
+    private fun releaseConnectionWakeLock() {
+        if (connectionWakeLock?.isHeld == true) {
+            try { connectionWakeLock?.release() } catch (_: Throwable) {}
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
@@ -277,6 +420,14 @@ class SyncService : Service() {
             ACTION_SET_DISCOVERY_NEEDED -> {
                 val needed = intent.getBooleanExtra(EXTRA_NEEDED, true)
                 if (needed) acquireMulticastLock() else releaseMulticastLock()
+            }
+            ACTION_SET_TRANSFER_LOCK -> {
+                val enabled = intent.getBooleanExtra(EXTRA_LOCK_ENABLED, false)
+                if (enabled) acquireTransferWakeLock() else releaseTransferWakeLock()
+            }
+            ACTION_SET_CONNECTION_LOCK -> {
+                val enabled = intent.getBooleanExtra(EXTRA_LOCK_ENABLED, false)
+                if (enabled) acquireConnectionWakeLock() else releaseConnectionWakeLock()
             }
             else -> {
                 // ACTION_START or START_STICKY recreation (null intent).
@@ -336,6 +487,8 @@ class SyncService : Service() {
         if (baseWakeLock?.isHeld == true) {
             try { baseWakeLock?.release() } catch (_: Throwable) {}
         }
+        releaseTransferWakeLock()
+        releaseConnectionWakeLock()
         releaseMulticastLock()
         super.onDestroy()
     }

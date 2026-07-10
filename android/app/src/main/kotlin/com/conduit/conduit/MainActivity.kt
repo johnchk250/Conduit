@@ -172,26 +172,29 @@ class MainActivity : FlutterActivity() {
             }
 
         // Channel 4 (Roadmap Phase 0.4): transfer-tied wake lock. Acquire a
-        // short, renewable lock only while bytes are actually moving; release on
-        // idle so Doze takes over. Routed to the running SyncService, which owns
-        // the PowerManager wake lock.
+        // short, renewable lock only while bytes are actually moving; release
+        // on idle so Doze takes over. Forwarded to the running SyncService,
+        // which owns the actual PowerManager wake lock (post-audit fix: this
+        // used to be acquired directly on the Activity and was released the
+        // moment the Activity was destroyed, e.g. a swipe-from-recents mid-
+        // transfer — see SyncService.transferWakeLock doc for the full story).
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CH_WAKELOCK)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "acquire" -> {
-                        acquireTransferWakeLock()
+                        SyncService.setTransferLockEnabled(this, true)
                         result.success(null)
                     }
                     "release" -> {
-                        releaseTransferWakeLock()
+                        SyncService.setTransferLockEnabled(this, false)
                         result.success(null)
                     }
                     "acquireConnection" -> {
-                        acquireConnectionWakeLock()
+                        SyncService.setConnectionLockEnabled(this, true)
                         result.success(null)
                     }
                     "releaseConnection" -> {
-                        releaseConnectionWakeLock()
+                        SyncService.setConnectionLockEnabled(this, false)
                         result.success(null)
                     }
                     // Roadmap Phase 0.6 (battery): toggles SyncService's
@@ -379,15 +382,6 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /// The transfer-tied wake lock is held HERE (in the Activity) rather than
-    /// routed through the SyncService. A partial wake lock is process-global,
-    /// the Activity and the Dart isolate share one process, and the Activity is
-    /// always present while the app runs — so there is no ServiceConnection to
-    /// bind or race. The foreground service keeps the process from being killed
-    /// while backgrounded; this lock only adds "don't doze mid-transfer".
-    private var transferWakeLock: PowerManager.WakeLock? = null
-    private var connectionWakeLock: PowerManager.WakeLock? = null
-
     // MulticastLock so the Dart isolate's UDP discovery listener actually
     // receives broadcast beacons. Mirrors the lock held by SyncService so
     // auto-discovery works even before/independent of the foreground service
@@ -410,47 +404,6 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun acquireTransferWakeLock() {
-        if (transferWakeLock == null) {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            transferWakeLock =
-                pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Conduit::Transfer")
-            transferWakeLock?.setReferenceCounted(false)
-        }
-        // Renew: release any held lock then re-acquire with a fresh 60s window.
-        // Renewal is how a long multi-file transfer stays awake: each transfer
-        // start re-arms the timeout; an idle gap lets it lapse.
-        if (transferWakeLock?.isHeld == true) {
-            try { transferWakeLock?.release() } catch (_: Throwable) {}
-        }
-        transferWakeLock?.acquire(60_000L)
-    }
-
-    private fun releaseTransferWakeLock() {
-        if (transferWakeLock?.isHeld == true) {
-            try { transferWakeLock?.release() } catch (_: Throwable) {}
-        }
-    }
-
-    private fun acquireConnectionWakeLock() {
-        if (connectionWakeLock == null) {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            connectionWakeLock =
-                pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Conduit::Connection")
-            connectionWakeLock?.setReferenceCounted(false)
-        }
-        if (connectionWakeLock?.isHeld == true) {
-            try { connectionWakeLock?.release() } catch (_: Throwable) {}
-        }
-        connectionWakeLock?.acquire(120_000L)
-    }
-
-    private fun releaseConnectionWakeLock() {
-        if (connectionWakeLock?.isHeld == true) {
-            try { connectionWakeLock?.release() } catch (_: Throwable) {}
-        }
-    }
-
     override fun onDestroy() {
         // Save the running engine to cache BEFORE releasing anything.
         // shouldDestroyEngineWithHost()=false means Flutter will not call
@@ -462,12 +415,10 @@ class MainActivity : FlutterActivity() {
         // restarting Dart or losing any sessions.
         flutterEngine?.let { FlutterEngineCache.getInstance().put(ENGINE_ID, it) }
 
-        if (transferWakeLock?.isHeld == true) {
-            try { transferWakeLock?.release() } catch (_: Throwable) {}
-        }
-        if (connectionWakeLock?.isHeld == true) {
-            try { connectionWakeLock?.release() } catch (_: Throwable) {}
-        }
+        // Note: the transfer/connection wake locks are no longer released
+        // here. They now live in SyncService (see its class doc for why),
+        // so they correctly survive this Activity's destruction — e.g. a
+        // swipe-from-recents mid-transfer no longer kills the lock.
         val mlock = multicastLock
         multicastLock = null
         try {

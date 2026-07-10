@@ -104,6 +104,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Timer? _connectionWakeLockRenewal;
   bool _connectionWakeLockHeld = false;
 
+  /// Roadmap Phase 0.4 (post-audit fix): renews the transfer-tied wake lock
+  /// every 45s while a burst is active, mirroring [_connectionWakeLockRenewal].
+  /// Previously a transfer burst only fired one native `acquire` at its start
+  /// with no renewal, so any burst longer than the native lock's timeout
+  /// silently lost wake-lock protection even without the app being
+  /// backgrounded. See [_onTransferState].
+  Timer? _transferWakeLockRenewal;
+
   /// Roadmap Phase 0.6 — battery: mirrors whether the Android SyncService's
   /// MulticastLock is currently held. Starts true because the service
   /// acquires it unconditionally in onCreate (the correct default before we
@@ -690,6 +698,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _connections.stop();
     _clipboard?.dispose();
     _setConnectionWakeLockEnabled(false);
+    _onTransferState(false); // cancel renewal timer + release, if held
     _engine.dispose();
     super.dispose();
   }
@@ -1285,20 +1294,39 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   /// Engine → host: bytes started/stopped moving (Phase 0.4). On Android we ask
-  /// the foreground service to acquire a short, renewable partial wake lock only
-  /// while `transferring` is true, so Doze is free to take over on an idle
-  /// folder. Renewal happens here: each transfer-start re-arms a 60s window; an
-  /// idle folder never holds the lock.
+  /// SyncService to acquire a short, renewable partial wake lock only while
+  /// `transferring` is true, so Doze is free to take over on an idle folder.
+  ///
+  /// Post-audit fix: a burst now gets a periodic renewal (every 45s, same
+  /// cadence as [_renewConnectionWakeLock]) for as long as it's active,
+  /// instead of a single acquire at burst-start with no renewal. Without
+  /// this, any burst lasting longer than the native lock's timeout silently
+  /// lost wake-lock protection partway through — a multi-file sync over a
+  /// slow link could easily run past that window.
   void _onTransferState(bool transferring) {
     if (!Platform.isAndroid) return;
-    _chWakelock
-        .invokeMethod<void>(transferring ? 'acquire' : 'release')
-        .catchError((Object e) {
+    if (transferring) {
+      _renewTransferWakeLock();
+      _transferWakeLockRenewal ??= Timer.periodic(
+        const Duration(seconds: 45),
+        (_) => _renewTransferWakeLock(),
+      );
+      return;
+    }
+
+    _transferWakeLockRenewal?.cancel();
+    _transferWakeLockRenewal = null;
+    _chWakelock.invokeMethod<void>('release').catchError((Object e) {
       // Best-effort: a wakelock failure must never break a transfer.
-      Diag.log('wakelock_error', fields: {
-        'op': transferring ? 'acquire' : 'release',
-        'error': e.toString()
-      });
+      Diag.log('wakelock_error',
+          fields: {'op': 'release', 'error': e.toString()});
+    });
+  }
+
+  void _renewTransferWakeLock() {
+    _chWakelock.invokeMethod<void>('acquire').catchError((Object e) {
+      Diag.log('wakelock_error',
+          fields: {'op': 'acquire', 'error': e.toString()});
     });
   }
 
@@ -1358,6 +1386,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> quit() async {
     try {
       _setConnectionWakeLockEnabled(false);
+      _onTransferState(false); // cancel renewal timer + release, if held
       _stopBackgroundService();
       if (_started) {
         _supervisor.stop();

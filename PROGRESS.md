@@ -5,6 +5,64 @@
 
 ---
 
+## 2026-07-10 — Session 2: wake-lock ownership fix + battery-doc audit
+
+**Continuation of the same-day session below.** That session's manual review
+(no `flutter`/`dart` SDK, no push credentials — same constraints apply here)
+confirmed the transfer/connection wake locks were genuinely owned by
+`MainActivity` rather than `SyncService`, despite a code comment claiming
+otherwise, and that `MainActivity.onDestroy()` explicitly released both locks
+— meaning a plain swipe-from-recents mid-transfer killed wake-lock protection
+immediately (this Activity is `launchMode="singleTask"`, no
+`excludeFromRecents`, so `onDestroy()` fires on that gesture). Separately,
+the transfer lock had no renewal at all, so any burst >60s lost the lock on
+its own regardless of the Activity lifecycle.
+
+**Fix implemented and committed locally** (see
+`HANDOFF_2026-07-10_WAKELOCK_FIX.md` for full detail):
+- `SyncService.kt`: added `transferWakeLock`/`connectionWakeLock` fields,
+  acquire/release methods, `ACTION_SET_TRANSFER_LOCK`/
+  `ACTION_SET_CONNECTION_LOCK` intents, and companion `setTransferLockEnabled`/
+  `setConnectionLockEnabled` functions. Both released in `onDestroy()`
+  (genuine service death, unlike the old Activity-triggered release).
+  Native timeout raised to 120s for both (safety net; Dart renewal is the
+  real mechanism).
+- `MainActivity.kt`: removed the Activity-owned `WakeLock` fields and their
+  acquire/release methods entirely. The `conduit/wakelock` channel now just
+  forwards to the `SyncService` companion functions above. No more wake-lock
+  release calls in `onDestroy()`.
+- `app_state.dart`: added `_transferWakeLockRenewal` (45s periodic timer,
+  mirroring the existing `_connectionWakeLockRenewal`), started/stopped from
+  `_onTransferState`, and released from both `dispose()` and `quit()`.
+- Docs: corrected `Roadmap.md`'s Phase 0.4 row (was describing the old,
+  broken design as current) and added the previously-undocumented Phase 0.6
+  row (battery-saver mode, connection lock, discovery multicast toggle —
+  code existed, table never mentioned it). Corrected a pre-Phase-0.4 stale
+  "10-min cap" wake-lock description in `ARCHITECTURE.md` §8, added new §9.4
+  documenting actual wake-lock ownership, and added an Appendix B changelog
+  entry.
+
+**Verification performed:** manual read of the full diff (all three changed
+files), cross-checked call sites (`SyncService` companion functions called
+correctly from `MainActivity`; `_onTransferState`/`dispose`/`quit` call sites
+in `app_state.dart` checked for the new timer's lifecycle). **Not performed:**
+`flutter analyze` / `flutter test` / an actual Android build — no toolchain
+available in this environment. **Recommend running `flutter analyze` and
+`flutter test` (and ideally a real device/emulator swipe-from-recents
+mid-transfer test) before merging.**
+
+**Known gap, unchanged by this fix:** zero automated test coverage existed
+for the wake-lock/service code before this session and none was added — the
+existing `flutter test` suite can't reach Kotlin service code. An
+instrumented `androidTest/` suite exercising `SyncService` directly is the
+right follow-up but is out of scope for what was asked this session.
+
+**Delivery constraint:** no push credentials for `johnchk250/Conduit` in this
+environment. Changes are committed locally; delivered to the user as a git
+bundle + patch file to apply/push from their own machine.
+
+---
+
 ## 2026-07-10 — Session start
 
 **Environment notes (read first, affects everything below):**

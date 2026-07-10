@@ -164,14 +164,20 @@ others. Mark status as you start/finish each.
 | 0.1 | **Periodic reconcile safety-net.** Long-interval (30 min) per-pair `reconcile(pair, session)` while a session is live. New `Map<String,Timer>` in `engine.dart`, started/stopped alongside watchers (`startPair`/`stopPair`/`dispose`). Relies on the existing re-entrancy guard (`engine.dart:573` `if (st.scanning) return;`) and the no-op-invariant. | `lib/src/sync/engine.dart` | Closes the only reliability hole (watcher-miss drift). |
 | 0.2 | **Watcher backoff when no peer.** Stretch poll 4s→30s when `registry.sessionFor(peerId)==null`; restore 4s on connect. | `lib/src/sync/watcher.dart` + engine wiring | ~8× fewer SAF scans in the common offline state. |
 | 0.3 | **Discovery beacon backoff when stable.** Broadcast fast (3s) for ~30s after startup/reconnect to establish the link, then back off to 10–15s while a session is live. Persistent session + `ConnectionSupervisor` cover re-acquisition. | `lib/src/net/discovery.dart` | Sleeping radio once connected. |
-| 0.4 | **Wake lock tied to transfers** (optional). Engine signals `transferring` start/stop over a method channel; `SyncService.kt` acquires a short (60s, renewable) lock only during `transferring==true`, releases on idle. | `SyncService.kt` + method channel + `_processNeeds` start/stop hooks | Doze works during idle. |
+| 0.4 | **Wake lock tied to transfers.** Engine signals `transferring` start/stop over a method channel; `SyncService.kt` acquires a short, renewable (120s timeout, 45s Dart renewal) lock only during `transferring==true`, releases on idle. **Post-audit fix (2026-07-10):** originally acquired directly on `MainActivity`, which released it in `onDestroy()` — meaning a plain swipe-from-recents mid-transfer killed the lock, and the lack of renewal meant any burst >60s lost it regardless. Ownership moved to `SyncService` (which outlives the Activity) and renewal added; see `HANDOFF_2026-07-10_WAKELOCK_FIX.md`. | `SyncService.kt`, `MainActivity.kt` (forwards over `conduit/wakelock`), `app_state.dart` `_onTransferState`/`_renewTransferWakeLock` | Doze works during idle; transfer protection actually survives backgrounding. |
 | 0.5 | **DB hardening.** `PRAGMA synchronous = NORMAL` alongside WAL; `PRAGMA integrity_check` on open; hourly `.bak` copy of the DB file. | `lib/src/storage/index_db.dart` `open()` | Recoverable DB without a full re-scan. |
+| 0.6 | **Battery-saver mode + connection wake lock + discovery multicast toggle** (undocumented until 2026-07-10; code and tests existed, this table didn't mention it). Battery-saver mode stretches the watcher to a flat 1-hour cadence regardless of connection state. A second renewable wake lock (`Conduit::Connection`, 120s timeout / 45s renewal) is held whenever any peer session is live and battery-saver is off — independent of whether bytes are moving. The Android `MulticastLock` is held unconditionally at service start, then released once any peer session goes live and re-acquired once none are (an established TCP session doesn't need broadcast discovery). Same post-audit ownership fix as 0.4 applies to the connection lock. | `lib/src/sync/engine.dart` (`setBatterySaverMode`), `lib/src/app_state.dart` (`_setConnectionWakeLockEnabled`, `_setDiscoveryLockEnabled`), `SyncService.kt`, `SafOps.kt`/`scanner.dart`/`watcher.dart` (batched SAF fast-path listing) | Cuts watcher/discovery cost further for users who opt in; avoids holding the multicast lock 24/7 when it can't do anything useful. |
 
 **Tests for Phase 0:**
 - 0.1: regression test asserting the no-op-invariant still holds under a
   periodic tick (idle folder burns zero sequences across N ticks).
 - 0.5: test that a DB opened after `synchronous=NORMAL` round-trips rows
   unchanged; that `integrity_check` result is surfaced/logged.
+- 0.4/0.6 wake locks: **no test coverage as of 2026-07-10.** The Kotlin
+  wake-lock/service code can't be exercised by the existing `flutter test`
+  suite (no Flutter/Dart SDK dependency reaches into `SyncService.kt`
+  directly); this was true before the ownership fix and remains a real gap
+  afterward. Manual review only — see `HANDOFF_2026-07-10_WAKELOCK_FIX.md`.
 
 **Acceptance:** `flutter analyze` clean; `flutter test` 154/154 (or updated
 count) passing; both binaries rebuilt.

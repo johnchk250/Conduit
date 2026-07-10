@@ -367,9 +367,14 @@ No all-files-access permission on Android — all file I/O goes through the
   — a one-time firewall rule is required (see README "First-run setup"). Native FS
   via `dart:io`.
 - **Android:** app support dir for identity/config. SAF document trees for folder
-  access. `SyncService` foreground service with a partial wake lock (10-min cap) so
-  an in-flight transfer completes before doze. Permissions: INTERNET, WIFI state,
-  multicast, FOREGROUND_SERVICE(dataSync), WAKE_LOCK. **No** all-files access.
+  access. `SyncService` foreground service; no blanket wake lock is held while
+  idle. Instead it owns two renewable partial wake locks (moved here from
+  `MainActivity` in the 2026-07-10 ownership fix — an Activity-scoped lock was
+  released on a plain swipe-from-recents, defeating the point of it): a
+  transfer lock held only while bytes are moving, and a connection lock held
+  whenever any peer session is live (off in battery-saver mode). Both renew
+  every 45s from Dart; see §9.4. Permissions: INTERNET, WIFI state, multicast,
+  FOREGROUND_SERVICE(dataSync), WAKE_LOCK. **No** all-files access.
 - **Per synced folder:** `.syncstate/` (legacy manifests), `.syncversions/`
   (conflict backups, 14-day retention), `.<name>.syncpart` (V2 partial downloads).
 
@@ -432,6 +437,42 @@ unfetched peer row **always** has `localSha == ''` and stays excluded from
 `localSha` branch newly admits to deletion-tracking are rows whose bytes this
 device genuinely holds (via `confirmLocalObservation`). The negative-control test
 in `bug9_recv_delete_propagation_test.dart` pins this.
+
+### 9.4 Android wake-lock ownership (battery, Phase 0.4 + 0.6)
+
+Two independent, renewable `PARTIAL_WAKE_LOCK`s exist, both owned by
+**`SyncService`**, not `MainActivity`:
+
+- **Transfer lock** (`Conduit::Transfer`) — held only while
+  `engine.dart`'s active-transfer-burst counter is above zero.
+- **Connection lock** (`Conduit::Connection`) — held whenever at least one
+  peer session is live and battery-saver mode is off.
+
+Dart (`app_state.dart`) renews each one every 45s for as long as it should be
+held (`_renewTransferWakeLock`, `_renewConnectionWakeLock`), against a 120s
+native timeout on the Kotlin side — the timeout is a safety net for a lost
+message, not the intended hold duration. `MainActivity` only *forwards*
+`conduit/wakelock` channel calls to `SyncService` (`setTransferLockEnabled`,
+`setConnectionLockEnabled`); it holds no `PowerManager.WakeLock` of its own.
+
+**Why this matters:** `MainActivity` is `launchMode="singleTask"` with no
+`excludeFromRecents`. Before the 2026-07-10 fix, both locks lived directly on
+the Activity, which released them in `onDestroy()` — so a plain
+swipe-from-recents mid-transfer killed the lock immediately, even though the
+Dart isolate and foreground service kept running (`shouldDestroyEngineWithHost()
+= false`). Separately, the transfer lock had no renewal at all, so any burst
+longer than its old 60s timeout lost protection on its own. Owning both locks
+in `SyncService` ties their lifetime to the thing that's actually meant to
+outlive the UI, matching how the `MulticastLock` toggle
+(`SyncService.multicastLock`) already worked correctly before this fix.
+
+**Known gap, unchanged by this fix:** there is still no automated test
+coverage for any of this — Kotlin service/wake-lock code isn't reachable from
+`flutter test`. This was true before 2026-07-10 and remains true after;
+verification here is manual code review only, not `flutter analyze`/`flutter
+test` (no Flutter/Dart SDK in the review environment either). Recommended
+follow-up: an instrumented Android test (`androidTest/`) exercising
+`SyncService` directly.
 
 ---
 
@@ -514,6 +555,7 @@ No DB migration is ever needed for the index DB: every fix so far has been runti
 ull session. Added config_store_test.dart; full suite 154/154 passing. |
 
 | 2026-07-08 | Documentation: verified the suite via `flutter test` (154/154 passing, 0 errors) and corrected stale test-count claims to match current code. `ARCHITECTURE.md` header / §11 / module-map and `Roadmap.md` "current state" counts updated from 112/112 and 146/146 to 154/154; the Roadmap current-state snapshot date advanced to 2026-07-07. No source changes. |
+| 2026-07-10 | **Wake-lock ownership fix + battery-doc audit** (see `HANDOFF_2026-07-10_WAKELOCK_FIX.md`). Audit of Phase 0.4/0.6 found the transfer- and connection-tied wake locks were acquired directly on `MainActivity` (a code comment claiming they were "routed to SyncService" was false — only the `MulticastLock` toggle actually was). Since `MainActivity` is `launchMode="singleTask"` with no `excludeFromRecents`, its `onDestroy()` explicitly released both locks — so a plain swipe-from-recents mid-transfer killed the lock immediately even though the Dart engine and foreground service kept running. Separately, the transfer lock had no renewal at all (unlike the connection lock's existing 45s renewal), so any burst longer than its 60s native timeout lost the lock on its own. **Fix:** moved both locks' real ownership into `SyncService` (`transferWakeLock`/`connectionWakeLock` fields, `ACTION_SET_TRANSFER_LOCK`/`ACTION_SET_CONNECTION_LOCK`, `setTransferLockEnabled`/`setConnectionLockEnabled`); `MainActivity` now only forwards the `conduit/wakelock` channel to `SyncService` and no longer holds any `PowerManager.WakeLock` itself. Added `_transferWakeLockRenewal` (45s periodic, mirroring `_connectionWakeLockRenewal`) in `app_state.dart`, released on `dispose()`/`quit()`. Native timeout for both locks raised to 120s (safety net only; Dart renewal is the real mechanism). Also corrected several stale doc passages: `Roadmap.md`'s 0.4 row (described the old, broken design as current), a pre-Phase-0.4 "10-min cap" description in `ARCHITECTURE.md` §8, and documented the previously-unwritten-up Phase 0.6 layer (battery-saver mode, connection lock, discovery multicast toggle) in both `Roadmap.md` (new 0.6 row) and `ARCHITECTURE.md` (new §9.4). **Known gap, unchanged by this fix:** still zero automated test coverage for any Kotlin service/wake-lock code — verification here is manual review only (no Flutter/Dart SDK or Android toolchain in the reviewing environment); an instrumented `androidTest/` suite exercising `SyncService` directly is the recommended follow-up. |
 | 2026-07-09 | **Ad-hoc send throughput + compact send widget** (see `docs/2026-07-05-send-widget-and-throughput.md` for full design). `TCP_NODELAY` set best-effort on both connect and accept paths in `peer_session.dart`. `fetchFileBlockLevel` (`block_transfer.dart`) gained an optional `pipelineDepth` param (sliding-window request pipelining; default 1 = byte-for-byte original stop-and-wait); `file_send.dart` uses depth 8 for ad-hoc receives. New compact popup send flow on Windows (`send_widget_screen.dart`, `send_flow_view.dart`, `AppState.sendWidgetMode`, `tray.dart`'s `suppressWindowBoundsPersistence`) reshapes the single existing window instead of opening a second native one. **Also present in this snapshot, not covered by that doc:** `engine.dart` now sets `_syncPipelineDepth = 4` and passes it to the V2 needs-queue's own `fetchFileBlockLevel` call (previously depth 1 / omitted, per the doc's "left alone here deliberately" note) — i.e. the background sync engine's own block fetch is now pipelined too, not just ad-hoc sends. Reviewed by inspection: `_sendBlockRequest` + `_BlockSink` (`engine.dart`) run `session.send(frame)` and enqueue the matching `_waiters`/`_queue` slot synchronously (before any `await`) on every call, so firing several requests before awaiting any of them still preserves strict FIFO request/response order — the same guarantee `block_transfer_test.dart`'s depth-3/4 tests check against a fake `sendRequest`. No `localSha`/version-vector path touched; only wire scheduling. **Gap:** no test currently drives the *real* engine needs-queue end-to-end at depth 4 (existing pipelining tests exercise the primitive directly with a fake `sendRequest`) — recommend adding one before relying on this further. Tests: `block_transfer_test.dart` pipelining tests present; full-suite count not independently re-verified this session (no `flutter` toolchain available in the reviewing environment — see `PROGRESS.md`). |
 
 ---
