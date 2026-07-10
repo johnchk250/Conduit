@@ -24,7 +24,7 @@
 // Dart handler both expect this delimiter.
 
 static constexpr wchar_t kWindowClass[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
-static constexpr wchar_t kWindowTitle[] = L"conduit";
+static constexpr wchar_t kWindowTitle[] = L"Conduit";
 
 // Parse --send args from the raw command line into a list of file paths.
 // Returns empty vector if --send is not present.
@@ -136,7 +136,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   Win32Window::Point origin(10, 10);
   Win32Window::Size size = sendPaths.empty() ? Win32Window::Size(1280, 720)
                                               : Win32Window::Size(400, 560);
-  if (!window.Create(L"conduit", origin, size)) {
+  if (!window.Create(L"Conduit", origin, size)) {
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);
