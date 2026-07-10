@@ -467,16 +467,47 @@ change to their app.
 
 **Plan for this session:**
 1. ✅ Re-clone, reconcile `PROGRESS.md`, add `THINKING.md`.
-2. ☐ Get user confirmation on fix direction (recommended: decouple +
-   fix UI copy).
-3. ☐ Implement in `app_state.dart` (`_applyBeaconMode`) and
-   `dashboard_screen.dart` (UI copy).
-4. ☐ Manually verify call sites / no regressions to the idle-battery path.
-5. ☐ Update `ARCHITECTURE.md` Appendix B changelog + `Roadmap.md` Phase 0.6
-   row per project convention (every prior fix session has done this).
-6. ☐ Commit locally, produce patch/diff for the user to apply + push.
+2. ✅ Get user confirmation on fix direction — user picked the recommended
+   option: decouple + fix UI copy.
+3. ✅ Implement in `app_state.dart` (`_applyBeaconMode`). `dashboard_screen.dart`
+   needed **no change** — its existing subtitle only ever described the
+   watcher-polling cadence, never the connection lock, so it was already
+   accurate once the undisclosed side effect was removed (confirmed by
+   reading the widget before assuming a copy edit was needed).
+4. ✅ Manually verified: `grep`'d every remaining `batterySaverMode` usage
+   in `lib/` (6 hits) to confirm the removed conditional was the only
+   coupling between battery-saver mode and the connection lock; confirmed
+   `setBatterySaverMode()` already calls `_applyBeaconMode()`, so toggling
+   the setting mid-session re-evaluates the lock immediately — no
+   additional wiring needed for that path.
+5. ✅ Updated `ARCHITECTURE.md` Appendix B (new 2026-07-11 row) and
+   `Roadmap.md` Phase 0.6 row per project convention.
+6. ✅ Committed locally, produced patch file for the user to apply + push
+   (see below).
 
-Checkpoints will be appended below as each step finishes — never leaving
-this file mid-step. `THINKING.md` gets a matching entry for any non-obvious
-reasoning.
+**Checkpoint — fix implemented:**
+
+`lib/src/app_state.dart` `_applyBeaconMode()`: changed
+`_setConnectionWakeLockEnabled(anyLive && !_config.batterySaverMode)` to
+`_setConnectionWakeLockEnabled(anyLive)`, with an inline comment explaining
+why (full reasoning in `THINKING.md`'s "weighing the two fix directions"
+entry). This is a one-line behavioral change plus documentation; no other
+source files were touched.
+
+**Files touched this session:** `PROGRESS.md`, `THINKING.md` (new),
+`lib/src/app_state.dart`, `ARCHITECTURE.md`, `Roadmap.md`.
+
+**Not performed (same standing limitation as every prior session):**
+`flutter analyze` / `flutter test` / a real build — no Flutter/Dart SDK or
+Android toolchain in this environment. Verification here was manual
+read-through of the changed function, its comment, and every call site of
+`batterySaverMode` and `setBatterySaverMode()`. **Recommend running the
+existing test suite and, ideally, a real-device idle/Doze soak test (phone
+screen off, Battery saver mode on, watch the Activity log for the
+disconnect cycle) before considering this closed.**
+
+**Status: fix complete, committed locally, not pushed** (no push
+credentials for `johnchk250/Conduit` in this environment — same limitation
+as every prior session). Delivered as a patch file — see delivery note
+below.
 

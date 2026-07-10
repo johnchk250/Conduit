@@ -588,7 +588,19 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   void _applyBeaconMode() {
     final anyLive = _registry.readyPeerIds.isNotEmpty;
     _discovery?.setBeaconMode(anyLive ? BeaconMode.stable : BeaconMode.fast);
-    _setConnectionWakeLockEnabled(anyLive && !_config.batterySaverMode);
+    // 2026-07-11 fix: hold the connection wake lock whenever a session is
+    // live, regardless of battery-saver mode. Battery-saver's idle savings
+    // come entirely from the watcher-polling interval (set once at startup
+    // in start(), see _engine.setBatterySaverMode) and from the discovery
+    // lock below — neither depends on this lock. Previously this was
+    // `anyLive && !_config.batterySaverMode`, which let Doze stall an
+    // already-live session's heartbeat during battery-saver mode, causing a
+    // disconnect -> rediscover -> resync cycle roughly every 72-90s for as
+    // long as the peer stayed in range (see PROGRESS.md / THINKING.md,
+    // 2026-07-11 entries, for the full investigation). That's strictly
+    // worse than just holding the lock for the life of the session, so the
+    // two concerns are decoupled here.
+    _setConnectionWakeLockEnabled(anyLive);
     // Phase 0.6: the Android MulticastLock only gates RECEIVING broadcast/
     // multicast UDP — i.e. discovery beacons on port 41827. It has no effect
     // on an already-live peer session, which is a unicast TCP socket
