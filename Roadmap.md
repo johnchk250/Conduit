@@ -519,6 +519,51 @@ edit-conflict-then-restore on both Windows and Android before merging. See
 
 ---
 
+### Phase 7 — Liquid-glass UI redesign (visual restyle, on top of Phase 5)
+**Status:** 🟡 in progress — shared library + app shell done, per-screen
+conversion ongoing.
+**Engine-safe?** ✅ pure UI, same constraint as Phase 5.
+
+Distinct from Phase 5 (which was the original Material 3 polish pass, marked
+complete 2026-06-27): this phase re-skins the same screens in a translucent
+"liquid glass" style (ambient drifting gradient background, blurred
+translucent panels, gradient-border cards) via a new shared component
+library, rather than changing any behavior. Design intent, restraint notes,
+and the modal-surfaces-stay-Material rule all live as doc comments directly
+in `lib/src/ui/glass.dart` — read that file's header before touching it or
+any screen that uses it.
+
+**Shared library:** `lib/src/ui/glass.dart` — ✅ complete (`GlassColors`,
+`GlassBackground`, `GlassPanel`, `GlassSectionLabel`, `GlassListTile`,
+`GlassStatusBanner`, `GlassChip`, `GlassButton`, `GlassNavBar`/`GlassNavRail`).
+
+**Per-screen conversion checklist:**
+| File | Status |
+|---|---|
+| `dashboard_screen.dart` (shell: NavRail/NavBar, Overview, Settings hub) | ✅ done (2026-07-12) |
+| `folder_pairs_screen.dart` | ⬜ not started — recommended next (see `THINKING.md` 2026-07-12) |
+| `pairing_screen.dart` | ⬜ not started |
+| `remote_control_screen.dart` | ⬜ not started |
+| `send_flow_view.dart` | ⬜ not started |
+| `send_panel.dart` | ⬜ not started |
+| `send_widget_screen.dart` | ⬜ not started |
+| `clipboard_screen.dart` | ⬜ not started |
+| `activity_screen.dart` | ⬜ not started |
+| `version_history_screen.dart` | ⬜ not started |
+
+**Known open item carried over from before this session:** the icon
+background color (`#5B4BDB` purple, from the 2026-07-11 adaptive-icon fix)
+doesn't match the in-app theme seed color (`AppTheme.seed`,
+`0xFF4F6BED` blue) or the glass violet accent (`GlassColors.violet`). Not
+touched here — still a design decision for the owner, not a bug.
+
+**Acceptance (per screen):** same interactive behavior as before conversion
+(no `onTap`/`onChanged` logic changes except where explicitly noted, e.g. the
+Settings "Required" chip in the 2026-07-12 entry); `flutter analyze` clean;
+manual visual pass on both a wide/desktop window and a phone-width window.
+
+---
+
 ## 4. Things that are deliberately NOT in scope
 
 To show we're not importing a foreign design wholesale:

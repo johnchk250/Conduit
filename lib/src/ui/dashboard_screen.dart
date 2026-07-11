@@ -17,6 +17,7 @@ import 'clipboard_screen.dart';
 import 'send_panel.dart';
 import 'send_widget_screen.dart';
 import 'remote_control_screen.dart';
+import 'glass.dart';
 
 /// Responsive app shell. Desktop gets a NavigationRail; phones a BottomNav.
 ///
@@ -129,27 +130,38 @@ class _DashboardScreenState extends State<DashboardScreen> {
     // Guard against the brief window before AppState.start() finishes
     // initializing the late identity/config/engine fields.
     if (!state.isStarted) {
+      final c = GlassColors.of(ctx);
       return Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(
-                width: 48,
-                height: 48,
-                child: CircularProgressIndicator(strokeWidth: 4),
-              ),
-              const SizedBox(height: 20),
-              Text(
-                'Starting Conduit…',
-                style: Theme.of(ctx).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                state.status,
-                style: Theme.of(ctx).textTheme.bodySmall,
-              ),
-            ],
+        backgroundColor: Colors.transparent,
+        body: GlassBackground(
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 48,
+                  height: 48,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 4,
+                    valueColor: AlwaysStoppedAnimation<Color>(c.violet),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  'Starting Conduit…',
+                  style: TextStyle(
+                    color: c.textPrimary,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  state.status,
+                  style: TextStyle(color: c.textSecondary, fontSize: 12),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -219,66 +231,76 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     if (isWide) {
       return Scaffold(
-        body: Row(
-          children: [
-            // NavigationRail must be width-bounded: a Row gives unbounded
-            // width to non-Expanded children, so the rail's internal trailing
-            // buttons (SizedBox(width: infinity)) would receive infinite
-            // constraints → layout assertion → frame abort → black screen +
-            // corrupted MouseTracker (buttons + tray stop responding).
-            // SizedBox bounds the rail to its declared minWidth so it never
-            // sees infinity.
-            SizedBox(
-              width: 220,
-              child: _NavRail(
-                index: activeIndex,
-                onChanged: (i) => setState(() => _index = i),
-                state: state,
-                onPauseToggle: () {
-                  if (state.isPaused) {
-                    state.resumeSync();
-                  } else {
-                    state.pauseSync();
-                  }
-                },
-                onQuit: () => _confirmQuit(ctx, state),
+        backgroundColor: Colors.transparent,
+        body: GlassBackground(
+          child: Row(
+            children: [
+              // NavigationRail must be width-bounded: a Row gives unbounded
+              // width to non-Expanded children, so the rail's internal
+              // trailing buttons (SizedBox(width: infinity)) would receive
+              // infinite constraints → layout assertion → frame abort →
+              // black screen + corrupted MouseTracker (buttons + tray stop
+              // responding). SizedBox bounds the rail to its declared
+              // minWidth so it never sees infinity. Still true for
+              // GlassNavRail, which keeps the same leading/trailing shape.
+              SizedBox(
+                width: 220,
+                child: _NavRail(
+                  index: activeIndex,
+                  onChanged: (i) => setState(() => _index = i),
+                  state: state,
+                  onPauseToggle: () {
+                    if (state.isPaused) {
+                      state.resumeSync();
+                    } else {
+                      state.pauseSync();
+                    }
+                  },
+                  onQuit: () => _confirmQuit(ctx, state),
+                ),
               ),
-            ),
-            const VerticalDivider(width: 1),
-            Expanded(child: desktopPages[activeIndex]),
-          ],
+              // No VerticalDivider here — GlassNavRail is a floating panel
+              // with its own border/blur, so a hard-line divider next to it
+              // reads as a glass rendering artifact rather than a boundary.
+              Expanded(child: desktopPages[activeIndex]),
+            ],
+          ),
         ),
       );
     }
     return Scaffold(
-      body: mobilePages[activeIndex],
-      bottomNavigationBar: NavigationBar(
+      backgroundColor: Colors.transparent,
+      // The nav bar floats above the content (its own blurred panel with
+      // margin on all sides), so the body needs to paint underneath it.
+      extendBody: true,
+      body: GlassBackground(child: mobilePages[activeIndex]),
+      bottomNavigationBar: GlassNavBar(
         selectedIndex: activeIndex,
         onDestinationSelected: (i) => setState(() => _index = i),
         destinations: const [
-          NavigationDestination(
-              icon: Icon(Icons.dashboard_outlined),
-              selectedIcon: Icon(Icons.dashboard),
+          GlassNavDestination(
+              icon: Icons.dashboard_outlined,
+              selectedIcon: Icons.dashboard,
               label: 'Home'),
-          NavigationDestination(
-              icon: Icon(Icons.folder_outlined),
-              selectedIcon: Icon(Icons.folder),
+          GlassNavDestination(
+              icon: Icons.folder_outlined,
+              selectedIcon: Icons.folder,
               label: 'Folders'),
-          NavigationDestination(
-              icon: Icon(Icons.devices_outlined),
-              selectedIcon: Icon(Icons.devices),
+          GlassNavDestination(
+              icon: Icons.devices_outlined,
+              selectedIcon: Icons.devices,
               label: 'Devices'),
-          NavigationDestination(
-              icon: Icon(Icons.content_copy_outlined),
-              selectedIcon: Icon(Icons.content_copy),
+          GlassNavDestination(
+              icon: Icons.content_copy_outlined,
+              selectedIcon: Icons.content_copy,
               label: 'Clipboard'),
-          NavigationDestination(
-              icon: Icon(Icons.settings_remote_outlined),
-              selectedIcon: Icon(Icons.settings_remote),
+          GlassNavDestination(
+              icon: Icons.settings_remote_outlined,
+              selectedIcon: Icons.settings_remote,
               label: 'Remote'),
-          NavigationDestination(
-              icon: Icon(Icons.settings_outlined),
-              selectedIcon: Icon(Icons.settings),
+          GlassNavDestination(
+              icon: Icons.settings_outlined,
+              selectedIcon: Icons.settings,
               label: 'Settings'),
         ],
       ),
@@ -338,34 +360,42 @@ class _NavRail extends StatelessWidget {
 
   @override
   Widget build(BuildContext ctx) {
-    return NavigationRail(
+    final c = GlassColors.of(ctx);
+    return GlassNavRail(
       selectedIndex: index,
       onDestinationSelected: onChanged,
       leading: Padding(
-        padding: const EdgeInsets.fromLTRB(8, 24, 8, 8),
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                Icon(Icons.sync,
-                    color: Theme.of(ctx).colorScheme.primary, size: 28),
+                Icon(Icons.sync, color: c.violet, size: 26),
                 const SizedBox(width: 10),
-                Text('Conduit', style: Theme.of(ctx).textTheme.titleLarge),
+                Text(
+                  'Conduit',
+                  style: TextStyle(
+                    color: c.textPrimary,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
               ],
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: 6),
             Text(
               state.identity.name,
-              style: Theme.of(ctx).textTheme.bodySmall,
+              style: TextStyle(color: c.textSecondary, fontSize: 12),
               overflow: TextOverflow.ellipsis,
             ),
             Text(
               state.identity.deviceId,
-              style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(ctx).colorScheme.outline,
-                    fontFamily: 'monospace',
-                  ),
+              style: TextStyle(
+                color: c.textTertiary,
+                fontSize: 11,
+                fontFamily: 'monospace',
+              ),
             ),
           ],
         ),
@@ -374,64 +404,61 @@ class _NavRail extends StatelessWidget {
         // Phase 1 controls: Pause/Resume + the intentional Quit. These are the
         // always-visible handles for "stop syncing now" and "exit the app",
         // mirroring the tray menu.
-        padding: const EdgeInsets.fromLTRB(8, 0, 8, 16),
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 14),
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Divider(),
-            const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.tonalIcon(
-                onPressed: onPauseToggle,
-                icon: Icon(state.isPaused ? Icons.play_arrow : Icons.pause),
-                label: Text(state.isPaused ? 'Resume' : 'Pause'),
-              ),
+            GlassButton(
+              icon: state.isPaused ? Icons.play_arrow : Icons.pause,
+              label: state.isPaused ? 'Resume' : 'Pause',
+              accentColor: state.isPaused ? c.mint : c.amber,
+              style: GlassButtonStyle.primary,
+              onTap: onPauseToggle,
             ),
             const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: onQuit,
-                icon: const Icon(Icons.power_settings_new),
-                label: const Text('Quit'),
-              ),
+            GlassButton(
+              icon: Icons.power_settings_new,
+              label: 'Quit',
+              accentColor: c.textSecondary,
+              style: GlassButtonStyle.outline,
+              onTap: onQuit,
             ),
           ],
         ),
       ),
       destinations: const [
-        NavigationRailDestination(
-            icon: Icon(Icons.dashboard_outlined),
-            selectedIcon: Icon(Icons.dashboard),
-            label: Text('Home')),
-        NavigationRailDestination(
-            icon: Icon(Icons.folder_outlined),
-            selectedIcon: Icon(Icons.folder),
-            label: Text('Folders')),
-        NavigationRailDestination(
-            icon: Icon(Icons.devices_outlined),
-            selectedIcon: Icon(Icons.devices),
-            label: Text('Devices')),
-        NavigationRailDestination(
-            icon: Icon(Icons.send_outlined),
-            selectedIcon: Icon(Icons.send),
-            label: Text('Send')),
-        NavigationRailDestination(
-            icon: Icon(Icons.history_outlined),
-            selectedIcon: Icon(Icons.history),
-            label: Text('Activity')),
-        NavigationRailDestination(
-            icon: Icon(Icons.content_copy_outlined),
-            selectedIcon: Icon(Icons.content_copy),
-            label: Text('Clipboard')),
-        NavigationRailDestination(
-            icon: Icon(Icons.settings_remote_outlined),
-            selectedIcon: Icon(Icons.settings_remote),
-            label: Text('Remote')),
-        NavigationRailDestination(
-            icon: Icon(Icons.power_settings_new_outlined),
-            selectedIcon: Icon(Icons.power_settings_new),
-            label: Text('Survival')),
+        GlassNavDestination(
+            icon: Icons.dashboard_outlined,
+            selectedIcon: Icons.dashboard,
+            label: 'Home'),
+        GlassNavDestination(
+            icon: Icons.folder_outlined,
+            selectedIcon: Icons.folder,
+            label: 'Folders'),
+        GlassNavDestination(
+            icon: Icons.devices_outlined,
+            selectedIcon: Icons.devices,
+            label: 'Devices'),
+        GlassNavDestination(
+            icon: Icons.send_outlined,
+            selectedIcon: Icons.send,
+            label: 'Send'),
+        GlassNavDestination(
+            icon: Icons.history_outlined,
+            selectedIcon: Icons.history,
+            label: 'Activity'),
+        GlassNavDestination(
+            icon: Icons.content_copy_outlined,
+            selectedIcon: Icons.content_copy,
+            label: 'Clipboard'),
+        GlassNavDestination(
+            icon: Icons.settings_remote_outlined,
+            selectedIcon: Icons.settings_remote,
+            label: 'Remote'),
+        GlassNavDestination(
+            icon: Icons.power_settings_new_outlined,
+            selectedIcon: Icons.power_settings_new,
+            label: 'Survival'),
       ],
     );
   }
@@ -444,6 +471,7 @@ class _OverviewPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext ctx) {
+    final c = GlassColors.of(ctx);
     final pairs = state.config.folderPairs;
     final connectedCount = state.pairedPeers
         .where((p) => state.isPeerConnected(p.deviceId))
@@ -451,170 +479,143 @@ class _OverviewPage extends StatelessWidget {
     final discovered = state.discoveredPeers;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Overview')),
+      backgroundColor: Colors.transparent,
+      appBar: AppBar(
+        title: const Text('Overview'),
+        backgroundColor: Colors.transparent,
+        foregroundColor: c.textPrimary,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+      ),
       body: ListView(
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
         children: [
-          _HeroBanner(
+          GlassStatusBanner(
             title: state.isStarted ? 'Sync is running' : 'Starting up…',
             subtitle: state.isStarted
                 ? 'Connected to $connectedCount of ${state.pairedPeers.length} paired device(s)'
                 : 'Warming up identity and discovery',
             icon: state.isStarted ? Icons.check_circle : Icons.hourglass_top,
-            color: state.isStarted ? Colors.green : Colors.amber,
+            accentColor: state.isStarted ? c.mint : c.amber,
           ),
-          const SizedBox(height: 20),
-          Text('Folder pairs', style: Theme.of(ctx).textTheme.titleMedium),
+          const SizedBox(height: 22),
+          _sectionHeader(c, 'Folder pairs'),
           const SizedBox(height: 8),
           if (pairs.isEmpty)
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.folder_off_outlined),
-                title: const Text('No folder pairs yet'),
-                subtitle: const Text(
-                    'Add a folder to start syncing with a paired device.'),
-                trailing: const Icon(Icons.chevron_right),
-                onTap: () => _goToFolders(ctx),
-              ),
+            GlassListTile(
+              leadingIcon: Icons.folder_off_outlined,
+              accentColor: c.textSecondary,
+              title: 'No folder pairs yet',
+              subtitle: 'Add a folder to start syncing with a paired device.',
+              trailing: Icon(Icons.chevron_right, color: c.textTertiary),
+              onTap: () => _goToFolders(ctx),
             )
           else
             ...pairs.map((p) {
               final st = state.stateFor(p.id);
-              return Card(
-                child: ListTile(
-                  leading: Icon(Icons.folder,
-                      color: Theme.of(ctx).colorScheme.primary),
-                  title: Text(p.name),
-                  subtitle: Text(
-                    '${p.direction.label} · ${st?.status ?? "Idle"}',
-                  ),
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: GlassListTile(
+                  leadingIcon: Icons.folder,
+                  accentColor: c.violet,
+                  title: p.name,
+                  subtitle: '${p.direction.label} · ${st?.status ?? "Idle"}',
                   trailing: st?.progress != null
                       ? SizedBox(
                           width: 40,
-                          child: LinearProgressIndicator(value: st!.progress),
+                          child: LinearProgressIndicator(
+                            value: st!.progress,
+                            color: c.violet,
+                            backgroundColor: c.violet.withValues(alpha: 0.15),
+                          ),
                         )
-                      : const Icon(Icons.chevron_right),
+                      : Icon(Icons.chevron_right, color: c.textTertiary),
                   onTap: () => _goToFolders(ctx),
                 ),
               );
             }),
-          const SizedBox(height: 20),
-          Text('Devices on this network',
-              style: Theme.of(ctx).textTheme.titleMedium),
+          const SizedBox(height: 22),
+          _sectionHeader(c, 'Devices on this network'),
           const SizedBox(height: 8),
           if (discovered.isEmpty)
-            const Card(
-              child: ListTile(
-                leading: Icon(Icons.wifi_find_outlined),
-                title: Text('Searching for devices…'),
-                subtitle: Text('Make sure both devices are on the same Wi-Fi.'),
-              ),
+            GlassListTile(
+              leadingIcon: Icons.wifi_find_outlined,
+              accentColor: c.blue,
+              title: 'Searching for devices…',
+              subtitle: 'Make sure both devices are on the same Wi-Fi.',
             )
           else
-            ...discovered.map((d) => Card(
-                  child: ListTile(
-                    leading: Icon(
-                      d.platform == 'android'
-                          ? Icons.phone_android
-                          : Icons.computer,
-                    ),
-                    title: Text(d.name),
-                    subtitle: Text('${d.deviceId} · ${d.address.address}'),
+            ...discovered.map((d) => Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: GlassListTile(
+                    leadingIcon: d.platform == 'android'
+                        ? Icons.phone_android
+                        : Icons.computer,
+                    accentColor: c.blue,
+                    title: d.name,
+                    subtitle: '${d.deviceId} · ${d.address.address}',
                     trailing: state.isPeerConnected(d.deviceId)
-                        ? const Chip(
-                            label: Text('Connected'),
-                            avatar: Icon(Icons.link, size: 16))
-                        : state.pairedPeers.any((p) => p.deviceId == d.deviceId)
-                            ? const Chip(
-                                label: Text('Paired'),
-                                avatar:
-                                    Icon(Icons.handshake_outlined, size: 16))
-                            : const Chip(label: Text('New')),
+                        ? GlassChip(
+                            label: 'Connected',
+                            icon: Icons.link,
+                            accentColor: c.mint,
+                            filled: true,
+                          )
+                        : state.pairedPeers
+                                .any((p) => p.deviceId == d.deviceId)
+                            ? GlassChip(
+                                label: 'Paired',
+                                icon: Icons.handshake_outlined,
+                                accentColor: c.blue,
+                              )
+                            : GlassChip(
+                                label: 'New',
+                                accentColor: c.textSecondary,
+                              ),
                     onTap: () => _goToDevices(ctx),
                   ),
                 )),
-          const SizedBox(height: 20),
-          Text('Quick actions', style: Theme.of(ctx).textTheme.titleMedium),
+          const SizedBox(height: 22),
+          _sectionHeader(c, 'Quick actions'),
           const SizedBox(height: 8),
-          Card(
-            child: ListTile(
-              leading: Icon(Icons.send_outlined,
-                  color: Theme.of(ctx).colorScheme.primary),
-              title: const Text('Send files'),
-              subtitle:
-                  const Text('Share ad-hoc files directly to paired devices'),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () {
-                Navigator.of(ctx).push(
-                  MaterialPageRoute(builder: (_) => const SendPanel()),
-                );
-              },
-            ),
+          GlassListTile(
+            leadingIcon: Icons.send_outlined,
+            accentColor: c.amber,
+            title: 'Send files',
+            subtitle: 'Share ad-hoc files directly to paired devices',
+            trailing: Icon(Icons.chevron_right, color: c.textTertiary),
+            onTap: () {
+              Navigator.of(ctx).push(
+                MaterialPageRoute(builder: (_) => const SendPanel()),
+              );
+            },
           ),
+          // Bottom breathing room so the last card never sits under the
+          // floating GlassNavBar on phones (harmless extra scroll on the
+          // wide/desktop NavigationRail layout, which has no floating bar).
+          const SizedBox(height: 90),
         ],
       ),
     );
   }
+
+  Widget _sectionHeader(GlassColors c, String text) => Padding(
+        padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
+        child: Text(
+          text,
+          style: TextStyle(
+            color: c.textPrimary,
+            fontSize: 15,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      );
 
   void _goToFolders(BuildContext ctx) => _navigate(ctx, 1);
   void _goToDevices(BuildContext ctx) => _navigate(ctx, 2);
 
   void _navigate(BuildContext ctx, int i) {
     onNavigate(i);
-  }
-}
-
-class _HeroBanner extends StatelessWidget {
-  const _HeroBanner({
-    required this.title,
-    required this.subtitle,
-    required this.icon,
-    required this.color,
-  });
-  final String title;
-  final String subtitle;
-  final IconData icon;
-  final Color color;
-
-  @override
-  Widget build(BuildContext ctx) {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [
-            color.withValues(alpha: 0.18),
-            color.withValues(alpha: 0.05),
-          ],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: color.withValues(alpha: 0.3)),
-      ),
-      child: Row(
-        children: [
-          Icon(icon, color: color, size: 36),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title,
-                    style: Theme.of(ctx)
-                        .textTheme
-                        .titleMedium
-                        ?.copyWith(fontWeight: FontWeight.w600)),
-                const SizedBox(height: 4),
-                Text(subtitle,
-                    style: Theme.of(ctx).textTheme.bodyMedium?.copyWith(
-                        color: Theme.of(ctx).colorScheme.onSurfaceVariant)),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
   }
 }
 
@@ -749,141 +750,124 @@ class _SettingsHubPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
+    final c = GlassColors.of(context);
 
     return Scaffold(
+      backgroundColor: Colors.transparent,
       appBar: AppBar(
         title: const Text('Settings'),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(1),
-          child: Divider(
-              height: 1, color: Theme.of(context).colorScheme.outlineVariant),
-        ),
+        backgroundColor: Colors.transparent,
+        foregroundColor: c.textPrimary,
+        elevation: 0,
+        scrolledUnderElevation: 0,
       ),
       body: ListView(
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         children: [
           // ---- Storage ----
-          Card(
-            child: Column(
-              children: [
-                ListTile(
-                  leading: Icon(Icons.download,
-                      color: Theme.of(context).colorScheme.primary),
-                  title: const Text('Received files folder'),
-                  subtitle: Text(
-                    state.receivedFilesPath ??
-                        (Platform.isWindows
-                            ? 'Defaults to Documents\\Sync'
-                            : 'Required: tap to pick folder'),
-                    style: TextStyle(
-                      color:
-                          state.receivedFilesPath == null && Platform.isAndroid
-                              ? Theme.of(context).colorScheme.error
-                              : null,
-                    ),
-                  ),
-                  trailing: const Icon(Icons.edit_outlined, size: 20),
-                  onTap: () async {
-                    String? path;
-                    if (Platform.isAndroid) {
-                      path = await SafFileSystemAccess.pickTree();
-                    } else {
-                      path = await FilePicker.platform.getDirectoryPath();
-                    }
-                    if (path != null) {
-                      await state.setReceivedFilesPath(path);
-                    }
-                  },
-                ),
-                Divider(
-                    height: 1,
-                    indent: 56,
-                    color: Theme.of(context).colorScheme.outlineVariant),
-                ListTile(
-                  leading: Icon(Icons.history_outlined,
-                      color: Theme.of(context).colorScheme.primary),
-                  title: const Text('Activity log'),
-                  subtitle:
-                      const Text('View history of sync operations and events'),
-                  trailing: const Icon(Icons.chevron_right, size: 20),
-                  onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => const ActivityScreen()),
-                    );
-                  },
-                ),
-                Divider(
-                    height: 1,
-                    indent: 56,
-                    color: Theme.of(context).colorScheme.outlineVariant),
-                ListTile(
-                  leading: Icon(Icons.power_settings_new_outlined,
-                      color: Theme.of(context).colorScheme.primary),
-                  title: const Text('Keep alive'),
-                  subtitle: const Text(
-                      'Execution controls and background battery settings'),
-                  trailing: const Icon(Icons.chevron_right, size: 20),
-                  onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                          builder: (_) => const BackgroundSurvivalScreen()),
-                    );
-                  },
-                ),
-              ],
-            ),
+          // Each former Card(ListTile) row is now its own GlassListTile —
+          // that's the intended 1:1 replacement (see glass.dart doc comment)
+          // rather than one big panel with internal dividers.
+          GlassListTile(
+            leadingIcon: Icons.download,
+            accentColor: c.violet,
+            title: 'Received files folder',
+            subtitle: state.receivedFilesPath ??
+                (Platform.isWindows
+                    ? 'Defaults to Documents\\Sync'
+                    : 'Required: tap to pick folder'),
+            // Swaps the old red-text warning for a "Required" chip — the
+            // GlassListTile subtitle style is fixed, so the warning signal
+            // moves to the trailing slot instead of a color override.
+            trailing: (Platform.isAndroid && state.receivedFilesPath == null)
+                ? GlassChip(
+                    label: 'Required',
+                    icon: Icons.priority_high,
+                    accentColor: c.amber,
+                    filled: true,
+                  )
+                : Icon(Icons.edit_outlined, size: 20, color: c.textTertiary),
+            onTap: () async {
+              String? path;
+              if (Platform.isAndroid) {
+                path = await SafFileSystemAccess.pickTree();
+              } else {
+                path = await FilePicker.platform.getDirectoryPath();
+              }
+              if (path != null) {
+                await state.setReceivedFilesPath(path);
+              }
+            },
+          ),
+          const SizedBox(height: 10),
+          GlassListTile(
+            leadingIcon: Icons.history_outlined,
+            accentColor: c.violet,
+            title: 'Activity log',
+            subtitle: 'View history of sync operations and events',
+            trailing:
+                Icon(Icons.chevron_right, size: 20, color: c.textTertiary),
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ActivityScreen()),
+              );
+            },
+          ),
+          const SizedBox(height: 10),
+          GlassListTile(
+            leadingIcon: Icons.power_settings_new_outlined,
+            accentColor: c.violet,
+            title: 'Keep alive',
+            subtitle: 'Execution controls and background battery settings',
+            trailing:
+                Icon(Icons.chevron_right, size: 20, color: c.textTertiary),
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                    builder: (_) => const BackgroundSurvivalScreen()),
+              );
+            },
           ),
 
-          const SizedBox(height: 16),
+          const SizedBox(height: 20),
 
-          // ---- System (Android-only UI, but the card is always shown) ----
-          Text('System',
-              style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  )),
-          const SizedBox(height: 6),
-          Card(
-            child: Column(
-              children: [
-                // Notification visibility: show/hide the status-bar icon.
-                // Android only — on Windows there is no persistent notification.
-                if (Platform.isAndroid) ...[
-                  SwitchListTile(
-                    secondary: Icon(
-                      Icons.notifications_outlined,
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                    title: const Text('Show in status bar'),
-                    subtitle: const Text(
-                      'Display a Conduit icon in the Android status bar while '
-                      'sync is running in the background.',
-                    ),
-                    value: state.showPersistentNotification,
-                    onChanged: (v) => state.setShowPersistentNotification(v),
-                  ),
-                  Divider(
-                      height: 1,
-                      indent: 56,
-                      color: Theme.of(context).colorScheme.outlineVariant),
-                ],
+          // ---- System (Android-only UI, but the section is always shown) ----
+          GlassSectionLabel('System'),
+          const SizedBox(height: 2),
+          // Notification visibility: show/hide the status-bar icon.
+          // Android only — on Windows there is no persistent notification.
+          if (Platform.isAndroid) ...[
+            GlassListTile(
+              leadingIcon: Icons.notifications_outlined,
+              accentColor: c.teal,
+              title: 'Show in status bar',
+              subtitle:
+                  'Display a Conduit icon in the Android status bar while '
+                  'sync is running in the background.',
+              trailing: Switch(
+                value: state.showPersistentNotification,
+                onChanged: (v) => state.setShowPersistentNotification(v),
+                activeThumbColor: c.teal,
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
 
-                // Battery-saver mode: 1-hour watcher cadence.
-                SwitchListTile(
-                  secondary: Icon(
-                    Icons.battery_saver_outlined,
-                    color: Theme.of(context).colorScheme.primary,
-                  ),
-                  title: const Text('Battery saver mode'),
-                  subtitle: const Text(
-                    'Scan folders every hour instead of every 4\u202fs — greatly '
-                    'reduces battery use. Local changes sync with up to 1-hour delay.',
-                  ),
-                  value: state.batterySaverMode,
-                  onChanged: (v) => state.setBatterySaverMode(v),
-                ),
-              ],
+          // Battery-saver mode: 1-hour watcher cadence.
+          GlassListTile(
+            leadingIcon: Icons.battery_saver_outlined,
+            accentColor: c.teal,
+            title: 'Battery saver mode',
+            subtitle:
+                'Scan folders every hour instead of every 4\u202fs — greatly '
+                'reduces battery use. Local changes sync with up to 1-hour delay.',
+            trailing: Switch(
+              value: state.batterySaverMode,
+              onChanged: (v) => state.setBatterySaverMode(v),
+              activeThumbColor: c.teal,
             ),
           ),
+          const SizedBox(height: 90),
         ],
       ),
     );

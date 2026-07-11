@@ -847,3 +847,88 @@ same file from both devices to force a same-file overwrite and confirm the
 old version shows up in "Restore versions" on both Windows and Android
 (SAF's `moveToVault` path in particular, since that native code could not be
 built or run here).
+
+## 2026-07-12 — Liquid-glass UI redesign, resumed (dashboard shell converted)
+
+**Context:** a prior session designed and built `lib/src/ui/glass.dart` (the
+shared liquid-glass token/component library — `GlassColors`, `GlassBackground`,
+`GlassPanel`, `GlassListTile`, `GlassStatusBanner`, `GlassChip`, `GlassButton`,
+`GlassNavBar`/`GlassNavRail`) and had fully scanned `dashboard_screen.dart`
+(NavRail, OverviewPage, SettingsHubPage, HeroBanner, InviteDialog) in
+preparation for converting it, but that session ended before either the
+library or any converted screen was ever committed — confirmed by `git log`
+(no glass-related commits) and `grep -ri glass lib/` (zero real hits before
+this session, only an unrelated `Icons.hourglass_top` false-positive). Picked
+back up from the uploaded `glass.dart` + the previous session's thinking-log
+export rather than redoing that design work.
+
+**Landed this session:**
+- `lib/src/ui/glass.dart` — added to the repo verbatim (uploaded file), no
+  changes needed. It was already complete and self-contained.
+- `lib/src/ui/dashboard_screen.dart` — fully converted, the one file the prior
+  session had already scanned in full:
+  - Wide layout: `NavigationRail` → `GlassNavRail` (`_NavRail` rebuilt on
+    `GlassNavRail` + `GlassButton` for Pause/Resume/Quit); the adjacent
+    `VerticalDivider` was dropped since a floating bordered rail doesn't need
+    a hard-line neighbor.
+  - Phone layout: `NavigationBar` → `GlassNavBar`; `Scaffold.extendBody` is
+    now `true` so page content scrolls underneath the floating bar, with a
+    90px bottom `SizedBox` on both list pages so the last row is never
+    covered.
+  - `_OverviewPage`: `_HeroBanner` (removed — fully superseded) →
+    `GlassStatusBanner`; every `Card(ListTile(...))` → `GlassListTile`;
+    device status `Chip`s → `GlassChip`. `Scaffold`/`AppBar` made
+    transparent so the single shared `GlassBackground` (mounted once, in the
+    shell around the NavRail/NavBar) shows through.
+  - `_SettingsHubPage`: same treatment. The one deliberate behavior change —
+    documented inline — is the "received files folder unset" warning, which
+    used to be red subtitle text and is now a `GlassChip("Required")` in the
+    trailing slot, since `GlassListTile`'s subtitle color isn't overridable
+    per-instance. Judged as a clearer signal, not just a style-forced swap.
+  - `SwitchListTile` → `GlassListTile` with a plain `Switch` in the trailing
+    slot (no glass-styled switch exists in the component library; this is a
+    reasonable extension of the pattern already established for the "trailing
+    can be anything" slot, not a new component).
+  - `_InviteDialog` (an `AlertDialog`) left untouched, per `glass.dart`'s own
+    documented intent: modal surfaces stay standard Material for legibility,
+    glass is for persistent chrome and content cards.
+- `Switch` styling uses `activeThumbColor`, not the older `activeColor` —
+  checked current Flutter API docs before writing it, since `activeColor` was
+  deprecated (in favor of `activeThumbColor`/`activeTrackColor`) after Flutter
+  3.31, and this project's Flutter is likely past that line given the current
+  date.
+
+**Verification (no Flutter/Dart SDK in this sandbox, same constraint as every
+prior session — `which dart flutter` confirmed empty):**
+- Balanced-delimiter check (custom Python scanner) on both
+  `dashboard_screen.dart` and `glass.dart` — clean.
+- Grepped for every Material widget this pass was supposed to remove
+  (`Card(`, bare `ListTile(`, `SwitchListTile`, bare `Chip(`,
+  `NavigationRail(`, `NavigationBar(`) inside `dashboard_screen.dart` — zero
+  real hits (only a doc-comment mention of the old pattern).
+- Re-viewed the entire edited file top to bottom after all edits to catch
+  anything a mechanical check wouldn't (mismatched named-parameter renames,
+  a stray `Colors.x` that should've become `c.x`, etc.).
+- Not verified: actually running `flutter analyze` / `flutter test` / a real
+  build. Recommend both before merging, plus a manual look on an actual
+  device/emulator — this is a visual redesign, and no screenshot tool exists
+  in this sandbox to self-check the rendered result.
+
+**Deliberately NOT touched this session (full inventory, for continuity):**
+`folder_pairs_screen.dart`, `pairing_screen.dart`, `remote_control_screen.dart`,
+`send_flow_view.dart`, `send_panel.dart`, `send_widget_screen.dart`,
+`clipboard_screen.dart`, `activity_screen.dart`, `version_history_screen.dart`
+— all still 100% standard Material, none reference `glass.dart` yet. This
+was a scope decision, not an oversight: converting all ~11 UI files
+(≈4,900 lines) to a hand-verified (no-compiler) standard in one pass risks
+shipping something broken across the whole app at once, versus one screen at
+a time, each independently checkable. `dashboard_screen.dart` was chosen
+first because it's the app's always-mounted root shell (nav rail/bar +
+Overview + Settings) and because the prior session had already fully read it.
+See `Roadmap.md` Phase 7 for the remaining per-screen checklist.
+
+**Status: dashboard shell (nav + Overview + Settings) is fully glass. Rest of
+the app is unconverted and functionally unaffected — everything outside
+`dashboard_screen.dart` still builds on stock Material and hasn't been
+touched.** Delivered as downloadable files/a git patch (no direct GitHub push
+access from this sandbox, per usual); the person applies and commits locally.

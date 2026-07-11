@@ -327,3 +327,49 @@ listing code) — the sandbox's lack of a build/run toolchain made "can I
 actually convince myself this is correct by reading it" the load-bearing
 question for every decision, more than it might have been with a real
 `flutter test` run available to fall back on.
+
+## 2026-07-12 — Scope call: one fully-converted screen vs. eleven half-converted ones
+
+**Question:** given a ~4,900-line, 11-file UI layer and a complete component
+library sitting ready (`glass.dart`), and no compiler in this sandbox to
+catch mistakes, how much should one session attempt?
+
+**Considered:** converting every screen in one pass, since the component
+library already exists and each screen mostly reduces to the same
+`Card(ListTile(...))` → `GlassListTile` substitution the doc comment in
+`glass.dart` describes. Rejected. Two independent reasons stacked, not one:
+
+1. **Verification cost scales with surface area, not linearly.** Every prior
+   entry in this file and in `PROGRESS.md` makes the same point for backend
+   changes: with no `flutter analyze`/`flutter test` available, correctness
+   comes entirely from re-reading. Re-reading 4,900 lines carefully enough to
+   trust it is a materially different (and materially riskier) task than
+   re-reading 900. A mistake in a converted `dashboard_screen.dart` is
+   contained; a mistake replicated across 11 files by pattern-matching too
+   fast is not.
+2. **The prior session had already paid the reading cost for exactly one
+   file.** Its thinking-log export explicitly lists `dashboard_screen.dart`'s
+   NavRail, OverviewPage, SettingsHubPage, HeroBanner, and InviteDialog as
+   fully scanned. Picking that file first meant continuing genuinely
+   in-progress work rather than starting a new, less-informed pass on a
+   different file — the literal ask was "continue," not "restart with a
+   different first screen."
+
+**What this predicts for next time:** the fastest, safest way to keep going
+is one screen per session (or per clearly-bounded chunk), each with its own
+before/after read-through, in the order listed in `Roadmap.md` Phase 7 —
+not a single pass across all remaining files. `folder_pairs_screen.dart` is
+the natural next one: it's the second-most-used screen (desktop index 1,
+mobile index 1) and, per the earlier `glass` grep, currently has zero glass
+usage despite being adjacent in the nav to the now-converted Overview page,
+so it's the most visually jarring inconsistency to leave as-is.
+
+**One deliberate deviation from a literal 1:1 port, flagged rather than
+silently made:** the "received files folder unset" warning on Settings used
+red subtitle text in the original. `GlassListTile`'s subtitle color isn't a
+per-call override (it's fixed to `textTertiary` in the component), so a
+literal port would have silently dropped the warning color with no
+replacement. Chose to move the signal to a `GlassChip("Required")` in the
+trailing slot instead of leaving it unsignaled — this is a visible behavior
+change on top of a visual one, which is why it's called out explicitly here
+and in `PROGRESS.md` rather than buried in a diff.
