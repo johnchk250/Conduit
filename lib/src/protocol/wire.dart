@@ -145,12 +145,36 @@ class FolderPair {
   /// been created locally but not yet accepted by the peer (pending invite).
   final String? peerDeviceId;
 
+  /// Roadmap Phase 6.2 — local-only ignore rules. Deliberately NOT
+  /// negotiated with the peer via folderInvite/folderAccept: each side sets
+  /// its own independently (e.g. "don't sync screenshots to MY phone"
+  /// without needing the PC's agreement). All three default to empty/null
+  /// so existing saved configs parse unchanged (same backward-compat
+  /// pattern [peerDeviceId] already uses).
+  ///
+  /// Glob syntax supported by [ignoreGlobs] (see ignore_rules.dart):
+  /// `*` (any chars except `/`), `**` (any chars including `/`), `?` (one
+  /// char except `/`), literal path segments. A pattern with no `/` also
+  /// matches at any depth via its basename (e.g. `*.tmp` matches
+  /// `sub/dir/x.tmp`), matching common ignore-file conventions.
+  final List<String> ignoreGlobs;
+
+  /// Extensions to ignore, e.g. `.tmp`, `.log`. Matched case-insensitively
+  /// against the end of the relative path.
+  final List<String> ignoreExtensions;
+
+  /// Files larger than this are ignored. Null = no cap.
+  final int? maxFileSizeBytes;
+
   FolderPair({
     required this.id,
     required this.name,
     required this.localPath,
     required this.direction,
     this.peerDeviceId,
+    this.ignoreGlobs = const [],
+    this.ignoreExtensions = const [],
+    this.maxFileSizeBytes,
   });
 
   Map<String, dynamic> toJson() => {
@@ -159,6 +183,9 @@ class FolderPair {
         'localPath': localPath,
         'direction': direction.name,
         if (peerDeviceId != null) 'peerDeviceId': peerDeviceId,
+        if (ignoreGlobs.isNotEmpty) 'ignoreGlobs': ignoreGlobs,
+        if (ignoreExtensions.isNotEmpty) 'ignoreExtensions': ignoreExtensions,
+        if (maxFileSizeBytes != null) 'maxFileSizeBytes': maxFileSizeBytes,
       };
 
   factory FolderPair.fromJson(Map<String, dynamic> j) => FolderPair(
@@ -167,8 +194,22 @@ class FolderPair {
         localPath: j['localPath'] as String,
         direction: SyncDirection.values.byName(j['direction'] as String),
         peerDeviceId: j['peerDeviceId'] as String?,
+        ignoreGlobs:
+            (j['ignoreGlobs'] as List?)?.map((e) => e as String).toList() ??
+                const [],
+        ignoreExtensions: (j['ignoreExtensions'] as List?)
+                ?.map((e) => e as String)
+                .toList() ??
+            const [],
+        maxFileSizeBytes: j['maxFileSizeBytes'] as int?,
       );
 
+  /// NOTE: [ignoreGlobs]/[ignoreExtensions]/[maxFileSizeBytes] are always
+  /// carried forward unchanged here (no override params) — this is
+  /// deliberate so the existing pair-edit dialog (which calls this with
+  /// only name/localPath/direction) can't silently wipe a pair's ignore
+  /// rules. Use [FolderPair]'s constructor directly (see
+  /// AppState.updateIgnoreRules) when you actually intend to change them.
   FolderPair copyWith({
     String? name,
     String? localPath,
@@ -181,5 +222,8 @@ class FolderPair {
         localPath: localPath ?? this.localPath,
         direction: direction ?? this.direction,
         peerDeviceId: peerDeviceId ?? this.peerDeviceId,
+        ignoreGlobs: ignoreGlobs,
+        ignoreExtensions: ignoreExtensions,
+        maxFileSizeBytes: maxFileSizeBytes,
       );
 }

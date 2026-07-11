@@ -1,4 +1,5 @@
 import '../storage/index_db.dart';
+import '../sync/ignore_rules.dart';
 import '../sync/manifest.dart';
 
 /// Result of one [IndexScanner.scan] pass: the entries whose rows actually
@@ -66,12 +67,27 @@ class IndexScanner {
   /// behaviour is byte-for-byte identical to before this parameter existed.
   /// Hashing is unaffected either way — see class docs for why every file is
   /// still hashed on every scan.
+  /// [ignoreGlobs], [ignoreExtensions], and [maxFileSizeBytes] are Roadmap
+  /// Phase 6.2 (ignore rules) — all optional and default to
+  /// empty/null/no-op, so every pre-Phase-6 caller (and every existing
+  /// test) behaves byte-for-byte as before. A path matching a rule is
+  /// skipped before it's ever hashed or upserted — same "never-indexed"
+  /// shape as `.syncstate`/`.syncversions` — but is still added to
+  /// [seenPaths] so it's FROZEN rather than tombstoned: an
+  /// already-synced file that starts matching a rule keeps its last-synced
+  /// state and stops receiving further local-edit propagation, but is never
+  /// deleted or delete-propagated to the peer. (Confirmed with the user
+  /// 2026-07-11 — the alternative, treating a new ignore rule like a
+  /// delete, is a different feature.)
   Future<ScanResult> scan({
     required FileSystemAccess fs,
     required IndexDb db,
     required String rootPath,
     required String deviceId,
     Future<List<FileEntry>> Function(String rootPath)? batchListWithStat,
+    List<String> ignoreGlobs = const [],
+    List<String> ignoreExtensions = const [],
+    int? maxFileSizeBytes,
   }) async {
     final changed = <IndexEntry>[];
     final seenPaths = <String>{};
@@ -85,6 +101,21 @@ class IndexScanner {
       // partial-download suffix here so a crashed block transfer never appears
       // as a "new file" in the index.
       if (_isInternalArtefact(rel)) continue;
+
+      // Phase 6.2 — ignore rules. Freeze (not tombstone): still mark the
+      // path seen so the tombstone sweep below leaves it alone, but skip
+      // hashing/upserting so it never enters the Index DB, never gets a
+      // version vector bump, and further local edits stop propagating.
+      if (matchesIgnoreRule(
+        rel,
+        sizeBytes: fileEntry.size,
+        globs: ignoreGlobs,
+        extensions: ignoreExtensions,
+        maxFileSizeBytes: maxFileSizeBytes,
+      )) {
+        seenPaths.add(rel);
+        continue;
+      }
 
       seenPaths.add(rel);
 

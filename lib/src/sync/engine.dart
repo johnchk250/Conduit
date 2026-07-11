@@ -14,6 +14,7 @@ import 'file_send.dart';
 import 'index_diff.dart';
 import 'manifest.dart';
 import 'scanner.dart';
+import 'vault_log.dart';
 import 'watcher.dart';
 
 /// Conservative folder-sync transfer pipeline. This changes only block request
@@ -216,6 +217,14 @@ class SyncEngine {
   /// point — the durable index survives across sessions.
   final _indexDbs = <String, IndexDb>{};
 
+  /// Roadmap Phase 6.4 — per-pair vault catalogs. See vault_log.dart doc
+  /// comment for why this exists instead of listing `.syncversions/`
+  /// directly. Cached the same way as [_indexDbs], but holds no OS
+  /// resource (just a [File] reference), so unlike [_indexDbs] there's
+  /// nothing to `close()` — [stopPair] still drops the cache entry for
+  /// tidiness/symmetry.
+  final _vaultLogs = <String, VaultLog>{};
+
   /// Filesystem scanner (decoupled from sync — REDESIGN.md §(4)). One shared
   /// instance; the scanner is stateless across pairs (all per-folder state lives
   /// in the Index DB it writes to).
@@ -386,6 +395,9 @@ class SyncEngine {
       rootPath: pair.localPath,
       deviceId: deviceId,
       batchListWithStat: batchListWithStat,
+      ignoreGlobs: pair.ignoreGlobs,
+      ignoreExtensions: pair.ignoreExtensions,
+      maxFileSizeBytes: pair.maxFileSizeBytes,
     );
     log(pair.id, 'Index seeded', SyncEventLevel.info);
     // If a peer is already connected, kick the first reconcile; otherwise
@@ -428,6 +440,7 @@ class SyncEngine {
         await db.close();
       } catch (_) {}
     }
+    _vaultLogs.remove(pairId); // no resource to close — just a File ref
     _peerLive.remove(pairId);
     _peerSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _sentSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
@@ -450,6 +463,35 @@ class SyncEngine {
   /// existing file's schema if needed.
   Future<IndexDb> _indexDbFor(FolderPair pair) async {
     return _indexDbs[pair.id] ??= await IndexDb.open(pair.id, stateDir);
+  }
+
+  /// Open (or return the cached) vault catalog for [pair]. See vault_log.dart.
+  Future<VaultLog> _vaultLogFor(FolderPair pair) async {
+    return _vaultLogs[pair.id] ??= await VaultLog.open(pair.id, stateDir);
+  }
+
+  /// Roadmap Phase 6.4 — list this pair's vault catalog for the
+  /// version-restore UI (see vault_log.dart).
+  Future<List<VaultLogEntry>> vaultEntries(FolderPair pair) async {
+    final vlog = await _vaultLogFor(pair);
+    return vlog.all();
+  }
+
+  /// Records a vault event directly. Used by [AppState.restoreVersion],
+  /// which vaults the current live file itself (via `fs.moveToVault`,
+  /// outside the block-transfer path) before overwriting it with an older
+  /// version, so that a restore is itself undoable rather than a one-way
+  /// trip.
+  Future<void> recordVaultEvent(FolderPair pair, VaultLogEntry entry) async {
+    final vlog = await _vaultLogFor(pair);
+    await vlog.record(entry);
+  }
+
+  /// Drops one vault catalog entry (used by [AppState.restoreVersion] after
+  /// a successful restore, once that vaulted copy's bytes are live again).
+  Future<void> removeVaultEntry(FolderPair pair, VaultLogEntry entry) async {
+    final vlog = await _vaultLogFor(pair);
+    await vlog.remove(entry);
   }
 
   Future<void> dispose() async {
@@ -783,6 +825,9 @@ class SyncEngine {
       rootPath: pair.localPath,
       deviceId: deviceId,
       batchListWithStat: batchListWithStat,
+      ignoreGlobs: pair.ignoreGlobs,
+      ignoreExtensions: pair.ignoreExtensions,
+      maxFileSizeBytes: pair.maxFileSizeBytes,
     );
 
     if (session == null) {
@@ -922,6 +967,20 @@ class SyncEngine {
               st.progress = total == 0 ? null : (done + recv / tot) / total;
               if (!_disposed) _stateController.add(st);
             },
+            // Roadmap Phase 6.4 (version-restore) — best-effort, fire-and-
+            // forget (same unawaited pattern already used elsewhere in this
+            // file): a slow or failed catalog write must never hold up the
+            // transfer this callback fires from the middle of.
+            onVaulted: (vaultPath, oldSizeBytes) => unawaited(
+              _vaultLogFor(pair).then(
+                (vlog) => vlog.record(VaultLogEntry(
+                  relPath: need.relPath,
+                  vaultPath: vaultPath,
+                  timestamp: DateTime.now(),
+                  sizeBytes: oldSizeBytes,
+                )),
+              ),
+            ),
           );
           // After a successful fetch the bytes on disk are guaranteed to hash to
           // `sha` (fetchFileBlockLevel verified the whole-file sha before

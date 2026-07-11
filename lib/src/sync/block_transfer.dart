@@ -93,6 +93,13 @@ Future<String> fetchFileBlockLevel({
       sendRequest,
   void Function(int received, int total)? onProgress,
   int pipelineDepth = 1,
+  // Roadmap Phase 6.4 (version-restore) — fires with the vault destination
+  // path and the SIZE OF THE OLD FILE THAT WAS VAULTED (not the new
+  // incoming size) whenever an existing file is vaulted before being
+  // overwritten by this fetch. Optional, defaults to null/no-op: every
+  // pre-Phase-6 caller (and every existing test) is unaffected. See
+  // _replacePartWithFinal.
+  void Function(String vaultPath, int oldSizeBytes)? onVaulted,
 }) async {
   final partRel = '$relPath$syncPartSuffix';
   final totalBlocks = (expectedSize + blockSize - 1) ~/ blockSize;
@@ -218,23 +225,66 @@ Future<String> fetchFileBlockLevel({
     return result;
   }
 
-  await _replacePartWithFinal(fs, rootPath, partRel, relPath);
+  await _replacePartWithFinal(fs, rootPath, partRel, relPath,
+      onVaulted: onVaulted);
   return result;
 }
 
+/// Roadmap Phase 6.4 (version-restore, edit-only scope — see PROGRESS.md
+/// 2026-07-11 for why delete-restore is out of scope: it would require
+/// touching `_applyRemoteTombstone`, which is on the project's own
+/// do-not-touch list).
+///
+/// Before a fetched file replaces an existing one, the existing file is
+/// moved into the `.syncversions` vault (already-existing but previously
+/// dead infrastructure — see `manifest.dart`/`saf_access.dart`
+/// `moveToVault`) so a prior version is recoverable. This is purely
+/// additive to the disk layout: no DB write, no wire message, no version-
+/// vector interaction, and no engine code touched — this function is not on
+/// the do-not-touch list. Best-effort: if the vault write fails for any
+/// reason (permissions, disk full, etc.), the transfer proceeds exactly as
+/// it did before this change rather than being blocked by a vault failure.
 Future<void> _replacePartWithFinal(
   FileSystemAccess fs,
   String rootPath,
   String partRel,
-  String relPath,
-) async {
+  String relPath, {
+  void Function(String vaultPath, int oldSizeBytes)? onVaulted,
+}) async {
   if (fs is LocalFileSystemAccess) {
     final part = File(p.join(rootPath, partRel));
     final dest = File(p.join(rootPath, relPath));
     await Directory(p.dirname(dest.path)).create(recursive: true);
-    if (await dest.exists()) await dest.delete();
+    if (await dest.exists()) {
+      var vaulted = false;
+      try {
+        // Stat BEFORE vaulting: moveToVault renames the file away, so
+        // dest.length() would throw afterward.
+        final oldSize = await dest.length();
+        final vaultPath = await fs.moveToVault(rootPath, relPath);
+        vaulted = true;
+        onVaulted?.call(vaultPath, oldSize);
+      } catch (_) {
+        // Best-effort — fall through to the pre-existing delete-and-replace
+        // behavior below so a vault failure never blocks the transfer.
+      }
+      // moveToVault already removed the file at `dest` by renaming it away;
+      // only delete here if that didn't happen (vault failed, or `dest`
+      // reappeared/still exists for some other reason).
+      if (!vaulted && await dest.exists()) await dest.delete();
+    }
     await part.rename(dest.path);
     return;
+  }
+  final existing = await fs.stat(rootPath, relPath);
+  if (existing != null) {
+    try {
+      final vaultPath = await fs.moveToVault(rootPath, relPath);
+      onVaulted?.call(vaultPath, existing.size);
+    } catch (_) {
+      // Best-effort — the write below overwrites in place either way,
+      // matching pre-existing behavior when vaulting isn't possible.
+    }
   }
   final bytes = await _readAll(fs, rootPath, partRel);
   await fs.write(rootPath, relPath, bytes);

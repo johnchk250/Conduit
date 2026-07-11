@@ -9,6 +9,7 @@ import '../app_state.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
 import '../sync/engine.dart';
+import 'version_history_screen.dart';
 
 /// Folder pairs list + add/invite/accept flow + per-pair detail view.
 ///
@@ -427,6 +428,14 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
   Widget build(BuildContext ctx) {
     final state = context.watch<AppState>();
     final st = state.stateFor(widget.pair.id);
+    // Re-derive from live config (not the immutable widget.pair) so the
+    // ignore-rules summary below reflects a save immediately, instead of
+    // only after this screen is reopened. Falls back to widget.pair if the
+    // pair was removed while this screen is open.
+    final currentPair = state.config.folderPairs
+        .cast<FolderPair?>()
+        .firstWhere((p) => p?.id == widget.pair.id, orElse: () => null) ??
+        widget.pair;
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.pair.name),
@@ -452,6 +461,37 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
           ),
           if (widget.pair.peerDeviceId != null)
             _kv('Paired with', widget.pair.peerDeviceId!),
+          if (currentPair.ignoreGlobs.isNotEmpty ||
+              currentPair.ignoreExtensions.isNotEmpty ||
+              currentPair.maxFileSizeBytes != null)
+            _kv('Ignore rules', _ignoreRulesSummary(currentPair)),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () =>
+                      _showIgnoreRulesDialog(ctx, state, currentPair),
+                  icon: const Icon(Icons.rule_folder_outlined),
+                  label: const Text('Ignore rules'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => Navigator.push(
+                    ctx,
+                    MaterialPageRoute(
+                      builder: (_) =>
+                          VersionHistoryScreen(pair: currentPair),
+                    ),
+                  ),
+                  icon: const Icon(Icons.history),
+                  label: const Text('Restore versions'),
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 24),
           Row(
             children: [
@@ -524,6 +564,144 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
               child: Text(v,
                   style:
                       const TextStyle(fontFamily: 'monospace', fontSize: 12))),
+        ],
+      ),
+    );
+  }
+
+  String _ignoreRulesSummary(FolderPair pair) {
+    final parts = <String>[];
+    if (pair.ignoreGlobs.isNotEmpty) {
+      parts.add('${pair.ignoreGlobs.length} pattern'
+          '${pair.ignoreGlobs.length == 1 ? '' : 's'}');
+    }
+    if (pair.ignoreExtensions.isNotEmpty) {
+      parts.add('${pair.ignoreExtensions.length} extension'
+          '${pair.ignoreExtensions.length == 1 ? '' : 's'}');
+    }
+    if (pair.maxFileSizeBytes != null) {
+      parts.add('max ${_fmtBytes(pair.maxFileSizeBytes!)}');
+    }
+    return parts.join(', ');
+  }
+
+  String _fmtBytes(int bytes) {
+    if (bytes >= 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    if (bytes >= 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '$bytes B';
+  }
+
+  /// Roadmap Phase 6.2 — ignore rules editor. Purely local per pair (see
+  /// wire.dart doc comment on why this isn't peer-negotiated). Saving calls
+  /// [AppState.updateIgnoreRules], which restarts this pair's watcher so
+  /// the new rules take effect immediately rather than after an app
+  /// restart.
+  Future<void> _showIgnoreRulesDialog(
+    BuildContext ctx,
+    AppState state,
+    FolderPair pair,
+  ) async {
+    final globsCtl =
+        TextEditingController(text: pair.ignoreGlobs.join('\n'));
+    final extCtl =
+        TextEditingController(text: pair.ignoreExtensions.join('\n'));
+    final sizeCtl = TextEditingController(
+      text: pair.maxFileSizeBytes != null
+          ? (pair.maxFileSizeBytes! / (1024 * 1024)).toStringAsFixed(0)
+          : '',
+    );
+
+    await showDialog<void>(
+      context: ctx,
+      builder: (dctx) => AlertDialog(
+        title: const Text('Ignore rules'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Matching files are never synced. Files already synced when '
+                'a rule is added keep their last-synced copy on both '
+                'devices — they are frozen in place, not deleted.',
+                style: TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: globsCtl,
+                maxLines: 3,
+                decoration: const InputDecoration(
+                  labelText: 'Glob patterns (one per line)',
+                  hintText: 'node_modules/**\n*.tmp',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: extCtl,
+                maxLines: 2,
+                decoration: const InputDecoration(
+                  labelText: 'Extensions (one per line)',
+                  hintText: '.tmp\n.log',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: sizeCtl,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'Max file size in MB (blank = no limit)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              final globs = globsCtl.text
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .where((s) => s.isNotEmpty)
+                  .toList();
+              final exts = extCtl.text
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .where((s) => s.isNotEmpty)
+                  .toList();
+              final sizeText = sizeCtl.text.trim();
+              int? maxBytes;
+              if (sizeText.isNotEmpty) {
+                final mb = double.tryParse(sizeText);
+                if (mb == null || mb <= 0) {
+                  ScaffoldMessenger.of(ctx).showSnackBar(
+                    const SnackBar(
+                        content: Text('Max file size must be a positive '
+                            'number, or left blank.')),
+                  );
+                  return;
+                }
+                maxBytes = (mb * 1024 * 1024).round();
+              }
+              await state.updateIgnoreRules(
+                pair.id,
+                ignoreGlobs: globs,
+                ignoreExtensions: exts,
+                maxFileSizeBytes: maxBytes,
+              );
+              if (dctx.mounted) Navigator.pop(dctx);
+            },
+            child: const Text('Save'),
+          ),
         ],
       ),
     );

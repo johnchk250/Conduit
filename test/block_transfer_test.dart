@@ -119,6 +119,61 @@ void main() {
   });
 
   test(
+      'fetching a file that already exists locally vaults the old bytes '
+      'under .syncversions/ and lands the new bytes at the live path '
+      '(Roadmap Phase 6.4 — version-restore, edit-only scope)', () async {
+    final oldContent = bytes(500); // whatever was there before
+    final newContent = bytes(2048); // < 1 block, what the peer is sending
+    final serverFs = FakeFs({'a.txt': newContent});
+    final clientFs = FakeFs({'a.txt': oldContent}); // already exists locally
+
+    final b = bridge(serverFs: serverFs, relPath: 'a.txt');
+    final result = await fetchFileBlockLevel(
+      fs: clientFs,
+      rootPath: 'r',
+      relPath: 'a.txt',
+      expectedSize: newContent.length,
+      expectedSha: sha(newContent),
+      blockHashes: blockHashesFor(newContent),
+      sendRequest: b.sendRequest,
+    );
+    expect(result, sha(newContent));
+    // New bytes landed at the live path.
+    expect(clientFs.files['a.txt'], newContent);
+    expect(clientFs.files.containsKey('a.txt$syncPartSuffix'), isFalse);
+    // Old bytes are recoverable under .syncversions/, not silently lost.
+    final vaultKeys =
+        clientFs.files.keys.where((k) => k.startsWith('.syncversions/'));
+    expect(vaultKeys, hasLength(1));
+    expect(clientFs.files[vaultKeys.single], oldContent);
+  });
+
+  test(
+      'a vault failure never blocks the transfer — the file is still '
+      'overwritten with the new content', () async {
+    // FailingVaultFs models a real-world vault failure (permissions, disk
+    // full, a transient SAF error) — moveToVault always throws. The fetch
+    // must still complete and land the new bytes, per the plan's explicit
+    // "best-effort, never block the transfer" requirement.
+    final newContent = bytes(2048);
+    final serverFs = FakeFs({'a.txt': newContent});
+    final clientFs = _FailingVaultFs({'a.txt': bytes(500)});
+
+    final b = bridge(serverFs: serverFs, relPath: 'a.txt');
+    final result = await fetchFileBlockLevel(
+      fs: clientFs,
+      rootPath: 'r',
+      relPath: 'a.txt',
+      expectedSize: newContent.length,
+      expectedSha: sha(newContent),
+      blockHashes: blockHashesFor(newContent),
+      sendRequest: b.sendRequest,
+    );
+    expect(result, sha(newContent));
+    expect(clientFs.files['a.txt'], newContent);
+  });
+
+  test(
       'pipelined fetch (depth > 1): a multi-block file is reassembled and '
       'verified identically to the depth-1 default', () async {
     final content = bytes(blockSize * 5 + 777); // 6 blocks, last partial
@@ -413,7 +468,43 @@ class FakeFs implements FileSystemAccess {
   Future<bool> delete(String rootPath, String relPath) async =>
       files.remove(relPath) != null;
 
+  /// Was dead code (`throw UnsupportedError`) before Phase 6.4 wired
+  /// `moveToVault` into `_replacePartWithFinal`. In-memory mirror of the
+  /// real implementations' naming convention (`.syncversions/<dir>/<base>.
+  /// <stamp>.<ext>`) — a monotonic counter stands in for the real
+  /// timestamp so vault destinations stay unique within a single test
+  /// without depending on wall-clock resolution.
+  int _vaultCounter = 0;
+
   @override
-  Future<String> moveToVault(String rootPath, String relPath) async =>
-      throw UnsupportedError('not used by block_transfer');
+  Future<String> moveToVault(String rootPath, String relPath) async {
+    final existing = files[relPath];
+    if (existing == null) {
+      throw StateError('moveToVault: no file at $relPath');
+    }
+    _vaultCounter++;
+    final slash = relPath.lastIndexOf('/');
+    final dir = slash == -1 ? '' : relPath.substring(0, slash + 1);
+    final name = slash == -1 ? relPath : relPath.substring(slash + 1);
+    final dotIdx = name.lastIndexOf('.');
+    final base = dotIdx <= 0 ? name : name.substring(0, dotIdx);
+    final ext = dotIdx <= 0 ? '' : name.substring(dotIdx);
+    final dest = '.syncversions/$dir$base.stamp$_vaultCounter$ext';
+    files[dest] = List<int>.of(existing);
+    files.remove(relPath);
+    return dest;
+  }
+}
+
+/// A [FakeFs] whose [moveToVault] always throws, modeling a real-world vault
+/// failure (permissions, disk full, a transient SAF error). Used to prove
+/// `_replacePartWithFinal`'s vaulting is genuinely best-effort — a failure
+/// here must never prevent the transfer itself from completing.
+class _FailingVaultFs extends FakeFs {
+  _FailingVaultFs([super.initial]);
+
+  @override
+  Future<String> moveToVault(String rootPath, String relPath) async {
+    throw StateError('simulated vault failure');
+  }
 }

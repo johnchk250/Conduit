@@ -67,8 +67,14 @@ codebase → Windows `.exe` + Android `.apk`.
   semantics (`block_transfer.dart`).
 - **Deletes:** tombstones + version-vector dominance, receive-time
   delete-vs-edit decision (`_applyRemoteTombstone`, `DeleteDecision`).
-- **Tests:** 154/154 passing, logic-only (real `IndexDb`/scanner/diff/transfer,
-  no sockets/SAF/hardware). Each fixed bug has a dedicated regression test.
+- **Tests:** 192 as of 2026-07-11 (Phase 6.2/6.4 added 39; last independently
+  *run and confirmed* passing was 154/154 on 2026-07-08 — no Flutter/Dart SDK
+  has been available in the implementing sandbox for any session since, so
+  every addition after that date, including this one, was verified by manual
+  read-through/hand-traced test cases rather than execution; see
+  `ARCHITECTURE.md` §10 and Appendix B), logic-only (real
+  `IndexDb`/scanner/diff/transfer, no sockets/SAF/hardware). Each fixed bug
+  has a dedicated regression test.
 
 ### The three independent V2 mechanisms (don't fight these)
 1. Persistent Index DB (durable source of truth).
@@ -381,6 +387,135 @@ Fold all the above into a cohesive redesign rather than bolting on piecemeal:
 
 **Acceptance:** Activity is human-readable and color-coded; nav is
 uncluttered; new feature screens match the rest of the app.
+
+---
+
+### Phase 6 — Quick-setup wizard, sync preview, ignore rules, version-restore UI
+**Source:** `docs/2026-07-11-phase6-planning.md`. Numbering below matches that
+doc's own §7 summary table.
+
+#### 6.1 — Sync preview
+**Status:** ☐ not started (out of scope for the 2026-07-11 implementation
+session — not requested).
+
+#### 6.2 — Ignore rules (glob / extension / size)
+**Status:** ✅ complete (2026-07-11)
+**Engine-safe?** ✅ new module (`ignore_rules.dart`) + one new `continue`
+branch in `scanner.dart`'s existing per-file loop, gated behind optional
+params that default to empty/null/no-op. Does not touch `indexDiff`,
+`_applyRemoteTombstone`, `upsertLocal`, or the version-vector path.
+
+`FolderPair` (`wire.dart`) gained `ignoreGlobs` / `ignoreExtensions` /
+`maxFileSizeBytes` — local-only, not peer-negotiated, backward-compatible
+JSON. New `lib/src/sync/ignore_rules.dart`: a small hand-rolled glob
+matcher (`*`, `**`, `?`) rather than the planning doc's suggested `glob`
+pub package — no Flutter/Dart SDK or pub.dev access in the implementing
+session's sandbox to fetch/verify a new dependency against. Wired into
+`scanner.dart` right after the existing `_isInternalArtefact` check: a
+matching path is skipped before hashing/upserting.
+
+**Retroactive-ignore semantics (§4.4 open question) — resolved:** confirmed
+with Aminul before implementation. A rule added for an already-synced file
+**freezes** it (keeps last-synced state on both devices, stops tracking
+further local edits) rather than tombstoning/deleting it. The matched path
+is still added to the scanner's `seenPaths` set specifically so the
+tombstone sweep doesn't mistake "now ignored" for "locally deleted."
+
+New "Ignore rules" editor dialog in `folder_pairs_screen.dart`, calling new
+`AppState.updateIgnoreRules`. That method explicitly cycles
+`engine.stopPair`/`startPair` rather than just re-persisting to config —
+`startPair(pair)` closes over the `FolderPair` object in its watcher/timer
+closures, so a plain persist would leave an already-running pair using
+stale rules until app restart. (The pre-existing name/path/direction
+edit dialog has this same latent gap via `addFolderPair` — noted, not
+fixed, out of scope for this phase.)
+
+Files: `lib/src/sync/ignore_rules.dart` (new), `lib/src/protocol/wire.dart`,
+`lib/src/sync/scanner.dart`, `lib/src/sync/engine.dart` (both `scan()` call
+sites), `lib/src/app_state.dart`, `lib/src/ui/folder_pairs_screen.dart`.
+Tests: `test/ignore_rules_test.dart` (new, 16 cases) + 6 new cases in
+`test/scanner_test.dart` (including the retroactive-freeze-not-tombstone
+invariant).
+
+**Acceptance:** a glob/extension/size rule keeps a matching file out of the
+Index DB entirely; adding a rule for an already-synced file freezes it in
+place on both devices rather than deleting it anywhere; removing the rule
+resumes normal tracking.
+
+#### 6.3 — Quick-setup wizard (camera/screenshot backup presets)
+**Status:** ☐ not started (out of scope for the 2026-07-11 implementation
+session — not requested).
+
+#### 6.4 — Version-restore UI (edit-only scope)
+**Status:** ✅ complete for edit-only scope (2026-07-11). Restoring a
+*deleted* file (the doc's option (a)) remains ☐ not started.
+**Engine-safe?** ✅ `block_transfer.dart`'s `_replacePartWithFinal` is not on
+the do-not-touch list; the restore write path is an ordinary
+`FileSystemAccess.write` call, deliberately not special-cased anywhere in
+`scanner.dart`/`engine.dart`'s reconcile logic/`indexDiff`/`upsertLocal`/
+`VersionVector` — the next scan picks up a restored file exactly like any
+other local edit.
+
+**Scope decision (§5.3 open question) — resolved without needing to ask:**
+the doc's option (a), restoring a *deleted* file, requires a line inside
+`_applyRemoteTombstone` — which this project's own §0 hard-constraint list
+above already names as must-not-touch, no exceptions. That's not a
+judgment call the way retroactive-ignore semantics was; it's already
+answered by an existing constraint. Implemented the doc's recommended
+option (b) only: restoring a previous version of an *edited* file.
+
+`_replacePartWithFinal` now vaults the existing file (via
+`FileSystemAccess.moveToVault` — previously-dead infrastructure, zero
+callers before this phase) before an incoming fetch overwrites it.
+Best-effort: a vault failure never blocks the transfer. **Bug caught and
+fixed before shipping:** `LocalFileSystemAccess.moveToVault` returned an
+*absolute* path while the Android SAF implementation returned a *relative*
+one — harmless while nothing consumed the return value, but would have
+broken cross-platform restore inconsistently. Fixed to return a path
+relative to `rootPath` on both platforms, at the one moment doing so was
+guaranteed to affect no existing behavior.
+
+New `lib/src/sync/vault_log.dart`: a small per-pair JSON catalog of vault
+events (in the app's own state directory, not inside the synced folder),
+used instead of directory-listing `.syncversions/` — both
+`FileSystemAccess.listFiles` implementations already filter that directory
+out (existing scanner behavior), and extending the Android native side to
+list it would mean shipping new, unverifiable Kotlin with no SDK/emulator
+available to build or test it against. Reading a *specific known* vaulted
+path back needs no new native code (confirmed: the native `stat`/`read`
+handlers resolve an exact path with no directory-level filtering) — that's
+what restore uses.
+
+New `AppState.restoreVersion`: reads the vaulted bytes, vaults the
+*current* live file first (so a restore is itself undoable), writes the
+restored bytes via the ordinary filesystem-write path. New
+`lib/src/ui/version_history_screen.dart` (list + confirm + restore), wired
+from a new button in `folder_pairs_screen.dart`'s pair-detail screen.
+
+**Retention policy (§5.2.3) — out of scope for this pass**, matching the
+planning doc's own "first cut" framing: old vault entries are never pruned.
+
+Files: `lib/src/sync/vault_log.dart` (new), `lib/src/ui/version_history_screen.dart`
+(new), `lib/src/sync/block_transfer.dart`, `lib/src/sync/manifest.dart`
+(the absolute/relative-path fix), `lib/src/sync/engine.dart`,
+`lib/src/app_state.dart`, `lib/src/ui/folder_pairs_screen.dart`. Tests:
+`test/vault_log_test.dart` (new, 8 cases), `test/local_fs_access_test.dart`
+(new, 7 cases — including a dedicated regression test for the
+absolute/relative-path bug), + 2 new cases in `test/block_transfer_test.dart`.
+
+**Acceptance:** a file overwritten by an incoming sync is recoverable from
+the "Restore versions" screen; restoring it propagates to the peer as a
+normal edit with no engine-level special-casing; a vault failure never
+blocks a transfer.
+
+**Not independently verified this session** (no Flutter/Dart SDK
+available): every new test was hand-traced against the exact algorithm
+rather than executed (glob-matching logic additionally cross-checked
+against a Python mirror). Test count 153→192 (39 new). Recommend running
+`flutter analyze` + `flutter test` and a real cross-device
+edit-conflict-then-restore on both Windows and Android before merging. See
+`ARCHITECTURE.md` Appendix B (2026-07-11 entry) and `PROGRESS.md`/
+`THINKING.md` for the full investigation and design-decision trail.
 
 ---
 

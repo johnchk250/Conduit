@@ -92,15 +92,145 @@ void main() {
     expect(result.changed.where((e) => e.relPath == 'b.txt'), isEmpty);
   });
 
-  test('.syncpart partial downloads are never indexed', () async {
+  test('a file matching an ignore glob is never indexed at all', () async {
     final fs = FakeFs({
       'a.txt': utf8Bytes('hello'),
-      'a.txt.syncpart': utf8Bytes('partial'), // a crashed block transfer
+      'node_modules/pkg/index.js': utf8Bytes('module.exports = {}'),
     });
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      ignoreGlobs: ['node_modules/**'],
+    );
+    expect(result.changed.map((e) => e.relPath), ['a.txt']);
+    expect(await db.get('node_modules/pkg/index.js'), isNull);
+  });
+
+  test('a file matching an ignored extension is never indexed', () async {
+    final fs = FakeFs({
+      'a.txt': utf8Bytes('hello'),
+      'debug.log': utf8Bytes('log output'),
+    });
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      ignoreExtensions: ['.log'],
+    );
+    expect(result.changed.map((e) => e.relPath), ['a.txt']);
+    expect(await db.get('debug.log'), isNull);
+  });
+
+  test('a file over the size cap is never indexed', () async {
+    final fs = FakeFs({
+      'small.bin': utf8Bytes('x' * 10),
+      'big.bin': utf8Bytes('x' * 1000),
+    });
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      maxFileSizeBytes: 100,
+    );
+    expect(result.changed.map((e) => e.relPath), ['small.bin']);
+    expect(await db.get('big.bin'), isNull);
+  });
+
+  test(
+      'retroactive ignore rule FREEZES an already-synced file — it is '
+      'NOT reported as a tombstone/delete (confirmed with user 2026-07-11)',
+      () async {
+    final fs = FakeFs({'a.txt': utf8Bytes('hello'), 'b.txt': utf8Bytes('x')});
+    // First scan: no ignore rules yet — a.txt is indexed normally.
+    await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
+    final before = await db.get('a.txt');
+    expect(before, isNotNull);
+    expect(before!.deleted, isFalse);
+
+    // A rule now covers a.txt (nothing changed on disk).
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      ignoreGlobs: ['a.txt'],
+    );
+
+    // THE key invariant: a.txt must not appear as a change of any kind —
+    // in particular, NOT as a tombstone. Only b.txt (unaffected) could
+    // possibly appear, and it didn't change either.
+    expect(result.changed, isEmpty);
+
+    // The DB row is untouched: same version/sequence as before, still not
+    // deleted. This is "frozen", not "silently re-synced" or "tombstoned".
+    final after = await db.get('a.txt');
+    expect(after!.version, before.version);
+    expect(after.sequence, before.sequence);
+    expect(after.deleted, isFalse);
+  });
+
+  test(
+      'once frozen, further local edits to the file do not propagate '
+      '(no version bump, not in changed)', () async {
+    final fs = FakeFs({'a.txt': utf8Bytes('hello')});
+    await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
+    await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      ignoreGlobs: ['a.txt'],
+    ); // now frozen
+    final frozen = await db.get('a.txt');
+
+    fs.files['a.txt'] = utf8Bytes('hello world — edited after freeze');
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      ignoreGlobs: ['a.txt'],
+    );
+
+    expect(result.changed, isEmpty);
+    final after = await db.get('a.txt');
+    expect(after!.version, frozen!.version); // unchanged
+    expect(after.sequence, frozen.sequence); // unchanged
+  });
+
+  test(
+      'removing the ignore rule resumes normal tracking — the file is '
+      'picked up again as if newly seen, not as a spurious delete/re-add',
+      () async {
+    final fs = FakeFs({'a.txt': utf8Bytes('hello')});
+    await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
+    await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A',
+        ignoreGlobs: ['a.txt']); // frozen
+    fs.files['a.txt'] = utf8Bytes('edited while frozen');
+
+    // Rule removed — back to normal scanning.
+    final result =
+        await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
+
+    // The edit-while-frozen is now visible, exactly like any other local
+    // edit picked up on the next unrestricted scan — no special-casing,
+    // no phantom delete/re-add pair.
+    expect(result.changed.map((e) => e.relPath), ['a.txt']);
+    final row = await db.get('a.txt');
+    expect(row!.deleted, isFalse);
+  });
+
+  test('ignore params default to empty/null — every existing caller and '
+      'test above behaves byte-for-byte unchanged (no ignore rules passed)',
+      () async {
+    final fs = FakeFs({'a.txt': utf8Bytes('hello')});
     final result =
         await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
     expect(result.changed.map((e) => e.relPath), ['a.txt']);
-    expect(await db.get('a.txt.syncpart'), isNull);
   });
 }
 

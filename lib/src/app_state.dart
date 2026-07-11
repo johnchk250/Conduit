@@ -20,6 +20,7 @@ import 'notifications/notifier.dart';
 import 'platform/saf_access.dart';
 import 'protocol/wire.dart';
 import 'sync/engine.dart';
+import 'sync/vault_log.dart';
 import 'sync/file_send.dart';
 import 'sync/manifest.dart';
 
@@ -821,6 +822,117 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> addFolderPair(FolderPair pair) async {
     await _config.upsertPair(pair);
     await _engine.startPair(pair);
+    notifyListeners();
+  }
+
+  /// Update a pair's ignore rules (Roadmap Phase 6.2) and take effect
+  /// immediately.
+  ///
+  /// Deliberately NOT built on [addFolderPair]/`copyWith`+persist alone:
+  /// `engine.startPair(pair)` closes over the `FolderPair` object in the
+  /// watcher's change-listener and the periodic-reconcile timer, so simply
+  /// re-persisting a changed pair to config would leave those already-running
+  /// closures using the OLD rules until the app restarts (confirmed
+  /// 2026-07-11 while investigating this feature — the same latent gap
+  /// already exists for the pre-existing name/path/direction edit dialog,
+  /// out of scope to fix here). `stopPair` + `startPair` is the same
+  /// restart-the-watcher pattern already relied on when a pair is first
+  /// added, and is explicitly designed to be safe to call in that sequence
+  /// (cancels the watcher/timer, closes + drops the Index DB handle, drops
+  /// per-pair V2 bookkeeping, then a fresh `startPair` reopens everything and
+  /// reseeds via one scan).
+  Future<void> updateIgnoreRules(
+    String pairId, {
+    required List<String> ignoreGlobs,
+    required List<String> ignoreExtensions,
+    int? maxFileSizeBytes,
+  }) async {
+    final existing = _config.folderPairs
+        .cast<FolderPair?>()
+        .firstWhere((p) => p?.id == pairId, orElse: () => null);
+    if (existing == null) return;
+    final updated = FolderPair(
+      id: existing.id,
+      name: existing.name,
+      localPath: existing.localPath,
+      direction: existing.direction,
+      peerDeviceId: existing.peerDeviceId,
+      ignoreGlobs: ignoreGlobs,
+      ignoreExtensions: ignoreExtensions,
+      maxFileSizeBytes: maxFileSizeBytes,
+    );
+    await _config.upsertPair(updated);
+    await _engine.stopPair(pairId);
+    await _engine.startPair(updated);
+    notifyListeners();
+  }
+
+  /// Roadmap Phase 6.4 — version-restore (edit-only scope; see PROGRESS.md
+  /// 2026-07-11 for why delete-restore is out of scope — it would require
+  /// touching `_applyRemoteTombstone`, which is on the project's
+  /// do-not-touch list). Lists this pair's vault catalog for the "Restore
+  /// versions" screen, most-recent-first.
+  Future<List<VaultLogEntry>> vaultEntries(FolderPair pair) =>
+      _engine.vaultEntries(pair);
+
+  /// Restores [entry]'s vaulted bytes back to their live path.
+  ///
+  /// The CURRENT live file (if any) is itself vaulted first — same
+  /// best-effort, never-block-on-failure vaulting `_replacePartWithFinal`
+  /// already uses for incoming transfers — so a restore is itself
+  /// undoable, not a one-way trip.
+  ///
+  /// Writing the restored bytes is an ordinary filesystem write through
+  /// [_fs]: deliberately NOT special-cased anywhere in the sync engine (no
+  /// direct Index DB write, no version-vector bump here, nothing in
+  /// scanner.dart/engine.dart's reconcile logic/indexDiff/upsertLocal/
+  /// VersionVector touched). The next periodic scan (or the folder
+  /// watcher, usually much sooner) picks this up exactly like any other
+  /// local edit — same path as if the user had edited the file directly —
+  /// and propagates it to the peer as a normal sync.
+  Future<void> restoreVersion(FolderPair pair, VaultLogEntry entry) async {
+    final oldBytes = <int>[];
+    await for (final chunk
+        in _fs.openRead(pair.localPath, entry.vaultPath)) {
+      oldBytes.addAll(chunk);
+    }
+
+    final currentStat = await _fs.stat(pair.localPath, entry.relPath);
+    if (currentStat != null) {
+      try {
+        final vaultPath =
+            await _fs.moveToVault(pair.localPath, entry.relPath);
+        await _engine.recordVaultEvent(
+          pair,
+          VaultLogEntry(
+            relPath: entry.relPath,
+            vaultPath: vaultPath,
+            timestamp: DateTime.now(),
+            sizeBytes: currentStat.size,
+          ),
+        );
+      } catch (_) {
+        // Best-effort — proceed with the restore even if vaulting the
+        // about-to-be-replaced file failed; matches
+        // _replacePartWithFinal's existing never-block-on-vault-failure
+        // behavior.
+      }
+    }
+
+    await _fs.write(pair.localPath, entry.relPath, oldBytes);
+
+    // The just-restored vault copy is now redundant (its bytes are live
+    // again) — tidy it up. Best-effort: a failure here just leaves a
+    // harmless extra copy in .syncversions/ and a stale log row: neither
+    // affects sync correctness, since .syncversions/ is already excluded
+    // from the scanner's index.
+    try {
+      await _fs.delete(pair.localPath, entry.vaultPath);
+    } catch (_) {}
+    try {
+      await _engine.removeVaultEntry(pair, entry);
+    } catch (_) {}
+
     notifyListeners();
   }
 

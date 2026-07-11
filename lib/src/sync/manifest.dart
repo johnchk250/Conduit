@@ -62,16 +62,30 @@ abstract class FileSystemAccess {
   Future<bool> delete(String rootPath, String relPath);
 
   /// Move a file to the conflict vault directory (under .syncversions).
+  /// Returns a path RELATIVE to [rootPath] — matching the Android SAF
+  /// native implementation's convention (see SafOps.kt's `vaultRel`) —
+  /// so callers can pass the return value straight back to
+  /// `stat`/`openRead` uniformly across platforms, without re-deriving
+  /// anything platform-specific. (This return value had zero callers
+  /// before Roadmap Phase 6.4 wired it into `_replacePartWithFinal` and
+  /// `AppState.restoreVersion` — the two implementations previously
+  /// disagreed, Local returning an absolute path and SAF a relative one;
+  /// fixed here, at the one moment that change is guaranteed to affect no
+  /// existing behavior.)
   Future<String> moveToVault(String rootPath, String relPath) async {
-    final vaultDir = p.join(rootPath, '.syncversions', p.dirname(relPath));
+    final relDir = p.dirname(relPath); // '.' when relPath has no directory
+    final vaultDir = p.join(rootPath, '.syncversions', relDir);
     await Directory(vaultDir).create(recursive: true);
     final stamp = DateTime.now().toIso8601String().replaceAll(':', '-');
     final base = p.basenameWithoutExtension(relPath);
     final ext = p.extension(relPath);
-    final dest = p.join(vaultDir, '$base.$stamp$ext');
+    final destName = '$base.$stamp$ext';
+    final dest = p.join(vaultDir, destName);
     final src = p.join(rootPath, relPath);
     await File(src).rename(dest);
-    return dest;
+    final vaultRelDir =
+        relDir == '.' ? '.syncversions' : p.join('.syncversions', relDir);
+    return p.join(vaultRelDir, destName);
   }
 }
 
@@ -150,15 +164,19 @@ class LocalFileSystemAccess implements FileSystemAccess {
 
   @override
   Future<String> moveToVault(String rootPath, String relPath) async {
-    final vaultDir = p.join(rootPath, '.syncversions', p.dirname(relPath));
+    final relDir = p.dirname(relPath); // '.' when relPath has no directory
+    final vaultDir = p.join(rootPath, '.syncversions', relDir);
     await Directory(vaultDir).create(recursive: true);
     final stamp = DateTime.now().toIso8601String().replaceAll(':', '-');
     final base = p.basenameWithoutExtension(relPath);
     final ext = p.extension(relPath);
-    final dest = p.join(vaultDir, '$base.$stamp$ext');
+    final destName = '$base.$stamp$ext';
+    final dest = p.join(vaultDir, destName);
     final src = p.join(rootPath, relPath);
     await File(src).rename(dest);
-    return dest;
+    final vaultRelDir =
+        relDir == '.' ? '.syncversions' : p.join('.syncversions', relDir);
+    return p.join(vaultRelDir, destName);
   }
 }
 

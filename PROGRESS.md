@@ -746,3 +746,104 @@ assuming, per this session's explicit "don't corrupt the working app" ask.
 
 **Status: investigation complete, no code changed yet.** Awaiting the
 retroactive-ignore answer above before touching `scanner.dart`/`wire.dart`.
+
+## 2026-07-11 (continued) — Ignore rules + version-restore implemented
+
+**Both features fully implemented, tested (by hand-trace — no SDK available),
+and documented.** Full technical writeup lives in `ARCHITECTURE.md` Appendix B
+(2026-07-11 Phase 6 entry) and `Roadmap.md` §3 Phase 6 — this entry is a
+shorter work-log pointer to that, plus anything not already captured there.
+
+**Ignore rules (6.2):** implemented per the confirmed decision (freeze, don't
+tombstone). New `ignore_rules.dart` (hand-rolled glob matcher — no `glob` pub
+dependency, sandbox has no SDK/pub.dev access to verify one against), wired
+into `scanner.dart`, `wire.dart` (`FolderPair` schema), `engine.dart` (both
+scan call sites), `app_state.dart` (`updateIgnoreRules`, explicitly restarts
+the pair's watcher — see THINKING.md for why), `folder_pairs_screen.dart`
+(editor dialog).
+
+**Version-restore (6.4), edit-only scope:** implemented per the doc's own
+recommended option (b) — restoring a *deleted* file was ruled out without
+needing to ask, since it requires touching `_applyRemoteTombstone`, already on
+the do-not-touch list. `block_transfer.dart`'s `_replacePartWithFinal` now
+vaults an existing file before an incoming fetch overwrites it (best-effort,
+never blocks the transfer on failure). New `vault_log.dart` (per-pair JSON
+catalog, deliberately not a `.syncversions/` directory listing — see below).
+New `AppState.restoreVersion` + `version_history_screen.dart` UI.
+
+**Bug caught and fixed during implementation, before it shipped:**
+`LocalFileSystemAccess.moveToVault` returned an *absolute* path while the
+Android SAF native implementation returned a *relative* one. This had zero
+effect before this session (zero callers), but would have broken cross-
+platform restore inconsistently once `_replacePartWithFinal` started
+depending on the return value. Fixed both (duplicated) `manifest.dart` copies
+to return a `rootPath`-relative path, matching SAF's convention — verified
+safe to change precisely because nothing consumed the return value before
+this session (confirmed by grep before making the change, not assumed).
+
+**Also caught and fixed:** the vault-log entry's `sizeBytes` was initially
+wired to the *incoming* peer file's size instead of the *vaulted (old)* file's
+size — caught on self-review before finalizing, not by the person. Fixed by
+changing `_replacePartWithFinal`'s `onVaulted` callback to a two-arg
+`(vaultPath, oldSizeBytes)` signature, threading the correct value through
+from both platform branches.
+
+**Why version-restore needed no new native Android code:** `FileSystemAccess
+.listFiles` (both platforms) already filters out `.syncversions/` — existing,
+load-bearing scanner behavior, confirmed by reading both `manifest.dart` and
+`SafOps.kt` before assuming. Writing new Kotlin to list vault contents would
+mean shipping unverifiable native code (no Android SDK/emulator in this
+sandbox to build or test it against). Instead, `vault_log.dart` keeps its own
+small catalog of "what got vaulted and when," written purely on the Dart side,
+and restore reads a *specific known* vaulted path back through the existing
+`stat`/`openRead` native handlers — confirmed by reading `SafOps.kt` that
+those resolve an exact path with no directory-level filtering, so no new
+native code was needed at all.
+
+**Pre-existing latent gap found, not fixed (out of scope):** the existing
+pair-edit dialog's `addFolderPair` call is a no-op on the engine for an
+already-running pair (`startPair`'s `if (_watchers.containsKey(...)) return`
+guard) — editing name/localPath/direction on a live pair silently doesn't
+take effect until app restart. Found while checking whether `updateIgnoreRules`
+could reuse that path (it can't, for the same reason) — noted here and in
+`Roadmap.md`/`ARCHITECTURE.md` for visibility, deliberately not fixed since
+it's unrelated to this session's two requested features and touching it risks
+scope creep into working code.
+
+**Test-count bookkeeping:** actual baseline going into this session was 153
+tests (verified directly against commit `490350e`, not trusted from
+`ARCHITECTURE.md`'s prose, which claimed 154/155 in different places — another
+small instance of the project's own "audit source, don't trust docs" principle
+paying off). 39 new tests added (`ignore_rules_test.dart` 16,
+`vault_log_test.dart` 8, `local_fs_access_test.dart` 7, +6 in
+`scanner_test.dart`, +2 in `block_transfer_test.dart`) → 192 total. None of
+this was run — no Flutter/Dart SDK in this sandbox, same constraint as every
+prior session. Verification was: hand-tracing every test's expected outcome
+against the exact algorithm (the glob matcher was additionally cross-checked
+against a Python mirror of the same character-by-character translation logic,
+since that's the one piece of new logic complex enough to be worth an
+independent check); re-viewing every touched file in full after editing;
+balanced-delimiter checks on every touched/new file; grepping for every call
+site of every changed function signature to confirm no caller was missed;
+and confirming every existing test fixture's `FileSystemAccess` fake that
+stubs `moveToVault` (several across the suite, in files unrelated to this
+session) is safe by construction under the new best-effort try/catch design,
+whether it throws or no-ops.
+
+**Docs updated:** `Roadmap.md` new Phase 6 section (6.1/6.3 marked not
+started — out of scope this session; 6.2/6.4 marked complete with full
+detail). `ARCHITECTURE.md` module map, test count, Appendix A (new test files
++ expanded coverage notes on existing ones), Appendix B (full changelog
+entry). Copied the uploaded planning doc into `docs/2026-07-11-phase6-
+planning.md` so the paths referenced throughout the new code comments and
+docs actually resolve in the repo.
+
+**Status: implementation complete for the two requested features.**
+Delivered as downloadable files/patches (no direct GitHub push access, per
+usual). Recommend, before merging: `flutter analyze` + `flutter test` (192
+expected), and a manual pass — add an ignore rule and confirm an
+already-synced file freezes rather than disappearing from the peer; edit the
+same file from both devices to force a same-file overwrite and confirm the
+old version shows up in "Restore versions" on both Windows and Android
+(SAF's `moveToVault` path in particular, since that native code could not be
+built or run here).

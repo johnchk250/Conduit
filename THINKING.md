@@ -269,3 +269,61 @@ second (§5) — verifying each with manual read-through + hand-traced test
 cases before moving to the next, rather than writing both features and
 verifying at the end. Smaller verified increments over one big unverified
 batch, given no SDK access to lean on for automated verification here.
+
+## 2026-07-11 (continued) — Implementation notes not fully captured elsewhere
+
+A few reasoning moments worth keeping a record of, beyond what's in
+`ARCHITECTURE.md`/`PROGRESS.md`/`Roadmap.md`:
+
+**Why I didn't ask about the `glob` package or the delete-restore scope, but
+did ask about retroactive-ignore.** All three were "deviate from the doc"
+moments, but only one was actually a judgment call. Delete-restore was
+already answered by the project's own pre-existing hard constraint
+(`_applyRemoteTombstone` on the do-not-touch list) — asking would have been
+asking permission to violate a rule the person already wrote down, which
+isn't a real question. The `glob` package was a technical environment
+constraint (no SDK/pub access), not a preference — there wasn't a version of
+"yes, use it anyway" that was actually available to choose. Retroactive-ignore
+was different: both options were technically buildable, and the wrong choice
+has a real, peer-visible, silent-data-loss failure mode (files disappearing
+off someone's phone because they added an ignore rule on their PC). That's
+the shape of question worth spending the person's attention on; the other two
+weren't.
+
+**The size-field bug is the kind of thing worth being honest about finding.**
+Wiring `onVaulted`'s size argument to the peer's incoming size instead of the
+old vaulted file's size wasn't caught by any test — it was caught by rereading
+my own code with the specific question "does this variable name actually mean
+what I'm using it to mean" before moving on. Both numbers are `int`, both
+would have type-checked, and the bug would have shown a plausible-looking but
+wrong file size in the restore UI — the kind of thing that's easy to ship and
+annoying to debug later. Recording it in PROGRESS.md rather than quietly
+fixing it and moving on, since a session log that only shows the fixed
+version teaches nothing about where this kind of bug tends to hide.
+
+**On the absolute-vs-relative path inconsistency.** This one was satisfying
+to find precisely because of the timing: it was dead code with zero callers,
+which is usually a reason to leave something alone (least-surprise, don't
+touch what isn't broken) — but here it was the opposite. Dead code with zero
+callers is the ONE time changing a return-value contract is unambiguously
+safe, because nothing downstream can be relying on the old behavior. Once
+I was about to become the first real caller, fixing the inconsistency first
+was strictly better than working around it in two different ways at each of
+my two call sites (which is what I'd have had to do otherwise — special-case
+`fs is LocalFileSystemAccess` again in `AppState.restoreVersion`, on top of
+the one already in `_replacePartWithFinal`, for a problem that only existed
+because of an accident in code nobody had exercised yet).
+
+**Overall approach this session:** verify each claim in the planning doc
+against the actual source before writing code touching it (caught the
+stale-closure gap this way, which the doc didn't mention); implement in small
+enough increments to hand-verify each one (glob matcher → scanner wiring →
+UI, then vault mechanism → catalog → restore → UI) rather than writing
+everything and checking at the end; and default to the smaller, more
+self-contained, more independently-verifiable option whenever the doc's
+suggestion and a leaner alternative both would have worked (hand-rolled glob
+matcher over a new dependency; a Dart-side catalog over new native Android
+listing code) — the sandbox's lack of a build/run toolchain made "can I
+actually convince myself this is correct by reading it" the load-bearing
+question for every decision, more than it might have been with a real
+`flutter test` run available to fall back on.
