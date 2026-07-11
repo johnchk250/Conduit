@@ -207,3 +207,65 @@ naming rather than presenting the fix as literally 100% detection.
 **Not yet done:** no code change — surfacing root cause + fix direction to
 the user first, per project convention (see prior disconnect-cycling
 session: confirm before touching behavior).
+
+## 2026-07-11 (new session) — Scoping ignore rules + version-restore, before writing code
+
+Read the uploaded Phase 6 planning doc in full first (it's explicitly framed
+as "plan only, nothing implemented" and written by a prior audit pass, so
+treating its file/line claims as things to re-verify against the actual repo,
+not take on faith — same discipline as every prior session on this project).
+
+Two things stood out as needing a decision before code, and the doc itself
+flags both:
+
+**1. Retroactive-ignore semantics (§4.4).** The scanner's tombstone sweep
+(`priorLive` vs `seenPaths` diff in `scanner.dart`) can't distinguish "this
+file was locally deleted" from "this file just started being ignored" unless
+the ignore-check explicitly adds ignored paths to `seenPaths` before
+`continue`-ing past the hash/upsert step. Get this wrong and a user adding an
+ignore rule for, say, a large already-synced folder would watch it vanish
+from their peer's device too — the opposite of what "ignore" should mean.
+The doc's own recommendation (freeze, don't tombstone) is clearly the safer
+default and is what I'd pick, but it's a real behavior choice with a
+real peer-visible consequence, so surfacing it rather than assuming — this is
+exactly the kind of thing the project's existing convention (confirm before
+touching sync-adjacent behavior) exists for.
+
+**2. Version-restore scope (§5.3).** Traced this myself rather than just
+trusting the doc's framing. Re-read `Roadmap.md` §0's hard constraint list —
+`_applyRemoteTombstone` is explicitly named as must-not-touch, no exceptions
+carved out. The doc's option (a) for delete-restore requires a line inside
+that exact function. That's not an "Aminul could go either way" question in
+the way retroactive-ignore is — it's already answered by a constraint the
+project itself wrote down as non-negotiable, well before this session
+started. So: not asking about this one, just doing edit-restore only (option
+b) and noting the reasoning in PROGRESS.md so it's visible, not silently
+decided.
+
+**3. The `glob` package.** Caught this by checking what's actually available
+in the sandbox before assuming the plan's suggested dependency was safe to
+add. No `flutter`/`dart` binary, and the network egress allowlist for this
+container doesn't include pub.dev (checked the configured domain list) — so
+`flutter pub get` would fail even if I wrote the pubspec line, and I'd have
+no way to confirm the package resolves or that its API surface matches what
+I'd be coding against. Given the explicit "verify workability before any
+critical change" instruction this session, adding a dependency I can't
+verify felt like exactly the kind of thing to avoid. A hand-rolled glob
+matcher covering just the patterns ignore-rules actually need (`*`, `**`,
+`?`, literal path segments) is a small, fully self-contained, and
+unit-testable substitute — deliberately choosing "smaller and verifiable"
+over "matches the plan's suggested package."
+
+**On the wake-lock-fix memory being stale:** the repo has moved through two
+more sessions (disconnect-cycling, clipboard notification) since the
+2026-07-10 handoff doc that's still sitting in memory as "not confirmed
+pushed." `git log` on fresh clone shows it landed at `b452888` with normal
+history after it. Worth noting in case this comes up again — memory is a
+snapshot, the repo is ground truth.
+
+**Next:** waiting on the retroactive-ignore answer, then implementing in the
+doc's own recommended sequencing — ignore rules first (§4), version-restore
+second (§5) — verifying each with manual read-through + hand-traced test
+cases before moving to the next, rather than writing both features and
+verifying at the end. Smaller verified increments over one big unverified
+batch, given no SDK access to lean on for automated verification here.

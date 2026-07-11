@@ -652,3 +652,97 @@ is asleep/unfocused) before merging.**
 **Status: fix complete, ready to commit locally and hand off as a patch**
 (no push credentials for `johnchk250/Conduit` in this environment — same
 limitation as every prior session).
+
+## 2026-07-11 (new session) — Phase 6 scoping: ignore rules + version-restore UI
+
+**Task:** from the uploaded `2026-07-11-phase6-planning.md` doc, implement only
+two of the four proposed items: **ignore rules** (§4) and **version-restore UI**
+(§5). Explicitly deferring sync preview (§3) and quick-setup wizard (§6) — not
+requested this session. User priority: do not disturb or corrupt the working
+app; verify workability before any critical change.
+
+**Repo state confirmed on clone:** `main` at `490350e` (clipboard notification
+fix), clean working tree, up to date with `origin/main`. The wake-lock fix from
+the 2026-07-10 handoff doc is confirmed landed (`b452888`) and the project has
+moved through two further sessions (disconnect-cycling fix `ca03805`,
+clipboard fix `490350e`) since that handoff — memory of "not yet confirmed
+pushed" is stale; it did land.
+
+**Investigation performed before writing any code** (per project convention —
+verify claims against actual source, not just the planning doc):
+
+- `lib/src/sync/scanner.dart` — confirmed the plan's claimed injection point
+  (`_isInternalArtefact` check, scanner.dart:87) is accurate. Ignore-rule
+  matching will slot in immediately after it, before hashing.
+- `lib/src/protocol/wire.dart` — confirmed `FolderPair`'s current shape
+  (`id`, `name`, `localPath`, `direction`, `peerDeviceId`); the plan's proposed
+  three new optional fields (`ignoreGlobs`, `ignoreExtensions`,
+  `maxFileSizeBytes`) fit the existing nullable/default pattern used by
+  `peerDeviceId`.
+- `lib/src/sync/engine.dart` — confirmed both call sites of `_scanner.scan()`
+  (`startPair` line ~383, `reconcile` line ~780) already have `pair` in scope,
+  so ignore rules can flow through without any new plumbing at the call site.
+- **Important finding not in the planning doc:** `startPair(pair)` closes over
+  the `pair` object in the watcher's change-listener closure and the periodic
+  reconcile timer closure. This means editing a pair's ignore rules and
+  persisting via `_config.upsertPair` alone would NOT take effect until app
+  restart — the running closures would keep using the stale `FolderPair` with
+  the old (or absent) ignore rules. Fix: the ignore-rules editor must call
+  `engine.stopPair(id)` then `engine.startPair(updatedPair)` after persisting,
+  the same restart-the-watcher pattern already used implicitly when a pair is
+  first added. Confirmed `stopPair` is designed for exactly this
+  (cancels watcher/timer, closes + drops the Index DB handle, drops per-pair
+  V2 bookkeeping) and is safe to call before `startPair` re-adds the same id.
+- `lib/src/sync/manifest.dart` / `lib/src/platform/saf_access.dart` — confirmed
+  `moveToVault(rootPath, relPath)` exists on both platforms and is genuinely
+  dead code (grepped every call site in `lib/src/`, matches the plan's
+  finding). Confirmed the Android native side also exists
+  (`SafOps.kt:249`), so the Dart-side call is not stubbed against a missing
+  native handler.
+- `lib/src/sync/block_transfer.dart` — confirmed `_replacePartWithFinal`
+  (block_transfer.dart:225) is the single choke point for both platform
+  branches (`LocalFileSystemAccess` direct-rename path and the generic
+  SAF write+delete path) where a fetched file overwrites an existing one.
+  This is the intended vault hook for "restore a previous version of an
+  edited file." Not on the do-not-touch list.
+- `Roadmap.md` §0 — re-confirmed the project's own hard constraint:
+  `_applyRemoteTombstone` is explicitly listed as must-not-touch. The
+  planning doc's option (a) for delete-restore (a try/caught vault line
+  inside `_applyRemoteTombstone`/`_propagateRemoteDeletes`) would violate
+  that constraint directly. Given the explicit "don't disturb the working
+  app" priority this session, proceeding with the plan's own recommended
+  **option (b): edit-restore only, delete-restore out of scope for this
+  pass.** This isn't treated as an open question — the project's existing
+  hard constraint already answers it.
+- `pubspec.yaml` — confirmed no glob-matching package present. No
+  `flutter`/`dart` SDK and no pub.dev network access in this sandbox
+  (network egress is allowlisted to a fixed domain list that does not
+  include pub.dev), so a new dependency (`glob: ^2.1.2`, as the plan
+  suggests) cannot be fetched or verified to resolve here. Deviating from
+  the plan on this one point: implementing a small self-contained glob→regex
+  matcher in Dart (supporting `*`, `**`, `?`, literal segments — the subset
+  actually needed for ignore patterns) instead of adding an unverifiable new
+  dependency. Lower risk, fully testable in this environment, easy to swap
+  for the real `glob` package later if desired.
+- `lib/src/ui/folder_pairs_screen.dart` — confirmed `_PairDetailScreen`
+  (line 384) is the natural place to add "Ignore rules" and "Restore
+  versions" entry points, consistent with where Sync Now / file list already
+  live per-pair.
+- `test/scanner_test.dart`, `test/block_transfer_test.dart` — confirmed test
+  patterns (fake in-memory FS + real FFI SQLite `IndexDb` for scanner tests;
+  similar fake-transport style for block_transfer tests). New tests will
+  follow the same style. As with every prior session, no Flutter/Dart SDK
+  here to actually run the suite — verification will be manual read-through
+  plus hand-traced test cases, flagged clearly as unrun.
+
+**Open question sent to the user before writing code:** retroactive-ignore
+semantics (Roadmap plan §4.4) — when a rule is added after matching files are
+already synced, should those files be frozen in place (recommended: stop
+tracking further local edits, never tombstoned/deleted) or actively
+tombstoned and delete-propagated to the peer (files disappear from both
+sides)? This has real data-safety consequences (wrong choice = surprise
+deletes on a peer device) so confirming before implementation rather than
+assuming, per this session's explicit "don't corrupt the working app" ask.
+
+**Status: investigation complete, no code changed yet.** Awaiting the
+retroactive-ignore answer above before touching `scanner.dart`/`wire.dart`.
