@@ -121,3 +121,89 @@ reading of *why* the code is shaped this way, which I can't fully verify
 (no commit message or doc explains the original intent behind bundling the
 two). Framed the question so proceeding with the recommended fix is the
 default, one-tap path.
+
+## 2026-07-11 (continued) — Root-causing the false "clipboard couldn't be written" notification
+
+**Bug report:** PC→phone clipboard notification (meant to fire only when
+Android blocks the background clipboard write) fires inconsistently,
+including cases where the write genuinely succeeded and synced.
+
+**Traced the write path first** (`clipboard_sync.dart` `onPushReceived`):
+write goes through `writeClipboard(text)`, which on Android
+(`_defaultWriteClipboard`) calls a native `MethodChannel('conduit/clipboard')`
+→ Kotlin `CH_CLIPBOARD` handler in `MainActivity.kt`, which sets the
+clip via `applicationContext.getSystemService(ClipboardManager)`. The
+in-code comment explains *why*: Flutter's own `Clipboard.setData()` is
+Activity-bound and can misbehave when the Activity is paused, so this
+routes through the same process as the foreground `SyncService` instead —
+deliberately built to work while the app is backgrounded.
+
+**Then traced how "did it work" gets decided.** Immediately after the
+native write call returns (no exception), `onPushReceived` calls
+`readClipboard()` — and *that* function (`_defaultReadClipboard`) is NOT
+the same native path. It's Flutter's own `Clipboard.getData('text/plain')`,
+which is the same Activity-bound plugin API the write path was explicitly
+built to avoid. If `verify != text`, `_pendingRemoteText` stays set, and
+`app_state.dart`'s `_onClipboardPushReceived` reads that as "the OS
+blocked the write" and fires `showClipboardSyncReceived`.
+
+**This asymmetry is the whole bug.** Confirmed against Android's actual
+platform behavior (searched to verify rather than assume): Android 10+
+restricts clipboard *reads* to whichever app currently has window focus,
+or the default IME — with no exception for the app that just wrote the
+data, and explicitly *not* satisfied by running as a foreground service.
+Writes were never restricted this way; only reads are. So:
+
+- The write (native, applicationContext) succeeds regardless of focus —
+  that's exactly what it was built for.
+- The verify-read (Flutter plugin, Activity-bound) is denied whenever the
+  app lacks focus — i.e. almost always in the exact backgrounded scenario
+  this write path exists to handle — and the OS doesn't throw for this,
+  it just silently returns empty/null, so `verify` comes back not-equal
+  to `text` even though the system clipboard is correct.
+- Net effect: whether the false notification fires depends on whether the
+  phone happened to have Conduit focused at the instant the push landed —
+  which matches the user's description of "inconsistent" exactly, and has
+  nothing to do with whether the write actually succeeded.
+
+**Checked for a loophole before concluding this is unconditional:** no
+`READ_CLIPBOARD`-adjacent permission, and Conduit isn't registered as an
+input method (grepped `AndroidManifest.xml` — no IME service, no related
+permission), so there's no legitimate way for this app to read back its
+own background write. Also checked the existing test
+(`pendingRemoteText is set when clipboard write is blocked (background)`)
+— its fake `_BlockedWriteClipboard` simulates "write succeeds, readback
+returns something else" as *the* model of "OS blocked it." That's exactly
+the conflation causing the bug: on real Android, "readback disagrees" and
+"OS blocked the write" are two different, independent conditions, and the
+test (correctly) exercises only the *intentional* meaning of the fake
+without catching that production code has no way to tell them apart.
+
+**Why the native write channel doesn't have this same problem:** writing
+via `ClipboardManager.setPrimaryClip()` isn't gated by focus at the OS
+level — only reads are. The Kotlin handler already surfaces genuine write
+failures correctly, via `result.error("CLIPBOARD_WRITE", ...)` on a thrown
+exception from `setPrimaryClip()`, which Dart receives as a
+`PlatformException` and the existing `catch (e)` block in
+`onPushReceived` already handles correctly (logs + returns, leaving
+`_pendingRemoteText` set — that path is fine as-is).
+
+**So the readback-based verify step, on Android specifically, does not
+detect anything the exception path doesn't already catch — it can only
+ever produce false negatives.** Concluded the fix is to stop using it as
+the success signal on Android: trust "the native write call completed
+without throwing" as success, keep the existing readback-based verify for
+non-Android platforms where no such read restriction exists (Windows).
+
+**Residual limitation to be upfront about:** this trusts the OS API's own
+exception behavior. If some OEM/enterprise policy silently swallowed a
+write without throwing, this fix would miss it and never show the
+"pending — open app to paste" notification for that case. This is
+strictly rarer than the reported bug (which fires on effectively every
+backgrounded receive) and matches how the rest of the write path already
+trusts the platform channel's own success/exception signal, but worth
+naming rather than presenting the fix as literally 100% detection.
+
+**Not yet done:** no code change — surfacing root cause + fix direction to
+the user first, per project convention (see prior disconnect-cycling
+session: confirm before touching behavior).

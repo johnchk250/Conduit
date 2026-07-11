@@ -533,3 +533,122 @@ read back from the remote.
 checkpoint entry itself was late — it was described in chat before it was
 actually written here; corrected once flagged.
 
+
+## 2026-07-11 (new session) — Clipboard "write failed" notification firing incorrectly
+
+**Environment notes (same as prior sessions):** no `flutter`/`dart` SDK, no
+push credentials for `johnchk250/Conduit` in this environment — manual
+review + static reading, changes (if any) committed locally and handed
+over as patch/file(s) for the user to apply and push themselves.
+
+**Task handed off by user (this session):** repo re-cloned fresh. New bug
+report — the PC→phone clipboard sync notification that's supposed to
+appear only when the clipboard *couldn't* be written on the Android
+device is instead appearing inconsistently, including cases where the
+write actually succeeded and synced fine.
+
+**Plan:**
+1. Locate the clipboard-write path and the notification-trigger logic —
+   likely `lib/src/clipboard/clipboard_sync.dart` +
+   `lib/src/notifications/notifier.dart`, cross-checked against the
+   Android platform channel in `MainActivity.kt`.
+2. Read the actual write call and trace exactly what condition raises the
+   "couldn't write" notification — success/failure signal, exception
+   handling, timing/race conditions, platform-channel return values.
+3. Identify why a successful write could still trip the failure path
+   (stale state read, wrong return-value check, exception swallowed
+   then treated as failure, async race between write result and
+   notification decision, etc).
+4. Write up root cause with cited line references before proposing a fix
+   — confirm with user before changing behavior, per project convention
+   in existing `PROGRESS.md`/`THINKING.md` history.
+
+**Status: investigation starting now.**
+
+## 2026-07-11 (continued) — Root cause found: false "clipboard couldn't be written" notification
+
+**Root cause (full reasoning in `THINKING.md`):** `onPushReceived` in
+`lib/src/clipboard/clipboard_sync.dart` writes via a native Android
+channel that deliberately bypasses focus restrictions (`applicationContext`
+→ `ClipboardManager`, see `MainActivity.kt` `CH_CLIPBOARD`), then
+*verifies* that write by reading back through Flutter's own
+`Clipboard.getData()` — the Activity-bound API the native write path was
+specifically built to avoid. Verified against real Android platform
+behavior (Android 10+ restricts clipboard *reads* to the focused app or
+default IME, with no carve-out for the app that just wrote it, and a
+foreground service does not count as focus). So the write succeeds
+regardless of app focus, but the verify-read is denied whenever the app
+isn't focused — i.e. almost every time this path is actually used
+(backgrounded receive via the sync service) — causing `app_state.dart` to
+treat a successful write as "blocked" and fire
+`showClipboardSyncReceived` anyway. Whether the false notification
+appears depends on whether Conduit happened to have focus at that
+instant, matching the "inconsistent" symptom exactly.
+
+Also checked: the native write path already correctly surfaces genuine
+failures as a thrown `PlatformException` (Kotlin `result.error(...)` on a
+`setPrimaryClip()` exception), which `onPushReceived`'s existing
+`catch (e)` block already handles correctly. So the readback-based verify
+step contributes no real failure detection on Android — only false
+negatives.
+
+**Proposed fix:** on Android, treat "native write call returned without
+throwing" as success (skip the readback comparison); keep the existing
+readback-based verify for non-Android platforms, where no such
+OS-level read restriction exists. One documented trade-off: this would no
+longer catch a hypothetical silent OEM/enterprise policy block that
+doesn't throw — rarer than the reported bug, and consistent with how the
+rest of this path already trusts the platform channel's exception
+signal, but flagging it rather than claiming the fix is airtight.
+
+**Status: root cause confirmed, fix proposed, no code changed yet** —
+per project convention, confirming direction with the user before editing
+`clipboard_sync.dart`.
+
+## 2026-07-11 (continued) — Fix implemented
+
+User confirmed: implement the proposed fix.
+
+**Changes made:**
+- `lib/src/clipboard/clipboard_sync.dart` — `onPushReceived`: on phone
+  (`!isDesktopPlatform`), the write call completing without throwing is now
+  treated as success; the readback-based verify (unreliable on Android per
+  the root-cause analysis) is only used on desktop, where no OS read
+  restriction applies. Doc comment added explaining both branches.
+- `lib/src/notifications/notifier.dart` — refined `showClipboardSyncReceived`'s
+  doc comment: "blocked" is now accurately defined as "the write call threw",
+  not "the readback disagreed".
+- `test/clipboard_sync_test.dart` — the three existing background-write
+  tests were re-based on a corrected fake:
+  - `_BlockedWriteClipboard` (modeled "write silently no-ops in the
+    background", which doesn't reflect the real native write path) replaced
+    by `_FailingWriteClipboard` (models a genuine thrown write failure —
+    the one real failure mode the native channel can hit).
+  - Added `_FocusRestrictedReadClipboard` (models Android's actual read
+    restriction: write genuinely succeeds, readback is always denied) plus
+    a new regression test asserting `pendingRemoteText` clears on a
+    successful phone write even when the readback would be denied — this
+    is the direct test for the reported bug.
+  - Net: 3 tests re-based (not deleted, still cover genuine-failure +
+    onResume + setEnabled(false) paths), 1 new test added.
+- `ARCHITECTURE.md` — new Appendix B row (2026-07-11) documenting root
+  cause + fix; header status line updated (155 tests: 154 prior + 1 new,
+  not independently re-run — no Flutter toolchain here).
+- `Roadmap.md` — short note added under the Phase 2 status line pointing to
+  the fix.
+
+**Verification performed (same standing limitation as every prior
+session):** no `flutter`/`dart` SDK in this environment — could not run
+`flutter analyze` / `flutter test` / a real build. Verification here was:
+manual read-through of the changed method and every call site of
+`isDesktopPlatform`/`_isDesktopPlatform` in both the source file and the
+test file; a balanced-delimiter (braces/parens/brackets) sanity check on
+both edited Dart files; re-read of every test in the "background write
+recovery" group after editing to confirm none still reference the removed
+`_BlockedWriteClipboard` class. **Recommend running the real test suite
+and a real-device backgrounded-receive test (push from PC while the phone
+is asleep/unfocused) before merging.**
+
+**Status: fix complete, ready to commit locally and hand off as a patch**
+(no push credentials for `johnchk250/Conduit` in this environment — same
+limitation as every prior session).
