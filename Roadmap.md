@@ -219,7 +219,13 @@ icon present); Android app survives screen-off + swipe-from-recents for
 ---
 
 ### Phase 2 — Clipboard sync (owner feature #1)
-**Status:** ✅ complete (2026-06-27)
+**Status:** ✅ complete (2026-06-27); hardened 2026-07-06; **2026-07-11:
+fixed a false "clipboard couldn't be written" notification** — the phone
+was misreporting successful backgrounded writes as blocked because its own
+verify step used a same-process readback, which Android's focus-gated
+*read* restriction denies independent of whether the write (done via a
+separate, unrestricted native-write path) actually succeeded. See
+`ARCHITECTURE.md` Appendix B (2026-07-11) for the full root cause and fix.
 **Engine-safe?** ✅ new `Msg.clipboardPush`, appended handler.
 
 **Platform reality (already researched):**

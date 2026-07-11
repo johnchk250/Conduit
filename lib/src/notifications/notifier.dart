@@ -149,9 +149,11 @@ class AppNotifier {
 
   /// Show a "Clipboard pending" notification.
   ///
-  /// Only fired when the Android OS blocked the background clipboard write
-  /// (i.e. [ClipboardSync.pendingRemoteText] is non-null after the attempt).
-  /// A successful foreground write never shows this notification.
+  /// Only fired when the clipboard write genuinely failed (i.e.
+  /// `ClipboardSync.pendingRemoteText` is still non-null after the attempt
+  /// because the write call itself threw — see `ClipboardSync.onPushReceived`
+  /// doc, 2026-07-11). A successful write, foreground or backgrounded, never
+  /// shows this notification.
   ///
   /// The notification auto-dismisses after 10 s so it never lingers — the
   /// user either taps it to open the app and paste, or it disappears on its own.

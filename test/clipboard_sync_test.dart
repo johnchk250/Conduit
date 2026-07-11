@@ -547,11 +547,12 @@ void main() {
       expect(await clip.read(), 'hello world');
     });
 
-    test('pendingRemoteText is set when clipboard write is blocked (background)',
+    test(
+        'pendingRemoteText is set when the write call itself genuinely fails',
         () async {
       final clip = _makeClipboard();
-      // Simulate blocked write: write succeeds but readback returns something else
-      final blockedClip = _BlockedWriteClipboard(delegate: clip);
+      // Simulate a genuine failure: the write call throws.
+      final failingClip = _FailingWriteClipboard(delegate: clip);
       final registry = PeerConnectionRegistry();
       final session = _FakeSession();
       registry.publish(_bobDeviceId, session);
@@ -563,8 +564,8 @@ void main() {
         onLog: (_, __) {},
         onRemoteReceived: (_) {},
         now: DateTime.now,
-        readClipboard: blockedClip.read,
-        writeClipboard: blockedClip.write,
+        readClipboard: failingClip.read,
+        writeClipboard: failingClip.write,
         isDesktopPlatform: () => false,
       );
       sync.setEnabled(true);
@@ -573,12 +574,15 @@ void main() {
 
       expect(sync.pendingRemoteText, 'secret text',
           reason:
-              'OS blocked the write — text should be stored as pending for resume');
+              'The write call threw — text should be stored as pending for resume');
     });
 
-    test('onResume commits the pending clipboard and clears it', () async {
+    test(
+        'pendingRemoteText is cleared on a successful phone write even when '
+        'a same-process readback would be denied (regression test for the '
+        'false "clipboard blocked" notification — 2026-07-11)', () async {
       final clip = _makeClipboard();
-      final blockedClip = _BlockedWriteClipboard(delegate: clip);
+      final focusRestricted = _FocusRestrictedReadClipboard(delegate: clip);
       final registry = PeerConnectionRegistry();
       final session = _FakeSession();
       registry.publish(_bobDeviceId, session);
@@ -590,18 +594,51 @@ void main() {
         onLog: (_, __) {},
         onRemoteReceived: (_) {},
         now: DateTime.now,
-        readClipboard: blockedClip.read,
-        writeClipboard: blockedClip.write,
+        readClipboard: focusRestricted.read,
+        writeClipboard: focusRestricted.write,
+        // Phone, not desktop — this is the platform where the native write
+        // channel is used and the OS read restriction applies.
         isDesktopPlatform: () => false,
       );
       sync.setEnabled(true);
 
-      // Simulate receiving a push while in the background (write blocked)
+      await sync.onPushReceived(_bobDeviceId, 'hello world');
+
+      expect(focusRestricted.actuallyWritten, 'hello world',
+          reason: 'The write itself genuinely succeeded');
+      expect(sync.pendingRemoteText, isNull,
+          reason: 'A successful write must not be reported as pending/'
+              'blocked just because the OS denies the readback used to '
+              'verify it — that denial is independent of write success on '
+              'Android 10+ (focus-gated reads, not focus-gated writes)');
+    });
+
+    test('onResume commits the pending clipboard and clears it', () async {
+      final clip = _makeClipboard();
+      final failingClip = _FailingWriteClipboard(delegate: clip);
+      final registry = PeerConnectionRegistry();
+      final session = _FakeSession();
+      registry.publish(_bobDeviceId, session);
+      session.markLinkReady();
+
+      final sync = ClipboardSync(
+        registry: registry,
+        pairedPeerIds: () => {_bobDeviceId},
+        onLog: (_, __) {},
+        onRemoteReceived: (_) {},
+        now: DateTime.now,
+        readClipboard: failingClip.read,
+        writeClipboard: failingClip.write,
+        isDesktopPlatform: () => false,
+      );
+      sync.setEnabled(true);
+
+      // Simulate receiving a push while the write genuinely fails.
       await sync.onPushReceived(_bobDeviceId, 'queued text');
       expect(sync.pendingRemoteText, 'queued text');
 
-      // App comes to foreground — unblock the clipboard and call onResume
-      blockedClip.unblock();
+      // The transient failure clears — unblock and call onResume.
+      failingClip.unblock();
       await sync.onResume();
 
       expect(sync.pendingRemoteText, isNull,
@@ -612,7 +649,7 @@ void main() {
 
     test('setEnabled(false) clears any pending clipboard', () async {
       final clip = _makeClipboard();
-      final blockedClip = _BlockedWriteClipboard(delegate: clip);
+      final failingClip = _FailingWriteClipboard(delegate: clip);
       final registry = PeerConnectionRegistry();
       final session = _FakeSession();
       registry.publish(_bobDeviceId, session);
@@ -624,8 +661,8 @@ void main() {
         onLog: (_, __) {},
         onRemoteReceived: (_) {},
         now: DateTime.now,
-        readClipboard: blockedClip.read,
-        writeClipboard: blockedClip.write,
+        readClipboard: failingClip.read,
+        writeClipboard: failingClip.write,
         isDesktopPlatform: () => false,
       );
       sync.setEnabled(true);
@@ -652,33 +689,52 @@ class _FakeClipboard {
   Future<void> write(String text) async => _value = text;
 }
 
-/// Wraps [_FakeClipboard] and simulates Android 10+ blocking the write in
-/// the background: [write] accepts the call but [read] returns the OLD value
-/// until [unblock] is called.
-class _BlockedWriteClipboard {
-  _BlockedWriteClipboard({required _FakeClipboard delegate})
+/// Simulates a GENUINE write failure — e.g. the native `conduit/clipboard`
+/// channel throwing (see `MainActivity.kt`'s `CH_CLIPBOARD` "write" handler
+/// erroring out), or the cold-start race noted in `_defaultWriteClipboard`
+/// before the channel registers: [write] throws while blocked, and
+/// succeeds once [unblock] is called. This is the one real failure mode the
+/// native write path can hit, and it's already surfaced as a thrown
+/// exception in production — [ClipboardSync.onPushReceived]'s `catch (e)`
+/// is what's expected to handle it.
+class _FailingWriteClipboard {
+  _FailingWriteClipboard({required _FakeClipboard delegate})
       : _delegate = delegate;
   final _FakeClipboard _delegate;
   bool _blocked = true;
-  String? _pendingValue;
 
-  void unblock() {
-    _blocked = false;
-    if (_pendingValue != null) {
-      _delegate._value = _pendingValue;
-    }
-  }
+  void unblock() => _blocked = false;
 
-  Future<String?> read() async => _delegate._value;
+  Future<String?> read() => _delegate.read();
 
   Future<void> write(String text) async {
     if (_blocked) {
-      // The OS pretends the write succeeded but the clipboard is unchanged.
-      _pendingValue = text;
-    } else {
-      _delegate._value = text;
+      throw Exception('simulated clipboard write failure');
     }
+    await _delegate.write(text);
   }
+}
+
+/// Simulates Android 10+'s OS-level clipboard READ restriction: this app
+/// isn't focused (it's running from the background sync service), so any
+/// readback is denied and comes back stale/empty — even though [write]
+/// genuinely lands on the "system" clipboard (the delegate). This models
+/// the real production asymmetry that caused the false "clipboard blocked"
+/// notification bug (see `PROGRESS.md` / `THINKING.md`, 2026-07-11): a
+/// same-process readback cannot be used to confirm a background write on
+/// Android, independent of whether that write actually succeeded.
+class _FocusRestrictedReadClipboard {
+  _FocusRestrictedReadClipboard({required _FakeClipboard delegate})
+      : _delegate = delegate;
+  final _FakeClipboard _delegate;
+
+  /// The write genuinely succeeds — inspect this directly in assertions
+  /// instead of going through [read], which always simulates denial.
+  String? get actuallyWritten => _delegate._value;
+
+  Future<String?> read() async => null; // OS pretends the clipboard is empty
+
+  Future<void> write(String text) => _delegate.write(text);
 }
 
 // ---------------------------------------------------------------------------

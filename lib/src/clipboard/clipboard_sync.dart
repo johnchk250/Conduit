@@ -262,15 +262,42 @@ class ClipboardSync {
 
   /// A peer pushed its clipboard — write ours and record the hash so our own
   /// poll doesn't echo it back.
+  ///
+  /// Success signal differs by platform (2026-07-11 fix — see `PROGRESS.md`
+  /// / `THINKING.md` for the full investigation):
+  ///
+  ///   * Phone (`!_isDesktopPlatform()`, i.e. Android): the write goes
+  ///     through the native `conduit/clipboard` channel, which uses
+  ///     `applicationContext` specifically so it keeps working while the app
+  ///     is backgrounded (see `MainActivity.kt`). A same-process readback
+  ///     CANNOT verify that write: Android 10+ restricts clipboard *reads*
+  ///     to whichever app currently has window focus (or the default IME) —
+  ///     with no exception for the app that just wrote the data, and a
+  ///     foreground service does not count as focus. So immediately after a
+  ///     backgrounded write, a readback is denied by the OS regardless of
+  ///     whether the write succeeded, which used to cause this method to
+  ///     treat a successful write as "blocked". The native channel already
+  ///     reports genuine write failures correctly (it throws), so on this
+  ///     platform "the write call returned without throwing" IS the success
+  ///     signal — no readback needed or trustworthy.
+  ///
+  ///   * Desktop (Windows): no such OS read restriction exists, so the
+  ///     readback comparison remains a valid (and slightly stronger) check.
   Future<void> onPushReceived(String peerId, String text) async {
     if (!_enabled) return; // feature off → ignore
     final hash = hashOf(text);
     _pendingRemoteText = text;
     try {
       await writeClipboard(text);
-      final verify = await readClipboard();
-      if (verify == text) {
+      if (!_isDesktopPlatform()) {
+        // Phone: the write call completing without throwing is the only
+        // trustworthy signal available (see doc comment above).
         _pendingRemoteText = null;
+      } else {
+        final verify = await readClipboard();
+        if (verify == text) {
+          _pendingRemoteText = null;
+        }
       }
     } catch (e) {
       onLog('Failed to write clipboard: $e', true);
