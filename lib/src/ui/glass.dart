@@ -135,8 +135,13 @@ class GlassColors {
     borderDim: Colors.white.withValues(alpha: 0.04),
     vignetteEdge: const Color(0xFF060A0F).withValues(alpha: 0.42),
     specularLine: Colors.white.withValues(alpha: 0.7),
-    sweepCore: const Color(0xFFDCEBF5).withValues(alpha: 0.16),
-    sweepEdge: Colors.white.withValues(alpha: 0.10),
+    // Lowered from the mockup's literal 0.16/0.10 after a real build showed
+    // the sweep reading as a hard, distinctly visible beam rather than
+    // ambient light on a wider window with more gap between panels than the
+    // mockup's narrow preview had — see the doc comment on the sweep
+    // gradient in GlassBackground for the full reasoning.
+    sweepCore: const Color(0xFFDCEBF5).withValues(alpha: 0.07),
+    sweepEdge: Colors.white.withValues(alpha: 0.04),
     ringBorderAlpha: 0.4,
     ringGlowAlpha: 0.08,
     navActiveFill: Colors.white.withValues(alpha: 0.08),
@@ -174,8 +179,8 @@ class GlassColors {
     borderDim: Colors.white.withValues(alpha: 0.25),
     vignetteEdge: const Color(0xFF4A4458).withValues(alpha: 0.12),
     specularLine: Colors.white.withValues(alpha: 0.9),
-    sweepCore: const Color(0xFFFFFBF3).withValues(alpha: 0.08),
-    sweepEdge: Colors.white.withValues(alpha: 0.05),
+    sweepCore: const Color(0xFFFFFBF3).withValues(alpha: 0.035),
+    sweepEdge: Colors.white.withValues(alpha: 0.02),
     // Tuned down from dark mode's 0.4/0.08 per plan §7's guidance to land in
     // the same 0.08-0.10 magnitude the old *Glow tokens used, rather than
     // the stronger accent presence dark glass can carry.
@@ -270,7 +275,7 @@ Widget _specularLine(GlassColors c) {
     height: 1,
     child: Align(
       alignment: Alignment.topCenter,
-      child: FractionalSizedBox(
+      child: FractionallySizedBox(
         widthFactor: 0.84, // 100% - 8% inset each side
         child: SizedBox(
           height: 1,
@@ -358,6 +363,18 @@ class _GlassBackgroundState extends State<GlassBackground> {
         // proportions as the mockup's `inset: -60%`), drifting back and
         // forth. Gradient direction (112deg) uses the same angle→Alignment
         // conversion as the backdrop above.
+        //
+        // Stops are deliberately much wider than the mockup's literal CSS
+        // (36/47/50/53/64% — a tight, ~28%-wide band). In the mockup's
+        // narrow phone-width preview, glass panels cover nearly the full
+        // width, so the raw gradient rarely shows through a gap. On a wider
+        // desktop window there's much more visible gap between panels, and
+        // that same tight band reads as a hard, distinctly visible stroke
+        // rather than ambient light — reported back after a real build, see
+        // PROGRESS.md. Widened here to ~85% of the gradient's extent with a
+        // very gradual falloff, no flat plateau, so it reads as a soft
+        // brightening rather than a beam. Alpha tokens (sweepCore/sweepEdge)
+        // were also lowered accordingly — see GlassColors.
         ClipRect(
           child: LayoutBuilder(
             builder: (context, constraints) {
@@ -388,7 +405,7 @@ class _GlassBackgroundState extends State<GlassBackground> {
                           c.sweepEdge,
                           Colors.transparent,
                         ],
-                        stops: const [0.36, 0.47, 0.50, 0.53, 0.64],
+                        stops: const [0.08, 0.38, 0.50, 0.62, 0.92],
                       ),
                     ),
                   ),
