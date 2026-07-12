@@ -526,31 +526,37 @@ conversion ongoing.
 
 Distinct from Phase 5 (which was the original Material 3 polish pass, marked
 complete 2026-06-27): this phase re-skins the same screens in a translucent
-"liquid glass" style (ambient drifting gradient background, blurred
-translucent panels, gradient-border cards) via a new shared component
-library, rather than changing any behavior. Design intent, restraint notes,
-and the modal-surfaces-stay-Material rule all live as doc comments directly
-in `lib/src/ui/glass.dart` — read that file's header before touching it or
-any screen that uses it.
+"liquid glass" style (flat backdrop, clearly-see-through panels,
+gradient-border cards — no `BackdropFilter`, no ambient motion, as of v6)
+via a new shared component library, rather than changing any behavior.
+Design intent, restraint notes, and the modal-surfaces-stay-Material rule
+all live as doc comments directly in `lib/src/ui/glass.dart` — read that
+file's header before touching it or any screen that uses it.
 
 **Shared library:** `lib/src/ui/glass.dart` — ✅ complete, now on its
-**clear-glass v5** revision (`GlassColors`, `GlassBackground`, `GlassPanel`,
+**clear-glass v6** revision (`GlassColors`, `GlassBackground`, `GlassPanel`,
 `GlassSectionLabel`, `GlassListTile`, `GlassStatusBanner`, `GlassChip`,
-`GlassButton`, `GlassNavBar`/`GlassNavRail`). v5 pulls per-panel accent-color
-fill/border tinting back out (the "vibrancy" pass didn't land well — see
-`docs/2026-07-12-clear-glass-v5-plan.md` §0) in favor of a neutral glass
-surface with color only on content (icon-chip borders, the hero ring, filled
-pills), a lighter backdrop gradient, and a drifting light-sweep ambient
-animation in place of the old three colored blobs. The Android
-flicker/perf fix from the vibrancy pass (`Timer` + implicit-animation drift,
-not a free-running `AnimationController`) carries over unchanged and now
-also covers the sweep — see the plan doc §3.1/§6 for why that matters.
+`GlassButton`, `GlassNavBar`/`GlassNavRail`). v5's gradient-plus-light-sweep
+backdrop was reported back as still not matching expectation, against a
+reference screenshot: flat uniform background, no gradient, panels
+distinctly more see-through. v6 responds by making `GlassBackground` a
+single flat color with zero ambient motion, and removing `BackdropFilter`
+from every glass surface entirely — not toning it down, removing it — since
+blurring a uniform color is a no-op; this also fully retires the Android
+flicker-risk category the v5 "Timer + implicit-animation, not a
+free-running ticker" fix existed to manage, since nothing left re-blurs on
+every paint. Panel translucency now comes from a lower-alpha, cool-tinted
+fill (colors sampled from the reference image) composited directly, plus a
+crisper border for edge legibility now that there's no blur to separate a
+panel from the backdrop. v5's "color stays off the glass fill, lives only
+on content" rule carries over unchanged. See `PROGRESS.md`/`THINKING.md`
+2026-07-12 "v6" entries for the color-sampling method and its caveats.
 
 **Per-screen conversion checklist:**
 | File | Status |
 |---|---|
-| `glass.dart` — clear-glass v5 token/component revision (see `docs/2026-07-12-clear-glass-v5-plan.md`) | ✅ done (2026-07-12) — un-tints panel fill/border, adds specular line + light sweep, hero moves to ring-not-fill, nav active state goes neutral. Do this before any further per-screen rows below. |
-| `dashboard_screen.dart` (shell: NavRail/NavBar, Overview, Settings hub) | ✅ done (2026-07-12) — re-touched for v5 (was converted against the now-reverted "vibrancy" pass): migrated `_sectionHeader` → shared `GlassSectionLabel` (plan §3.6); no other call-site changes needed (`GlassListTile`/`GlassChip`/`GlassStatusBanner` pick up the new neutral tokens automatically). Quick Actions row deliberately left as a single `Send files` row, not converted to the mockup's 3-across circular layout — see plan §5. |
+| `glass.dart` — clear-glass v6 token/component revision (flat backdrop, no `BackdropFilter`, more-translucent panel fill) | ✅ done (2026-07-12) — see `PROGRESS.md`/`THINKING.md` 2026-07-12 "v6" entries. Do this before any further per-screen rows below. |
+| `dashboard_screen.dart` (shell: NavRail/NavBar, Overview, Settings hub) | ✅ still accurate against v6 — this screen only calls the shared widgets' public API (`GlassColors.of`, `GlassPanel`, `GlassListTile`, `GlassStatusBanner`, `GlassChip`, `GlassSectionLabel`, `GlassNavBar`/`GlassNavRail`) and none of the fields/params it references were touched by the v6 rewrite (verified by grep — see `PROGRESS.md`). No edit needed this session. |
 | `folder_pairs_screen.dart` | ⬜ not started — recommended next (see `THINKING.md` 2026-07-12), now against v5 tokens |
 | `pairing_screen.dart` | ⬜ not started |
 | `remote_control_screen.dart` | ⬜ not started |

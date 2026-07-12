@@ -5,6 +5,128 @@
 
 ---
 
+## 2026-07-12 (new session) — Clear-glass v6: flat backdrop + more-translucent panels (continuing an interrupted session)
+
+**Context:** fresh sandbox, repo cloned to `/home/claude/work/Conduit`,
+verified clean on `origin/main` at `bd032de` (the v5 commits from the prior
+session — see `## 2026-07-12 — Clear-glass v5` entry below). The person
+supplied a transcript (`Previous_agent_thinking.txt`) of a session that
+started immediately after v5 landed: v5 was reported back as still not
+matching expectation, this time against a reference screenshot the person
+shared directly in that chat (not saved to this repo — I do not have the
+image file itself, only the sampled color values recorded in that
+transcript). That session sampled the reference image's colors and had
+started editing `glass.dart` when it was interrupted before committing
+anything — `git log` confirms none of that work reached `origin/main`. This
+session picks up exactly where that one left off, using the colors it had
+already locked in.
+
+**What the reference called for** (per the interrupted session's own
+sampling, taken as given rather than re-derived, since I don't have the
+image): a flat, uniform background — no gradient, no animation — and panels
+that are distinctly more see-through than v5's barely-there frost, with the
+background clearly visible through them. Two color findings from that
+session's pixel sampling:
+- Flat background: consistent `RGB(39,81,106)` / `#27516A` across multiple
+  open-area samples (margins, gaps between tiles).
+- Tile fill: a subtle, consistent lightening of the same blue —
+  `RGB(~35-36,91-92,125-127)` — not a white-tinted glass; a white-blend
+  hypothesis was tested against the sample math and ruled out (red channel
+  moved the wrong direction for a white mix).
+
+**What I implemented in `lib/src/ui/glass.dart`:**
+- `GlassColors`: replaced the 4-stop `bgTop/bgMid/bgMid2/bgBottom` gradient
+  with a single flat `bg` field (`#27516A` dark). Removed `vignetteEdge`,
+  `sweepCore`, `sweepEdge` — no longer meaningful once there's no gradient
+  or sweep to shape.
+- `panelFillA`/`panelFillB` (dark): switched from a white-alpha wash
+  (0.09/0.02) to a light cyan-blue tint (`#8FD9FF`) at lower alpha
+  (0.10/0.04) — matches the sampled tiles' hue family and pushes further
+  toward "clearly see-through" per the ask. Exact-pixel reverse-engineering
+  wasn't pursued (compressed screenshot, some samples landed on icon/edge
+  artifacts per the transcript) — landed on a close, tasteful approximation
+  instead, same call the interrupted session was already leaning toward.
+- `borderBright`/`borderDim` (dark): bumped slightly (0.24→0.32,
+  0.04→0.06) — with `BackdropFilter` gone (next point), the border is now
+  the main thing that separates a panel's edge from the flat backdrop, so
+  it needed to stay legible rather than getting softer.
+- **Removed `BackdropFilter` from `_clearGlassSurface` entirely** (and the
+  now-pointless `blurSigma` param from it, `GlassPanel`, and the
+  `GlassNavBar`/`GlassNavRail` call sites that passed it). Once the backdrop
+  is one flat color, blurring it is a no-op — blurring a uniform color
+  returns that same uniform color — so this isn't a shortcut, it's the same
+  visual result for zero per-frame cost. It also fully retires the Android
+  flicker-risk category that v5's `Timer`-based sweep fix existed to
+  manage: nothing left on screen re-samples/re-blurs on every paint.
+- `GlassBackground`: converted from a `StatefulWidget` (Timer +
+  `AnimatedAlign` driving the v5 light sweep) to a plain `StatelessWidget`
+  painting one flat `DecoratedBox`. Removed `dart:async`/`dart:ui` imports
+  from the file entirely — nothing left uses `Timer` or `ImageFilter`.
+- Light mode: no reference image for it (same gap v5 had). Designed, not
+  sampled — flattened the old 4-stop near-white gradient to one flat color
+  (its old midpoint, `#E9E6F5`), and moved the fill alphas in the same
+  "more see-through" direction (0.55/0.22 → 0.40/0.14) while staying high
+  enough to read against a bright backdrop. Flagged in the code comment as
+  unverified — please sanity-check once built.
+- Updated `Roadmap.md`'s Phase 7 section and per-screen checklist row for
+  `glass.dart` to describe v6 instead of v5, and confirmed (by grep, listed
+  below) that `dashboard_screen.dart`'s row needed no code change since it
+  only touches the shared widgets' public API.
+
+**`dashboard_screen.dart`: not touched.** It only calls
+`GlassColors.of(context)` and reads `c.violet/amber/teal/blue/mint/
+textPrimary/textSecondary/textTertiary` (confirmed by grep — none of those
+fields were removed or renamed), plus the `GlassPanel`/`GlassListTile`/
+`GlassStatusBanner`/`GlassChip`/`GlassSectionLabel`/`GlassNavBar`/
+`GlassNavRail` widgets by their existing public constructors. No
+`blurSigma` or gradient-field references anywhere in it. Re-touching it
+would have been a no-op edit, so it was left alone.
+
+**Verification performed** (no Flutter/Dart SDK in this sandbox, same
+standing limitation as every session in this log):
+- Balanced-delimiter check (Python, brace/paren/bracket counts) on
+  `glass.dart` after every edit — clean throughout.
+- Same check swept across all of `lib/**/*.dart` at the end of the session:
+  two pre-existing imbalances flagged in `activity_screen.dart` and
+  `lib/src/sync/file_send.dart` — **neither file was touched this session**
+  (confirmed via `git status --short`, which shows only `glass.dart`
+  modified), so these are pre-existing false positives from unbalanced
+  string literals, not a regression from this session's edits.
+- Full top-to-bottom re-read of the rewritten `glass.dart`.
+- Repo-wide grep for `GlassPanel(`, `blurSigma`, and every removed
+  `GlassColors` field name (`.bgTop`, `.bgMid`, `.bgBottom`, `.vignetteEdge`,
+  `.sweepCore`, `.sweepEdge`) across all of `lib/src/ui/*.dart` — zero hits
+  outside `glass.dart` itself, confirming no other screen references
+  anything that got removed.
+- **Not verified:** an actual `flutter run`/`flutter analyze`, or a
+  rendered screenshot to visually confirm the flat background and panel
+  translucency actually match the reference image — no such tooling in
+  this sandbox, and (unlike the v5 session) I never saw the reference image
+  myself, only its already-sampled color values from the transcript.
+  **Please build and run, and compare Overview against your reference
+  screenshot directly** — if the fill still doesn't read right, the fastest
+  path is re-sharing that image in a follow-up so the color sampling can be
+  redone directly rather than relayed through a transcript.
+
+**Files touched:** `lib/src/ui/glass.dart`, `Roadmap.md`, `PROGRESS.md`,
+`THINKING.md`.
+
+**Not done this session:** no other screen was converted — same 9 files
+listed as `⬜ not started` in `Roadmap.md` before this session are still
+untouched (they were never glass to begin with, so v6's changes don't
+affect their status either way).
+
+**Status: implementation complete for the v6 token/component rewrite,
+verified by static analysis only (no SDK in this sandbox) — please
+`flutter run` on Windows and Android and compare Overview against your
+reference image before merging. Delivered as a `git format-patch` series
+you can apply and push yourself — see delivery note at the end of this
+session for the exact commands (no push credentials for
+`johnchk250/Conduit` in this sandbox, same limitation as every prior
+session).**
+
+---
+
 ## 2026-07-10 — Session 2: wake-lock ownership fix + battery-doc audit
 
 **Continuation of the same-day session below.** That session's manual review

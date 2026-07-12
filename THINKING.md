@@ -9,6 +9,65 @@ re-derive it.
 
 ---
 
+## 2026-07-12 (new session) — Clear-glass v6: interpreting "continue from there" and the BackdropFilter-removal call
+
+**Reading the request.** The instruction was terse and referenced two
+things that needed reconciling: "check the latest modification about glass
+UI fix attempt" (i.e. audit current repo state) and "previous session was
+started in that direction, can you continue from there" (i.e. the uploaded
+transcript). The transcript itself shows a session that: (a) was reacting
+to v5 being rejected, (b) got explicit answers to its own clarifying
+questions ("flat solid color... very see-through, background clearly
+visible"), (c) sampled the reference image's exact colors, and (d) was cut
+off mid-edit ("Re-view current imports and GlassColors class for precise
+editing" is the last line). Cloning the repo confirmed `origin/main` is
+still sitting at the v5 commits — none of that work landed. So "continue
+from there" reads unambiguously as "finish implementing what that session
+had already fully scoped and color-sampled," not as an open-ended new
+design request — there was no actual ambiguity left to ask about once the
+repo audit confirmed the previous session's endpoint never shipped. I
+proceeded on that basis rather than asking a clarifying question, since one
+would have just re-asked what the transcript already answered.
+
+**Why remove `BackdropFilter` instead of just lowering blur sigma.** This
+was the interrupted session's own conclusion, and it survives scrutiny
+independently: `ImageFilter.blur` operates on whatever's composited behind
+it at paint time. When that backdrop is a single flat `Color`, every pixel
+sampled by the blur kernel is identical, so the weighted average the blur
+computes is mathematically that same color — there is no information for
+the blur to smear together. Keeping `BackdropFilter` at a lower sigma would
+have kept 100% of its per-paint re-sample/re-blur cost for 0% of its visual
+effect. Removing it is strictly dominant here, not a stylistic call. It also
+happens to retire the specific bug class (Android flicker from something
+under a `BackdropFilter` never settling) that the v5 session's `Timer`-based
+sweep fix was built to manage — worth stating plainly in the doc comment so
+a future session doesn't see the missing `BackdropFilter` and assume it was
+an oversight.
+
+**Why I didn't try to reverse-engineer the tile color more precisely.** The
+interrupted transcript already ran that experiment and hit a wall:
+several sample points landed on icon/edge artifacts rather than clean tile
+fill, and a plausible blend hypothesis (white overlay) was tested against
+the actual RGB deltas and mathematically ruled out (red moved the wrong
+direction for a white mix). The transcript's own conclusion was to stop
+chasing an exact reverse-engineered blend and implement "a tasteful frosted
+glass look... more visible... but still maintains translucency" instead.
+I inherited that judgment call rather than re-litigating it, since I have
+strictly less information available than that session did (I have its
+sampled numbers, not the image itself) — re-deriving a "more precise"
+answer from a transcript of already-noisy sampling would be manufacturing
+false precision, not recovering it.
+
+**What would change my mind on the fill color.** If the person reports the
+tint still doesn't read right, the correct next step is asking them to
+re-share the reference image directly to this session rather than tuning
+further from the relayed numbers — repeated indirect adjustment from a
+secondhand description degrades faster than it converges. Flagged this
+explicitly in `PROGRESS.md`'s "not verified" section rather than presenting
+the color choice as more confident than the underlying evidence supports.
+
+---
+
 ## 2026-07-11 — Repeated peer-disconnect cycling during Doze / Battery Saver
 
 **Question:** is the connect→disconnect→reconnect cycling shown in the

@@ -1,43 +1,40 @@
-import 'dart:async';
-import 'dart:ui';
-
 import 'package:flutter/material.dart';
 
 /// Liquid-glass design tokens + shared widgets used across every screen.
 ///
-/// Design intent (revised 2026-07-12, "clear-glass v5" pass — see
-/// `docs/2026-07-12-clear-glass-v5-plan.md` for the full plan this file was
-/// rewritten against, and `overview_redesign_preview_v5.html` for the source
-/// mockup it was reverse-engineered from): this is the THIRD visual
-/// direction this file has gone through in one day, and it deliberately
-/// walks back the second one.
+/// Design intent (revised 2026-07-12, "clear-glass v6" pass — continuing a
+/// same-day session that was interrupted before landing; see `PROGRESS.md`
+/// / `THINKING.md` 2026-07-12 "v6" entries for the reference-image color
+/// sampling this was built from): this is the FOURTH visual direction this
+/// file has gone through in one day, and it walks back v5's backdrop
+/// entirely while keeping v5's "color stays off the glass fill" rule.
 ///
 ///  1. Original glass pass — flat, low-contrast panels, color only on the
 ///     small leading-icon chip. Read as dull/monochrome.
-///  2. "Vibrancy" pass — fixed that by tinting each [GlassPanel]'s fill and
-///     border with its accent color, so panels read as distinctly-colored
-///     frosted modules (iOS Control Center style). Reported back as "not
-///     quite what I had in mind, looks ugly."
-///  3. **Clear-glass v5 (this revision)** — color moves OUT of the glass
-///     fill entirely. The glass itself (panel fill, panel border, nav
-///     bar/rail) is always a neutral, barely-there frost — one restrained
-///     hue family, never tinted per-accent. Color instead lives only in:
-///     icon-chip borders/strokes, the hero status ring, and filled pills
-///     (`GlassChip`). The backdrop swaps three drifting colored blobs for
-///     one achromatic diagonal light sweep over a lighter, real-luminance-
-///     range gradient — "light glinting on water, not colored water."
-///
-/// [GlassBackground]'s ambient motion still does **not** run a continuous
-/// 60fps [Ticker] — every [BackdropFilter] on screen re-samples and re-blurs
-/// whatever's beneath it on every paint, so anything that never stops moving
-/// forces all of them to redo that work forever, even at rest. This was the
-/// root cause of a reported Android flicker/slowdown (see `PROGRESS.md`,
-/// 2026-07-12) and the fix — a throttled [Timer] driving an *implicit*
-/// animation, so motion only costs anything during short eased bursts and
-/// sits fully idle the rest of the time — carries over unchanged to the v5
-/// sweep, which is exactly as prone to the same mistake as the blobs were if
-/// it were ported as a literal translation of the mockup's CSS
-/// `animation: sweep 13s ease-in-out infinite`. See [_GlassBackgroundState].
+///  2. "Vibrancy" pass — tinted each [GlassPanel]'s fill and border with its
+///     accent color (iOS Control Center style). Reported back as "not quite
+///     what I had in mind, looks ugly."
+///  3. "Clear-glass v5" — un-tinted the fill again, but replaced the flat
+///     backdrop with a 4-stop gradient plus an animated diagonal light
+///     sweep. Reported back as still not matching expectation, this time
+///     against a reference screenshot: uniform flat background, no
+///     gradient, panels distinctly more see-through than v5's barely-there
+///     frost.
+///  4. **Clear-glass v6 (this revision)** — [GlassBackground] is now a
+///     single flat color (`GlassColors.bg`), not a gradient, and has no
+///     ambient motion at all. Once the backdrop is one flat color, blurring
+///     it is a no-op (blurring a uniform color returns the same uniform
+///     color), so [BackdropFilter] is removed from every glass surface, not
+///     just toned down — same visual result, and it fully retires the
+///     Android flicker-risk category v5's doc comment used to warn about
+///     here, since nothing left re-samples/re-blurs on every paint. Panel
+///     translucency instead comes from a lower-alpha, cool-tinted fill
+///     (sampled from the reference image's tiles, which read as a
+///     lightened/desaturated version of the same background blue, not a
+///     white wash) composited directly over that flat backdrop, plus a
+///     crisper border to keep panel edges legible now that there's no blur
+///     to separate them. "Pure glass over water," not "light glinting on
+///     water."
 ///
 /// Modal surfaces (AlertDialog, SnackBar, BottomSheet) are deliberately
 /// LEFT as standard Material — glass is for the persistent app chrome and
@@ -54,18 +51,12 @@ class GlassColors {
     required this.textPrimary,
     required this.textSecondary,
     required this.textTertiary,
-    required this.bgTop,
-    required this.bgMid,
-    required this.bgMid2,
-    required this.bgBottom,
+    required this.bg,
     required this.panelFillA,
     required this.panelFillB,
     required this.borderBright,
     required this.borderDim,
-    required this.vignetteEdge,
     required this.specularLine,
-    required this.sweepCore,
-    required this.sweepEdge,
     required this.ringBorderAlpha,
     required this.ringGlowAlpha,
     required this.navActiveFill,
@@ -79,23 +70,27 @@ class GlassColors {
 
   final Color textPrimary, textSecondary, textTertiary;
 
-  // Backdrop gradient — 4 stops now (was 3). A near-black backdrop has
-  // almost no tonal variation for a blurred panel to visibly separate from,
-  // so v5 moves to a mid-tone slate-blue field with real luminance range
-  // top-to-bottom (see plan §1, "Backdrop gradient" row).
-  final Color bgTop, bgMid, bgMid2, bgBottom;
+  // v6: single flat backdrop color — no gradient, no stops. Matches a
+  // reference screenshot's sampled background exactly (dark: #27516A).
+  // See PROGRESS.md 2026-07-12 "v6" entry for the sampling method/caveats.
+  final Color bg;
 
-  // Panel fill/border — always neutral now, never accent-tinted.
+  // Panel fill/border — always neutral (never accent-tinted, unchanged
+  // rule from v5), but v6 lowers the alpha and shifts the hue from
+  // white-tinted to a cool blue-cyan tint, matching how the reference
+  // image's tiles actually read: a lightened/desaturated version of `bg`,
+  // not a white wash mixed into it (a literal white-blend was tested
+  // against the sampled tile pixels and ruled out — see PROGRESS.md).
   final Color panelFillA, panelFillB;
+  // Border stays crisp/bright — with BackdropFilter gone (see class doc
+  // comment), the border is now the primary thing separating a panel's
+  // edge from the flat backdrop behind it, so v6 keeps this bright rather
+  // than softening it further.
   final Color borderBright, borderDim;
 
-  // New in v5:
-  final Color vignetteEdge; // radial overlay darkening the backdrop's edges
   final Color specularLine; // the discrete 1px top-edge highlight on glass
-  final Color sweepCore; // center of the diagonal light-sweep band
-  final Color sweepEdge; // shoulders of the light-sweep band
 
-  // Hero/status-banner "ring" alphas — the one place v5 still puts color
+  // Hero/status-banner "ring" alphas — the one place v5/v6 still puts color
   // directly on a panel, as a border + glow ring rather than a fill tint.
   // Kept as tunable tokens (not literals in GlassPanel) so light mode can
   // use a toned-down scale without touching widget code — see plan §7.
@@ -114,8 +109,11 @@ class GlassColors {
   static GlassColors of(BuildContext context) =>
       Theme.of(context).brightness == Brightness.dark ? dark : light;
 
-  /// Dark-mode tokens — matches `overview_redesign_preview_v5.html` exactly
-  /// for every value the mockup specifies (see plan §1/§2/Appendix).
+  /// Dark-mode tokens — v6: `bg` and the panel-fill hue/alpha are sampled
+  /// from a user-provided reference screenshot (uniform flat blue backdrop,
+  /// clearly-see-through tiles), not carried over from the v5 mockup. See
+  /// PROGRESS.md 2026-07-12 "v6" entry for the exact sampling method,
+  /// including the samples that were discarded as edge/icon artifacts.
   static final GlassColors dark = GlassColors._(
     violet: const Color(0xFFAFA4F2),
     amber: const Color(0xFFF0B47A),
@@ -125,33 +123,34 @@ class GlassColors {
     textPrimary: const Color(0xFFF8F9FC),
     textSecondary: const Color(0xFFB4B9CE),
     textTertiary: const Color(0xFF7F86A0),
-    bgTop: const Color(0xFF35495C),
-    bgMid: const Color(0xFF26374A),
-    bgMid2: const Color(0xFF1A2735),
-    bgBottom: const Color(0xFF121B25),
-    panelFillA: Colors.white.withValues(alpha: 0.09),
-    panelFillB: Colors.white.withValues(alpha: 0.02),
-    borderBright: Colors.white.withValues(alpha: 0.24),
-    borderDim: Colors.white.withValues(alpha: 0.04),
-    vignetteEdge: const Color(0xFF060A0F).withValues(alpha: 0.42),
+    // Sampled directly from the reference image's open background area
+    // (consistent RGB(39,81,106) across multiple margin samples).
+    bg: const Color(0xFF27516A),
+    // Two-stop gradient (barely distinguishable, kept only for the same
+    // subtle top-left/bottom-right light-catching cue the border gradient
+    // uses) of a light cyan-blue tint at low alpha over `bg`. Tuned to land
+    // close to the reference tiles' sampled RGB(~35-36,91-92,125-127) —
+    // see PROGRESS.md for why an exact reverse-engineered blend wasn't
+    // pursued (compressed screenshot, icon-blur artifacts in several
+    // samples) in favor of this "clearly see-through, right hue family"
+    // approximation.
+    panelFillA: const Color(0xFF8FD9FF).withValues(alpha: 0.10),
+    panelFillB: const Color(0xFF8FD9FF).withValues(alpha: 0.04),
+    borderBright: Colors.white.withValues(alpha: 0.32),
+    borderDim: Colors.white.withValues(alpha: 0.06),
     specularLine: Colors.white.withValues(alpha: 0.7),
-    // Lowered from the mockup's literal 0.16/0.10 after a real build showed
-    // the sweep reading as a hard, distinctly visible beam rather than
-    // ambient light on a wider window with more gap between panels than the
-    // mockup's narrow preview had — see the doc comment on the sweep
-    // gradient in GlassBackground for the full reasoning.
-    sweepCore: const Color(0xFFDCEBF5).withValues(alpha: 0.07),
-    sweepEdge: Colors.white.withValues(alpha: 0.04),
     ringBorderAlpha: 0.4,
     ringGlowAlpha: 0.08,
     navActiveFill: Colors.white.withValues(alpha: 0.08),
     navActiveBorder: Colors.white.withValues(alpha: 0.22),
   );
 
-  /// Light-mode tokens — v5's mockup is dark-only, so this palette is
-  /// *designed*, not copied: same structural rules (real backdrop luminance
-  /// range, neutral glass, specular line, accent-only-on-content) at
-  /// light-mode-appropriate contrast. See plan §7 for the full reasoning.
+  /// Light-mode tokens — the reference image is dark-mode-only (same
+  /// limitation v5 had with its mockup), so this palette is *designed*, not
+  /// sampled: same v6 structural rules (flat backdrop, no blur, lower-alpha
+  /// cool-tinted fill, crisp border) at light-mode-appropriate contrast.
+  /// Flagging this explicitly rather than presenting it as verified — please
+  /// sanity-check light mode against the app once built.
   static final GlassColors light = GlassColors._(
     violet: const Color(0xFF6C5CE7),
     amber: const Color(0xFFB5690C),
@@ -161,29 +160,22 @@ class GlassColors {
     textPrimary: const Color(0xFF1B1D28),
     textSecondary: const Color(0xFF4B4F63),
     textTertiary: const Color(0xFF767B93),
-    // Same lavender-leaning hue family as before, but with genuine
-    // top-to-bottom luminance range (cool sky-lavender top → warm-white
-    // bottom) instead of three near-identical near-whites — the same "flat,
-    // nothing for a blur to reveal" problem v5 fixes in dark mode existed
-    // here too, just less obviously.
-    bgTop: const Color(0xFFDCE3F0),
-    bgMid: const Color(0xFFE9E6F5),
-    bgMid2: const Color(0xFFF3EFFA),
-    bgBottom: const Color(0xFFFAF8FC),
-    // Fill/border stay at their existing, much higher light-mode alphas —
-    // light glass fundamentally needs more opacity to read than dark glass
-    // (pre-existing rule, unchanged by v5).
-    panelFillA: Colors.white.withValues(alpha: 0.55),
-    panelFillB: Colors.white.withValues(alpha: 0.22),
+    // Flat backdrop (was a 4-stop near-white gradient) — picked the old
+    // gradient's midpoint as the single flat tone, same "one uniform color,
+    // no gradient" rule as dark mode's `bg`.
+    bg: const Color(0xFFE9E6F5),
+    // Light glass still needs more opacity than dark glass to read at all
+    // against a bright backdrop (pre-existing rule, unchanged by v6), but
+    // v6 still pushes it more see-through than v5's 0.55/0.22 — moved
+    // toward the same direction dark mode moved, just staying legible.
+    panelFillA: Colors.white.withValues(alpha: 0.40),
+    panelFillB: Colors.white.withValues(alpha: 0.14),
     borderBright: Colors.white.withValues(alpha: 0.85),
     borderDim: Colors.white.withValues(alpha: 0.25),
-    vignetteEdge: const Color(0xFF4A4458).withValues(alpha: 0.12),
     specularLine: Colors.white.withValues(alpha: 0.9),
-    sweepCore: const Color(0xFFFFFBF3).withValues(alpha: 0.035),
-    sweepEdge: Colors.white.withValues(alpha: 0.02),
-    // Tuned down from dark mode's 0.4/0.08 per plan §7's guidance to land in
-    // the same 0.08-0.10 magnitude the old *Glow tokens used, rather than
-    // the stronger accent presence dark glass can carry.
+    // Tuned down from dark mode's 0.4/0.08 to land in the same 0.08-0.10
+    // magnitude the old *Glow tokens used, rather than the stronger accent
+    // presence dark glass can carry (carried over unchanged from v5).
     ringBorderAlpha: 0.30,
     ringGlowAlpha: 0.09,
     // White washes over an already-light panel are nearly invisible, so
@@ -205,11 +197,19 @@ class GlassColors {
 /// added alongside the panel's normal drop shadow. Everything else about
 /// the surface (fill, specular line) stays neutral either way — this is a
 /// ring, not a tint.
+///
+/// v6: no [BackdropFilter]. [GlassBackground] is now a single flat color —
+/// blurring a uniform color returns that same uniform color, so the blur
+/// pass bought nothing and cost a re-sample/re-blur on every paint (the
+/// mechanism behind a previously-fixed Android flicker bug, see the class
+/// doc comment above). The fill is now composited directly: a two-stop,
+/// low-alpha, cool-tinted gradient (`panelFillA`/`panelFillB`) painted as a
+/// plain `Container`, so the flat backdrop reads through clearly with zero
+/// per-frame sampling cost.
 Widget _clearGlassSurface(
   BuildContext context, {
   required Widget child,
   required double borderRadius,
-  double blurSigma = 18,
   Color? ringColor,
   bool specular = true,
 }) {
@@ -244,19 +244,16 @@ Widget _clearGlassSurface(
     padding: const EdgeInsets.all(1.1),
     child: ClipRRect(
       borderRadius: BorderRadius.circular(borderRadius - 1.1),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma),
-        child: Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(borderRadius - 1.1),
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [c.panelFillA, c.panelFillB],
-            ),
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(borderRadius - 1.1),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [c.panelFillA, c.panelFillB],
           ),
-          child: specular ? Stack(children: [child, _specularLine(c)]) : child,
         ),
+        child: specular ? Stack(children: [child, _specularLine(c)]) : child,
       ),
     ),
   );
@@ -292,53 +289,20 @@ Widget _specularLine(GlassColors c) {
   );
 }
 
-/// Persistent ambient backdrop: the v5 gradient field, a radial vignette,
-/// and one diagonal light sweep drifting across it. Meant to be used once
-/// per screen, behind that screen's content.
-class GlassBackground extends StatefulWidget {
+/// Persistent ambient backdrop: a single flat color, no gradient, no
+/// motion. Meant to be used once per screen, behind that screen's content.
+///
+/// v6: was a [StatefulWidget] driving a [Timer] + [AnimatedAlign] light
+/// sweep over a 4-stop gradient (see git history for that version if it's
+/// ever needed again). Once the background is one flat color there is
+/// nothing left to animate or blend — a static [DecoratedBox] is strictly
+/// equivalent in the one case that mattered (idle-screen repaint cost: was
+/// already near-zero thanks to the throttled-Timer fix, now it's exactly
+/// zero) and removes the class entirely rather than leaving inert
+/// machinery behind.
+class GlassBackground extends StatelessWidget {
   const GlassBackground({super.key, this.child});
   final Widget? child;
-
-  @override
-  State<GlassBackground> createState() => _GlassBackgroundState();
-}
-
-// Every GlassPanel/GlassListTile/GlassNavBar/GlassNavRail on screen paints
-// itself with BackdropFilter, which re-samples and re-blurs whatever is
-// beneath it EVERY time it paints. A background that never stops moving
-// forces all of them to redo that work forever, even while the screen is
-// completely idle — that was the root cause of the reported Android
-// flicker/slowdown (see PROGRESS.md, 2026-07-12 "vibrancy + perf" entry),
-// and it applies just as much to v5's sweep as it did to the old drifting
-// color blobs it replaces (see plan §3.1/§6 — porting the mockup's literal
-// `animation: sweep 13s ease-in-out infinite` as a free-running
-// AnimationController.repeat() would silently reintroduce the exact bug
-// that session just fixed). Fix, unchanged in mechanism from that session:
-// drive the drift from a slow Timer that toggles a target position, and let
-// an *implicit* animation (AnimatedAlign) ease to it. The sweep then only
-// repaints — and only forces every blur layer above it to re-blur — during
-// the short ease window, and sits fully static (zero repaint cost) the rest
-// of the time.
-class _GlassBackgroundState extends State<GlassBackground> {
-  static const _driftPeriod = Duration(seconds: 13); // matches mockup's 13s cycle
-  static const _driftEase = Duration(seconds: 7);
-  Timer? _timer;
-  bool _swept = false; // toggled — NOT ticked every frame.
-
-  @override
-  void initState() {
-    super.initState();
-    _timer = Timer.periodic(_driftPeriod, (_) {
-      if (!mounted) return;
-      setState(() => _swept = !_swept);
-    });
-  }
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -346,87 +310,8 @@ class _GlassBackgroundState extends State<GlassBackground> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        // 4-stop backdrop gradient, 165deg (converted to Alignment via
-        // dx=sin(theta), dy=-cos(theta) — see plan Appendix for the source
-        // CSS this is copied from).
-        DecoratedBox(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: const Alignment(-0.2588, -0.9659),
-              end: const Alignment(0.2588, 0.9659),
-              colors: [c.bgTop, c.bgMid, c.bgMid2, c.bgBottom],
-              stops: const [0.0, 0.38, 0.68, 1.0],
-            ),
-          ),
-        ),
-        // Diagonal light sweep — oversized band (220% of the screen, same
-        // proportions as the mockup's `inset: -60%`), drifting back and
-        // forth. Gradient direction (112deg) uses the same angle→Alignment
-        // conversion as the backdrop above.
-        //
-        // Stops are deliberately much wider than the mockup's literal CSS
-        // (36/47/50/53/64% — a tight, ~28%-wide band). In the mockup's
-        // narrow phone-width preview, glass panels cover nearly the full
-        // width, so the raw gradient rarely shows through a gap. On a wider
-        // desktop window there's much more visible gap between panels, and
-        // that same tight band reads as a hard, distinctly visible stroke
-        // rather than ambient light — reported back after a real build, see
-        // PROGRESS.md. Widened here to ~85% of the gradient's extent with a
-        // very gradual falloff, no flat plateau, so it reads as a soft
-        // brightening rather than a beam. Alpha tokens (sweepCore/sweepEdge)
-        // were also lowered accordingly — see GlassColors.
-        ClipRect(
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final w = constraints.maxWidth.isFinite
-                  ? constraints.maxWidth * 2.2
-                  : 2000.0;
-              final h = constraints.maxHeight.isFinite
-                  ? constraints.maxHeight * 2.2
-                  : 2000.0;
-              return AnimatedAlign(
-                duration: _driftEase,
-                curve: Curves.easeInOutSine,
-                alignment: _swept
-                    ? const Alignment(0.08, 0.04)
-                    : const Alignment(-0.08, -0.04),
-                child: SizedBox(
-                  width: w,
-                  height: h,
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: const Alignment(-0.9272, -0.3746),
-                        end: const Alignment(0.9272, 0.3746),
-                        colors: [
-                          Colors.transparent,
-                          c.sweepEdge,
-                          c.sweepCore,
-                          c.sweepEdge,
-                          Colors.transparent,
-                        ],
-                        stops: const [0.08, 0.38, 0.50, 0.62, 0.92],
-                      ),
-                    ),
-                  ),
-                ),
-              );
-            },
-          ),
-        ),
-        // Radial vignette — darkens the edges/bottom slightly so the sweep
-        // and top content stay legible against the now-lighter backdrop.
-        DecoratedBox(
-          decoration: BoxDecoration(
-            gradient: RadialGradient(
-              center: const Alignment(0, -0.5),
-              radius: 1.1,
-              colors: [Colors.transparent, c.vignetteEdge],
-              stops: const [0.45, 1.0],
-            ),
-          ),
-        ),
-        if (widget.child != null) widget.child!,
+        DecoratedBox(decoration: BoxDecoration(color: c.bg)),
+        if (child != null) child!,
       ],
     );
   }
@@ -445,7 +330,6 @@ class GlassPanel extends StatelessWidget {
     this.padding = const EdgeInsets.all(14),
     this.borderRadius = 18,
     this.ringColor,
-    this.blurSigma = 18,
     this.margin,
   });
 
@@ -462,7 +346,6 @@ class GlassPanel extends StatelessWidget {
   /// [GlassStatusBanner]) — see plan §3.2 for why a rename was preferred
   /// over silently changing what `accentColor` meant.
   final Color? ringColor;
-  final double blurSigma;
   final EdgeInsetsGeometry? margin;
 
   @override
@@ -470,7 +353,6 @@ class GlassPanel extends StatelessWidget {
     Widget panel = _clearGlassSurface(
       context,
       borderRadius: borderRadius,
-      blurSigma: blurSigma,
       ringColor: ringColor,
       child: Padding(padding: padding, child: child),
     );
@@ -957,7 +839,6 @@ class GlassNavBar extends StatelessWidget {
       child: _clearGlassSurface(
         context,
         borderRadius: 24,
-        blurSigma: 22,
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
           child: Row(
@@ -1042,7 +923,6 @@ class GlassNavRail extends StatelessWidget {
       child: _clearGlassSurface(
         context,
         borderRadius: 22,
-        blurSigma: 24,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
