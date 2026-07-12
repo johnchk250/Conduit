@@ -533,15 +533,25 @@ and the modal-surfaces-stay-Material rule all live as doc comments directly
 in `lib/src/ui/glass.dart` — read that file's header before touching it or
 any screen that uses it.
 
-**Shared library:** `lib/src/ui/glass.dart` — ✅ complete (`GlassColors`,
-`GlassBackground`, `GlassPanel`, `GlassSectionLabel`, `GlassListTile`,
-`GlassStatusBanner`, `GlassChip`, `GlassButton`, `GlassNavBar`/`GlassNavRail`).
+**Shared library:** `lib/src/ui/glass.dart` — ✅ complete, now on its
+**clear-glass v5** revision (`GlassColors`, `GlassBackground`, `GlassPanel`,
+`GlassSectionLabel`, `GlassListTile`, `GlassStatusBanner`, `GlassChip`,
+`GlassButton`, `GlassNavBar`/`GlassNavRail`). v5 pulls per-panel accent-color
+fill/border tinting back out (the "vibrancy" pass didn't land well — see
+`docs/2026-07-12-clear-glass-v5-plan.md` §0) in favor of a neutral glass
+surface with color only on content (icon-chip borders, the hero ring, filled
+pills), a lighter backdrop gradient, and a drifting light-sweep ambient
+animation in place of the old three colored blobs. The Android
+flicker/perf fix from the vibrancy pass (`Timer` + implicit-animation drift,
+not a free-running `AnimationController`) carries over unchanged and now
+also covers the sweep — see the plan doc §3.1/§6 for why that matters.
 
 **Per-screen conversion checklist:**
 | File | Status |
 |---|---|
-| `dashboard_screen.dart` (shell: NavRail/NavBar, Overview, Settings hub) | ✅ done (2026-07-12) |
-| `folder_pairs_screen.dart` | ⬜ not started — recommended next (see `THINKING.md` 2026-07-12) |
+| `glass.dart` — clear-glass v5 token/component revision (see `docs/2026-07-12-clear-glass-v5-plan.md`) | ✅ done (2026-07-12) — un-tints panel fill/border, adds specular line + light sweep, hero moves to ring-not-fill, nav active state goes neutral. Do this before any further per-screen rows below. |
+| `dashboard_screen.dart` (shell: NavRail/NavBar, Overview, Settings hub) | ✅ done (2026-07-12) — re-touched for v5 (was converted against the now-reverted "vibrancy" pass): migrated `_sectionHeader` → shared `GlassSectionLabel` (plan §3.6); no other call-site changes needed (`GlassListTile`/`GlassChip`/`GlassStatusBanner` pick up the new neutral tokens automatically). Quick Actions row deliberately left as a single `Send files` row, not converted to the mockup's 3-across circular layout — see plan §5. |
+| `folder_pairs_screen.dart` | ⬜ not started — recommended next (see `THINKING.md` 2026-07-12), now against v5 tokens |
 | `pairing_screen.dart` | ⬜ not started |
 | `remote_control_screen.dart` | ⬜ not started |
 | `send_flow_view.dart` | ⬜ not started |

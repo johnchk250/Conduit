@@ -1086,3 +1086,179 @@ confirm before merging.** Not committed or pushed (no local git identity
 configured in this sandbox and no push credentials for
 `johnchk250/Conduit`, same limitation as every prior session). Delivered as
 a git patch file plus a full repo copy — see delivery note in chat.
+
+---
+
+## 2026-07-12 (new session) — Clear-glass v5: `glass.dart` rewrite + Overview re-touch
+
+**User report:** the previous session's "vibrancy" fix (see the entry just
+above this one) didn't land — reported back as "that didn't work out
+great." The person supplied a fully worked static mockup
+(`overview_redesign_preview_v5.html`) plus a **detailed written execution
+plan** (`2026-07-12-clear-glass-v5-plan.md`, now committed at
+`docs/2026-07-12-clear-glass-v5-plan.md`) that reverse-engineers every token
+and structural decision out of that mockup and maps it onto this file. This
+session's instruction was explicit: implement that plan as given, not
+design a new one.
+
+**What "clear-glass v5" changes, in one sentence:** color moves out of the
+glass fill entirely — the panel/nav surface itself is always a neutral,
+barely-there frost, and color instead lives only in icon-chip
+borders/strokes, the hero status ring, and filled pills. This is a partial,
+deliberate reversal of the immediately-prior "vibrancy" session (which
+tinted panel fills/borders per accent) — called out explicitly here and in
+`glass.dart`'s own doc comment so it doesn't read as accidentally
+regressing that session's work.
+
+**`lib/src/ui/glass.dart` — full rewrite, following the plan section by
+section:**
+- `GlassColors`: removed the five now-dead `*Glow` fields (only ever fed the
+  removed background blobs); replaced the 3-stop near-black backdrop
+  (`bgTop/Mid/Bottom`) with a 4-stop mid-tone slate-blue gradient
+  (`bgTop/Mid/Mid2/Bottom`, exact hexes copied from the mockup); bumped
+  `panelFillA` 0.08→0.09 and `borderBright` 0.20→0.24; added four new
+  tokens the mockup introduces with no prior equivalent (`vignetteEdge`,
+  `specularLine`, `sweepCore`, `sweepEdge`). Also added two token pairs of
+  my own that the plan flagged as implementation judgment calls rather than
+  literal mockup values: `ringBorderAlpha`/`ringGlowAlpha` (hero ring
+  strength, tuned down for light mode per plan §7) and
+  `navActiveFill`/`navActiveBorder` (nav bar/rail active-tab highlight —
+  white overlay reads fine on dark glass but is nearly invisible on light
+  glass, so light mode darkens instead of brightens; the mockup is dark-only
+  and doesn't cover this).
+- Extracted `_clearGlassSurface()`, a shared private helper now used by
+  `GlassPanel`, `GlassNavBar`, and `GlassNavRail` alike (per plan §3.7),
+  replacing three separately-hand-rolled `BackdropFilter`+`Container`
+  decorations that had already drifted apart once (navbar's border used
+  `borderDim`, panel used `borderBright` — that inconsistency is gone now
+  that there's one formula). Also added the discrete 1px specular highlight
+  (inset 8% each side, fading at both ends) every clear-glass surface now
+  gets, replacing the old full-width inset-shadow highlight.
+- `GlassPanel`: removed the accent-conditional fill/border branch entirely
+  (fill is always `panelFillA/B` now); renamed `accentColor` → `ringColor`
+  (deliberate rename, not a silent meaning-change — plan §3.2 argues for
+  this explicitly, and it only touched 2 internal call sites). When set,
+  `ringColor` now colors the border gradient's bright corner and adds a
+  thin additive glow-ring shadow, instead of tinting the fill.
+- `GlassListTile`: icon chip switched from a filled color wash to a
+  bordered chip (neutral `white@6%` background, accent-colored 1px border —
+  matches the mockup's `.icon-chip` exactly); **stopped forwarding
+  `accentColor` into the inner panel** — this is the one deliberate
+  re-reversal of the immediately-prior session's "previously dropped, now
+  forwarded" fix, called out in both the commit and this file so it isn't
+  mistaken for a regression; added text-shadows to title/subtitle (needed
+  now that the backdrop is lighter/busier than the old near-black field —
+  without it, white text was losing contrast in the brighter zones of the
+  sweep).
+- `GlassStatusBanner` (hero): switched from `GlassPanel(accentColor:)` to
+  `GlassPanel(ringColor:)`; icon chip switched from a 28px filled gradient
+  circle to the same bordered-chip treatment as row icons, just larger
+  (44px, radius 13, matching the mockup's `.hero-icon` exactly).
+- `GlassSectionLabel`: bumped `textSecondary`/12.5px → `textPrimary`/15px,
+  added a text-shadow — this coincidentally now matches what
+  `dashboard_screen.dart`'s own private `_sectionHeader` helper already did
+  (a pre-existing, not-v5-caused divergence the plan flagged in §3.6), so
+  that private helper is deleted this session in favor of every screen
+  calling this one shared widget.
+- `GlassChip`: fill alpha `.22/.13` → `.10/.05`, border `.36` → `.55`
+  (quieter fill, more visible border — plan §3.8, no structural change).
+- `GlassButton`: untouched — nothing in the mockup implies a change (plan
+  §3.9).
+- `GlassBackground`: replaced the three drifting colored blobs
+  (violet/teal/amber) with one achromatic diagonal light sweep plus a radial
+  vignette layer. **The performance-critical part:** the sweep is driven by
+  the exact same `Timer.periodic` + implicit-animation (`AnimatedAlign`)
+  pattern the immediately-prior session's flicker fix established for the
+  blobs — *not* a literal port of the mockup's CSS
+  `animation: sweep 13s ease-in-out infinite`, which would have been a
+  free-running `AnimationController.repeat()` behind every `BackdropFilter`
+  on screen and would have silently reintroduced the exact bug that session
+  just fixed. Plan §3.1/§6 flag this as the single highest-consequence
+  mistake available in the whole rollout — treated it as such. Backdrop and
+  sweep gradient angles (165deg / 112deg) are converted from CSS angle
+  convention to Flutter `Alignment` via `dx=sin(θ), dy=-cos(θ)` rather than
+  eyeballed, so the direction is exact, not approximate.
+- `GlassColors.light`: the mockup is dark-only, so per plan §7 this is
+  *designed*, not copied — same structural rules (real backdrop luminance
+  range, neutral glass, specular line, accent-only-on-content) at
+  light-mode-appropriate contrast. Flagged in the code comments as a
+  judgment call, not a verbatim source value, so a future session doesn't
+  mistake it for something pulled off the mockup.
+
+**`lib/src/ui/dashboard_screen.dart` — re-touch, not fresh conversion** (it
+was already glass, just built against the now-reverted vibrancy semantics):
+migrated all three Overview section headers from the private
+`_sectionHeader(c, text)` helper to the shared `GlassSectionLabel(text)`
+widget, then deleted `_sectionHeader` entirely. Confirmed (by reading
+`glass.dart`'s new call graph, not assuming) that no other call site in this
+file needed changes — `GlassStatusBanner`, `GlassListTile`, and `GlassChip`
+all keep the exact same external parameter names they had before
+(`accentColor:`), so every existing call in this file picks up the new
+neutral tokens automatically. The Quick Actions row is **unchanged** — the
+mockup's 3-across circular-shortcut layout was evaluated and explicitly
+declined in the plan (§5); Overview keeps its single `Send files` row.
+Net diff: 3 one-line swaps + one 11-line deletion — about as small as a
+"re-touch" gets, matching the plan's own prediction in its §4 rollout table.
+
+**`Roadmap.md`:** inserted the `glass.dart` v5 revision as its own row above
+the existing per-screen checklist (plan §9's suggested edit, applied
+verbatim), and updated the `dashboard_screen.dart` row to describe the
+re-touch instead of the original conversion. The other 9 rows are untouched
+— this session did not convert any of the remaining Material screens; see
+"Not done this session" below.
+
+**Also committed to the repo this session:** the plan doc itself
+(`docs/2026-07-12-clear-glass-v5-plan.md`) and the source mockup
+(`docs/overview_redesign_preview_v5.html`), matching this project's existing
+`docs/` convention for dated planning documents (`2026-07-05-...`,
+`2026-07-11-...`).
+
+**Verification performed** (same standing constraint as every session in
+this log — no Flutter/Dart SDK in this sandbox, `which flutter dart`
+confirmed empty):
+- Balanced-delimiter check (custom Python scanner, comment/string-aware) on
+  both touched Dart files — clean, before and after every edit.
+- Full top-to-bottom re-read of `glass.dart` after the rewrite.
+- Grepped for every remaining `Glow`/`GlassPanel(`/`AnimationController`/
+  `.repeat(` reference across all of `lib/` (not just the touched files) to
+  confirm: no dangling references to the removed `*Glow` tokens; the
+  renamed `GlassPanel(ringColor:)` param has exactly the 2 internal call
+  sites the plan predicted; the only `AnimationController` in the touched
+  files is `GlassButton`'s pre-existing one-shot tap-scale animation (not a
+  `.repeat()`, not behind a `BackdropFilter` driving ambient motion) — the
+  plan's §6/§8 guardrail check, run as specified.
+- **Not verified:** an actual `flutter run`/`flutter analyze`, or a
+  rendered screenshot to visually confirm the result matches the mockup —
+  no such tooling in this sandbox, same limitation as every prior session.
+  **Please build and run on both targets to confirm** — in particular, the
+  sweep's motion (Timer+AnimatedAlign, alignment deltas of ±0.08/±0.04
+  eyeballed against the CSS's own translate percentages rather than derived
+  from a formula, since Flutter's `Alignment` and CSS `%`-translate aren't
+  directly equivalent units) is the one piece of this session's work with
+  no strong basis for confidence beyond "looks plausible on paper."
+
+**Not done this session, and not claimed as done:** this is step 1-2 of the
+plan's own §4 rollout table (`glass.dart` itself, then the
+`dashboard_screen.dart` re-touch) — the plan's suggested order has 5 more
+steps after this covering the other 9 screens (`send_widget_screen.dart`,
+`send_panel.dart`, `version_history_screen.dart`, `activity_screen.dart`,
+`clipboard_screen.dart`, `remote_control_screen.dart`,
+`folder_pairs_screen.dart`, `pairing_screen.dart`, `send_flow_view.dart`,
+roughly risk-ascending). None of those were touched this session — they're
+still 100% standard Material, same as before. `Roadmap.md`'s checklist
+reflects this accurately (still ⬜ for all 9).
+
+**Files touched:** `lib/src/ui/glass.dart`, `lib/src/ui/dashboard_screen.dart`,
+`Roadmap.md`, `PROGRESS.md`, `THINKING.md`,
+`docs/2026-07-12-clear-glass-v5-plan.md` (added),
+`docs/overview_redesign_preview_v5.html` (added).
+
+**Status: implementation complete for plan steps 1-2 (shared library +
+Overview re-touch), verified by static analysis only (no SDK in this
+sandbox) — please `flutter run` on Windows and Android to confirm before
+merging, and take a visual look at Overview in both light and dark mode
+(light mode in particular got no mockup to check against — see plan §7 and
+the `GlassColors.light` code comments). Committed locally (see delivery
+note for the exact commits and how to bring them into your local clone/push
+to GitHub yourself — no push credentials for `johnchk250/Conduit` in this
+sandbox, same limitation as every prior session).

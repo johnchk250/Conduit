@@ -508,3 +508,93 @@ BackdropFilter-consolidation step flagged in `PROGRESS.md`. No profiler, no
 emulator, no device in this sandbox — this is a confident diagnosis of
 mechanism, not a benchmarked-and-confirmed fix, and I said so rather than
 overstating it.
+
+---
+
+## 2026-07-12 (new session) — Clear-glass v5: why a rewrite, not another patch
+
+The instruction for this session was unusually explicit about scope:
+implement a plan the person had already written and handed off
+(`2026-07-12-clear-glass-v5-plan.md`), and specifically *not* re-derive one.
+That's a different mode than most entries in this file — normally the work
+here is investigating a bug or scoping a decision from scratch. Here the
+investigation was already done, by the plan's own author, and the job was
+faithful execution plus catching anything the plan's execution notes
+flagged as a place to be careful.
+
+**Reading the plan before touching any code mattered more than usual
+here**, because §0 of the plan makes a specific, load-bearing claim: that
+this is the *third* visual direction `glass.dart` has gone through in one
+day, and that v5 is a *partial* reversal of the second one (the "vibrancy"
+pass), not a full reset back to the first. Skimming straight to the token
+table (§1) without reading §0 first would have made it easy to miss that
+`GlassListTile` needed one thing un-done (stop forwarding `accentColor`
+into the panel fill) while `GlassPanel` needed something new added in
+roughly the same spot (a `ringColor` parameter, for the hero only). Those
+two changes sit right next to each other in the diff and read, out of
+context, like they might be inconsistent with each other. They're not —
+one is "color never touches a *row's* panel," the other is "color still
+touches the *hero's* panel, just as a ring instead of a fill" — but that
+distinction only makes sense if you've read why rows and the hero are
+being treated differently in the first place (plan §3.2-§3.4). Called this
+out explicitly in both the code comments and `PROGRESS.md` for exactly this
+reason: a future session skimming the diff without this context could
+plausibly "fix" the row behavior back to matching the hero's, thinking it
+found an inconsistency, when the inconsistency is the actual design intent.
+
+**The single most consequential instruction in the whole plan, by the
+plan's own framing, was §3.1/§6's warning about the light sweep's motion.**
+Worth restating why that's not overcautious: the mockup's CSS is
+`animation: sweep 13s ease-in-out infinite` — a completely ordinary,
+essentially free way to animate something in a browser, because CSS
+animations run on the compositor thread and don't force any element
+beneath them to redo work. Flutter's `BackdropFilter` has no equivalent
+free lunch — it re-samples and re-blurs whatever's currently composited
+beneath it on literally every paint, by design, with no caching. That's
+*exactly* the mechanism the immediately-prior session's flicker bug came
+from (see that day's earlier entry above), and it would have been an easy
+mistake to reintroduce by translating the CSS keyframe literally instead of
+asking "what does this animation actually need to *do*, mechanically, in
+this specific rendering model." Ported it as the same `Timer.periodic` +
+implicit-animation (`AnimatedAlign`) pattern that fix already established,
+applied to a gradient's alignment instead of three blobs' positions. This
+is, structurally, the same lesson as the earlier session's ("prefer
+implicit animations over a free-running ticker for anything under a
+BackdropFilter") — the plan's author clearly already knew this from having
+lived through the original bug, which is presumably exactly why §6 exists
+as its own section rather than being folded into §3.1's design notes.
+
+**Where I made judgment calls the plan explicitly delegated rather than
+specified:** two spots. First, the `ringBorderAlpha`/`ringGlowAlpha` and
+`navActiveFill`/`navActiveBorder` tokens don't exist in the mockup at all —
+I added them as tunable `GlassColors` fields rather than hardcoding numbers
+into the widgets, specifically so light mode (§7, which the plan is
+explicit has "no source-of-truth mockup" and calls "a direction, not exact
+hex values") could use different numbers without touching widget code
+later. Second, the nav bar/rail active-item highlight: the plan's dark-mode
+value is a literal `rgba(255,255,255,...)` wash, which reads fine against
+dark glass but would be nearly invisible against light mode's much brighter
+panel fill (light mode's own existing alphas are already 0.55/0.85, far
+above dark's 0.09/0.24 — a white-on-white overlay at typical alpha values
+just disappears). The plan doesn't mention nav treatment in §7 at all — it
+only discusses panel fill/border/specular/hero ring for light mode — so
+this was a genuine gap, not something I overrode. Resolved it by flipping
+the highlight to a darkening (black-based) tint in light mode instead of a
+brightening one, on the same "same structural rule, different sign, because
+the background inverted" logic the plan already uses for the ring alphas.
+Documented as a deliberate judgment call in both the code and
+`PROGRESS.md`, not presented as if it came from the mockup.
+
+**What I did not do, and why that's not scope-creep-avoidance for its own
+sake:** the plan's own §4 rollout table treats "convert one more screen" as
+enough work to be its own commit, explicitly because the largest untouched
+file (`send_flow_view.dart`) is roughly the size of two other screens
+combined and the project's stated convention (visible throughout this file
+and `PROGRESS.md`) is one bounded change per session/commit rather than a
+large batch that's harder to review or roll back cleanly. Stopping after
+the shared-library rewrite + the one screen that was already glass (and
+therefore needed re-touching regardless, or every screen converted after it
+would need a second touch-up) is exactly what the plan's own suggested
+order says to do first. The other 9 screens are unchanged, `Roadmap.md`
+still shows them as ⬜, and `PROGRESS.md` says so plainly rather than
+implying more got done than did.

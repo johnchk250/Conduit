@@ -499,7 +499,7 @@ class _OverviewPage extends StatelessWidget {
             accentColor: state.isStarted ? c.mint : c.amber,
           ),
           const SizedBox(height: 22),
-          _sectionHeader(c, 'Folder pairs'),
+          const GlassSectionLabel('Folder pairs'),
           const SizedBox(height: 8),
           if (pairs.isEmpty)
             GlassListTile(
@@ -535,7 +535,7 @@ class _OverviewPage extends StatelessWidget {
               );
             }),
           const SizedBox(height: 22),
-          _sectionHeader(c, 'Devices on this network'),
+          const GlassSectionLabel('Devices on this network'),
           const SizedBox(height: 8),
           if (discovered.isEmpty)
             GlassListTile(
@@ -576,7 +576,7 @@ class _OverviewPage extends StatelessWidget {
                   ),
                 )),
           const SizedBox(height: 22),
-          _sectionHeader(c, 'Quick actions'),
+          const GlassSectionLabel('Quick actions'),
           const SizedBox(height: 8),
           GlassListTile(
             leadingIcon: Icons.send_outlined,
@@ -598,18 +598,6 @@ class _OverviewPage extends StatelessWidget {
       ),
     );
   }
-
-  Widget _sectionHeader(GlassColors c, String text) => Padding(
-        padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
-        child: Text(
-          text,
-          style: TextStyle(
-            color: c.textPrimary,
-            fontSize: 15,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-      );
 
   void _goToFolders(BuildContext ctx) => _navigate(ctx, 1);
   void _goToDevices(BuildContext ctx) => _navigate(ctx, 2);
