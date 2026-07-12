@@ -932,3 +932,58 @@ the app is unconverted and functionally unaffected — everything outside
 `dashboard_screen.dart` still builds on stock Material and hasn't been
 touched.** Delivered as downloadable files/a git patch (no direct GitHub push
 access from this sandbox, per usual); the person applies and commits locally.
+
+---
+
+## 2026-07-12 (new session) — Windows build broken by `activeThumbColor`: fixed
+
+**User report:** `flutter build windows` failing with
+`error GC6690633: No named parameter with the name 'activeThumbColor'` at
+`dashboard_screen.dart:850` and `:867` (screenshot of the terminal output),
+cascading into MSB8066 custom-build-step failures — those cascade errors are
+just downstream consequences of the Dart compile error, not a separate bug.
+
+**Root cause:** the prior (2026-07-12, same-day) session's glass-UI conversion
+used `Switch(..., activeThumbColor: c.teal)`, reasoning in this file that
+`activeColor` was deprecated "after Flutter 3.31" in favor of
+`activeThumbColor`. That reasoning was correct about Flutter's own direction,
+but wrong about which stable release actually shipped it — checked against
+current Flutter release notes this session: `activeThumbColor` landed in the
+**3.35.0** stable release (PR flutter/flutter#166382), not 3.31. This repo's
+`pubspec.yaml` pins `environment.sdk: ^3.6.0` (Dart), which pairs with a
+Flutter release well before 3.35 — so the local Flutter SDK genuinely doesn't
+have that parameter yet, matching the exact compiler error.
+
+**Fix:** reverted both `Switch` call sites in `dashboard_screen.dart` from
+`activeThumbColor: c.teal` back to `activeColor: c.teal` — the older,
+non-deprecated-on-this-SDK-version parameter, present on every Flutter
+release including whatever this project is actually pinned to. On Flutter
+3.35+ this will show as a deprecation warning (not an error) rather than
+failing the build; on anything before 3.35 (this project's case) it's simply
+correct, non-deprecated usage. This is the appropriate fix without knowing
+the exact installed Flutter version — `activeColor` works everywhere.
+
+**Verification performed:** `grep -rn "activeThumbColor|activeTrackColor"
+lib/` across the whole tree — zero remaining hits (only the two call sites
+existed, both fixed). Balanced-delimiter check (custom Python scanner) on the
+edited file — clean. No Flutter/Dart SDK in this sandbox (same standing
+limitation as every session), so this is still a manual-review fix, not a
+verified `flutter build windows` pass — **please re-run your build to
+confirm**, but this is a one-line-times-two, low-risk, high-confidence fix
+for the exact error message reported.
+
+**Also set up this session (infrastructure, not app code):** the person asked
+for a persistently-tracked, git-friendly workflow — cloned the repo fresh
+into this sandbox, confirmed this `PROGRESS.md`/`THINKING.md` pair already
+existed as the running work-log (continuing the existing convention rather
+than creating a new one), and is delivering this fix as a git patch file
+(`0001-fix-switch-activeColor-windows-build.patch`) plus the full modified
+repo as a zip, both placed in the chat's Files panel for download.
+
+**Files touched:** `lib/src/ui/dashboard_screen.dart`, `PROGRESS.md`,
+`THINKING.md`.
+
+**Status: fix complete, committed locally, not pushed** (no push credentials
+for `johnchk250/Conduit` in this sandbox — same limitation as every prior
+session). Delivered as a patch file to apply via `git am` on your machine,
+plus a full repo zip as a fallback — see delivery note in chat.

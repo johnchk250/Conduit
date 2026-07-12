@@ -373,3 +373,52 @@ replacement. Chose to move the signal to a `GlassChip("Required")` in the
 trailing slot instead of leaving it unsignaled — this is a visible behavior
 change on top of a visual one, which is why it's called out explicitly here
 and in `PROGRESS.md` rather than buried in a diff.
+
+---
+
+## 2026-07-12 (new session) — Why `activeThumbColor` broke the build, and why `activeColor` is the right fix (not a workaround)
+
+**Starting point:** the previous same-day session's `PROGRESS.md` entry
+already contains a specific, checkable factual claim: "`activeColor` was
+deprecated ... after Flutter 3.31." A user-reported build error directly
+contradicts the parameter existing at all in their toolchain. Rather than
+assume the claim was simply wrong, re-verified it properly before touching
+code, since "the prior session's stated reasoning turned out incomplete" and
+"the prior session's reasoning was entirely wrong" call for different fixes.
+
+**Checked, not assumed:** searched current Flutter API docs and the actual
+merged PR (flutter/flutter#166382, "feat(Switch): Add activeThumbColor and
+deprecate activeColor"). Two things were both true at once, which is why the
+prior session's claim was half-right: (1) `activeColor` genuinely is
+deprecated in current Flutter, in favor of `activeThumbColor` —
+`activeThumbColor` is a real, correctly-spelled parameter, not a
+hallucination; (2) but it shipped in the **3.35.0** stable release
+specifically, not "after 3.31" as a general cutoff — 3.31 was likely
+conflated from the deprecation *notice text* itself
+(`'This feature was deprecated after v3.31.0-2.0.pre.'`), which refers to
+when the *pre-release* deprecation annotation landed on `activeColor`, not
+when `activeThumbColor` became available on a *stable* channel a developer
+would actually be running. That's a subtle but real distinction: pre-release
+branch history isn't the same as "what stable Flutter has today."
+
+**Confirmed the version mismatch, not just asserted it:** this repo's
+`pubspec.yaml` environment constraint (`sdk: ^3.6.0`, a *Dart* SDK version)
+pairs with a Flutter release meaningfully older than 3.35 — consistent with
+the exact `error GC6690633: No named parameter with the name
+'activeThumbColor'` the user hit. Didn't have shell access to the user's
+actual installed `flutter --version` (no Flutter SDK in this sandbox, same
+standing constraint as every session), so this is inference from the pinned
+Dart constraint plus the literal compiler error, not a directly-observed
+Flutter version number — flagged as such rather than overstating certainty.
+
+**Why `activeColor` (not, say, pinning a newer Flutter, or keeping
+`activeThumbColor` behind a version check) is the right fix here:**
+`activeColor` is present and functional on every Flutter release, including
+whatever this project is actually pinned to, and including 3.35+ (where it
+just becomes a deprecation *warning*, which doesn't fail a build). A
+conditional/version-gated approach would add real complexity (Dart doesn't
+have a clean compile-time "if SDK >= X use Y" for widget parameters) to fix
+a cosmetic detail — the color of an already-teal-accented switch — that
+doesn't need it. Simplicity matched to the actual stakes: this is styling,
+not sync-critical logic, so the lowest-risk fix that unblocks the build is
+correct, not a compromise.

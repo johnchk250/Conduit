@@ -847,7 +847,7 @@ class _SettingsHubPage extends StatelessWidget {
               trailing: Switch(
                 value: state.showPersistentNotification,
                 onChanged: (v) => state.setShowPersistentNotification(v),
-                activeThumbColor: c.teal,
+                activeColor: c.teal,
               ),
             ),
             const SizedBox(height: 10),
@@ -864,7 +864,7 @@ class _SettingsHubPage extends StatelessWidget {
             trailing: Switch(
               value: state.batterySaverMode,
               onChanged: (v) => state.setBatterySaverMode(v),
-              activeThumbColor: c.teal,
+              activeColor: c.teal,
             ),
           ),
           const SizedBox(height: 90),
