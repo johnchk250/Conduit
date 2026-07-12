@@ -1384,3 +1384,173 @@ the `GlassColors.light` code comments). Committed locally (see delivery
 note for the exact commits and how to bring them into your local clone/push
 to GitHub yourself — no push credentials for `johnchk250/Conduit` in this
 sandbox, same limitation as every prior session).
+
+---
+
+## 2026-07-12 (new session) — "Exact-match" pass: `glass.dart` + Overview against a real reference file
+
+**Starting point:** the person said the current UI (v6, previous session)
+still didn't look right, and this time supplied a real reference —
+`conduit-glass-redesign.html` (a static, literal mockup with real CSS
+custom properties, not a description) plus a matching screenshot. Different
+mode from every prior session in this log: those were all working from a
+verbal description or a remembered screenshot; this one has an actual
+source-of-truth file to translate token-for-token. Read the full git log
+(v1 through v6) and this file's own history before touching anything, to
+understand what "didn't look right" had already been tried.
+
+**What changed, file by file:**
+
+- **`lib/src/ui/glass.dart` — full rewrite of the token/component layer.**
+  Every `GlassColors` field now traces to a specific CSS custom property or
+  rule in the reference (see the file's own doc comments for the mapping —
+  every non-obvious choice, e.g. why `amber`/`teal` exist when the
+  reference doesn't define them, is explained inline rather than left
+  implicit). Structural change from v5/v6: the reference's `.glass` class
+  is a **flat** translucent fill + flat 1px border (`rgba(255,255,255,
+  .055)` / `rgba(255,255,255,.12)`), not the gradient-fill/gradient-border
+  recipe v5/v6 both used — so `_clearGlassSurface` was replaced with a new
+  `_glassSurface` that matches this literally, plus a real `BackdropFilter`
+  blur (see the flicker-risk discussion below), a hero-only diagonal
+  static light band (`_heroSweep`, matching `.hero::after` — confirmed by
+  reading the CSS closely that this is *not* animated, unlike what v5
+  assumed/added), and a `GlassBackground` that composites three static
+  radial "glow" blobs (indigo/teal/sky, exact positions converted from the
+  CSS's `at X% Y%` values) over a 3-stop vertical gradient, replacing v6's
+  single flat color. Also corrected the nav bar/rail active-item styling:
+  v5/v6 both deliberately made the active tab *neutral* (a design choice
+  made without a real mockup to check against); the actual reference shows
+  the active dock item with a violet gradient glow, so that's what it does
+  now — this is a case where having a real reference caught a previous
+  session's reasonable-sounding guess being wrong.
+
+- **`lib/src/ui/dashboard_screen.dart` — `_OverviewPage` re-touch.** Dropped
+  the page's own `Scaffold`/`AppBar` (`title: Text('Overview')`) in favor
+  of the reference's actual structure: a plain `SafeArea` + `ListView`
+  whose first child is the new `GlassPageTitle` widget (Manrope 800/30px,
+  matching `h1.page-title`) — both the wide-desktop and mobile shells in
+  `DashboardScreen.build` already provide a `Scaffold` + `GlassBackground`
+  ancestor, so nothing was lost by removing the nested one. Folder-pair
+  rows now show a small status dot before their subtitle
+  (`GlassListTile.subtitleDotColor`/`subtitleLive`, matching the
+  reference's `.status-idle`/`.status-live`) — the reference only shows
+  two states (idle/live-green), so `Paused`→amber and `Error`→a new
+  `GlassColors.danger` (red-400 family) dot are this session's own
+  extensions for states the reference doesn't cover, not something copied
+  from it (called out as such in the code comment). Device rows now use
+  `subtitleMono: true` (JetBrains Mono, matching `.tile-sub.mono`) for the
+  device-ID/IP line. Fixed the "Paired" chip's accent from `c.blue` to
+  `c.violet` — the reference's one literal `.badge` example in the
+  screenshot is exactly a violet "Paired" pill, and the prior code had
+  guessed blue.
+  **Deliberately kept, not shown in the reference:** the "Quick actions /
+  Send files" row. The reference screenshot's content ends after "Devices
+  on this network" with visible empty scroll space before the dock, which
+  reads as the screenshot just not scrolling far enough to show it, not as
+  an instruction to remove an existing, reachable feature — removing it
+  would have been a functional regression nobody asked for, so it stays,
+  restyled to match everything else.
+
+- **`Roadmap.md`** — updated the Phase 7 shared-library description and the
+  `glass.dart`/`dashboard_screen.dart` checklist rows to describe this
+  pass instead of v6, matching this project's own convention of keeping
+  that checklist in sync with what actually landed each session. The other
+  9 screens' rows are untouched (still ⬜) — see "Not done this session"
+  below.
+
+- **`docs/2026-07-12-conduit-glass-redesign.html`** and
+  **`docs/2026-07-12-conduit-glass-redesign-screenshot.png`** (added) — the
+  person's reference file and screenshot, committed alongside the plan/
+  mockup docs from the v5 session, matching this project's existing `docs/`
+  convention for dated planning/reference material so a future session (or
+  a future me) can re-check against the actual source instead of relying
+  on this log's paraphrase of it.
+
+**The one real engineering judgment call this session made, not just a
+styling choice:** reintroducing `BackdropFilter`, which the immediately
+prior session removed app-wide after tracing a real Android flicker bug to
+it. That bug's mechanism (documented in this file's 2026-07-12 "Android
+flicker/perf fix" entry and `THINKING.md`'s matching entry) was
+specifically: `BackdropFilter` re-blurs whatever's beneath it on *every*
+paint, with no caching, so a backdrop that's continuously animating (the
+v5-era `Timer`-driven light sweep) forces every glass panel on screen to
+pay full blur cost forever, even at rest — and that showed up as visible
+flicker on Android. The new reference file has **no animation anywhere**
+(checked carefully — no `@keyframes`, no `animation:` rule in the whole
+stylesheet, including what looked like it might be a moving sweep on the
+hero card but is actually a static gradient). Since the specific mechanism
+behind the diagnosed bug isn't present in what's being matched here, blur
+was brought back — but this is a confident diagnosis of *mechanism*, not a
+benchmarked-and-confirmed fix, same caveat every performance-related entry
+in this log has carried: **there is still no Flutter/Android environment in
+this sandbox, so this has not been run on a real device.** Flagging this as
+the top thing to verify before merging. If it turns out to still be a
+problem, the fallback is narrow and documented directly in
+`glass.dart`'s class doc comment: drop the one `ImageFilter.blur` call in
+`_glassSurface`, nothing else in the file needs to change.
+
+**Also scoped out, and said so directly rather than silently skipping:**
+the reference screenshot's custom titlebar (traffic-light-style minimize/
+maximize/close icons). Checked first whether this Windows build already
+runs frameless (`grep -rn "titleBarStyle\|WindowOptions\|TitleBarStyle"`) —
+it doesn't; the app currently uses the native OS titlebar, and
+`window_manager` is a dependency but nothing puts the window into frameless
+mode. Building a literal custom titlebar means a window-lifecycle change
+(frameless mode + wiring real minimize/maximize/close through
+`window_manager`), not a content-styling one, and this repo's own history
+(tray init, wake-lock, disconnect-cycling) shows exactly this area has been
+fragile before. Also Android has no window controls at all, so a literal
+port would need to be conditional on `Platform.isWindows` regardless. Not
+attempted, since there's no way to compile/run and verify a change to
+window startup behavior in this sandbox — matched everything *below* the
+titlebar exactly instead, which is also where 100% of the actual visual
+complaint and every prior session's work was focused.
+
+**Verification performed** (same standing constraint as every session in
+this log — no Flutter/Dart SDK in this sandbox, `which flutter dart`
+confirmed empty):
+- A custom comment/string-aware balanced-delimiter Python scanner (same
+  category of tool prior sessions used, rewritten fresh this session) on
+  both touched Dart files — clean, both files, after every edit.
+- Full top-to-bottom re-read of `glass.dart` after the rewrite, specifically
+  checking every `GlassColors._(...)` call site (`dark`/`light`) supplies
+  exactly the constructor's field set — caught and fixed one real bug this
+  way (a leftover `subtitleDotGlow` constructor parameter with no matching
+  field, left behind by a mid-session rename to `subtitleLive`, which would
+  have been a compile error).
+- Grepped all of `lib/` (not just the touched files) for every consumer of
+  `GlassPanel`/`GlassListTile`/`GlassStatusBanner`/`GlassChip`/
+  `GlassButton`/`GlassNavBar`/`GlassNavRail`/`GlassColors` — confirmed only
+  `dashboard_screen.dart` uses any of them (the other 9 screens are still
+  100% standard Material, unaffected by this rewrite by construction, not
+  just by omission).
+- **Not verified:** an actual `flutter run`/`flutter analyze`, or a
+  rendered screenshot to compare against the reference — no such tooling in
+  this sandbox, same limitation as every prior session. **Please run
+  `flutter analyze` and `flutter run` on both Windows and Android before
+  merging** — in particular the `BackdropFilter` reintroduction (Android,
+  above) and light mode (still undesigned against any real reference, same
+  caveat as every prior session — the new reference is dark-mode-only).
+
+**Not done this session, and not claimed as done:** the other 9 screens
+(`send_flow_view.dart`, `send_panel.dart`, `version_history_screen.dart`,
+`activity_screen.dart`, `clipboard_screen.dart`, `remote_control_screen.dart`,
+`folder_pairs_screen.dart`, `pairing_screen.dart`, `send_widget_screen.dart`)
+are still untouched, standard Material. `Roadmap.md` says so plainly.
+
+**Files touched:** `lib/src/ui/glass.dart`, `lib/src/ui/dashboard_screen.dart`,
+`Roadmap.md`, `PROGRESS.md`, `THINKING.md`,
+`docs/2026-07-12-conduit-glass-redesign.html` (added),
+`docs/2026-07-12-conduit-glass-redesign-screenshot.png` (added).
+
+**Status: implementation complete for `glass.dart` + the Overview screen,
+verified by static analysis only (no SDK in this sandbox) — please
+`flutter analyze` + `flutter run` on Windows and Android to confirm before
+merging, with particular attention to the `BackdropFilter` reintroduction
+on Android and a visual side-by-side against
+`docs/2026-07-12-conduit-glass-redesign-screenshot.png`.** Committed
+locally in this sandbox's clone (see the delivery note provided directly
+to the person for exactly how to bring these commits into your own local
+clone and push to GitHub yourself — no push credentials for
+`johnchk250/Conduit` here, same limitation as every prior session in this
+log).

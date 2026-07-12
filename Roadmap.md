@@ -526,38 +526,39 @@ conversion ongoing.
 
 Distinct from Phase 5 (which was the original Material 3 polish pass, marked
 complete 2026-06-27): this phase re-skins the same screens in a translucent
-"liquid glass" style (flat backdrop, clearly-see-through panels,
-gradient-border cards — no `BackdropFilter`, no ambient motion, as of v6)
-via a new shared component library, rather than changing any behavior.
-Design intent, restraint notes, and the modal-surfaces-stay-Material rule
-all live as doc comments directly in `lib/src/ui/glass.dart` — read that
-file's header before touching it or any screen that uses it.
+"liquid glass" style via a new shared component library, rather than
+changing any behavior. Design intent, restraint notes, and the
+modal-surfaces-stay-Material rule all live as doc comments directly in
+`lib/src/ui/glass.dart` — read that file's header before touching it or any
+screen that uses it.
 
 **Shared library:** `lib/src/ui/glass.dart` — ✅ complete, now on its
-**clear-glass v6** revision (`GlassColors`, `GlassBackground`, `GlassPanel`,
-`GlassSectionLabel`, `GlassListTile`, `GlassStatusBanner`, `GlassChip`,
-`GlassButton`, `GlassNavBar`/`GlassNavRail`). v5's gradient-plus-light-sweep
-backdrop was reported back as still not matching expectation, against a
-reference screenshot: flat uniform background, no gradient, panels
-distinctly more see-through. v6 responds by making `GlassBackground` a
-single flat color with zero ambient motion, and removing `BackdropFilter`
-from every glass surface entirely — not toning it down, removing it — since
-blurring a uniform color is a no-op; this also fully retires the Android
-flicker-risk category the v5 "Timer + implicit-animation, not a
-free-running ticker" fix existed to manage, since nothing left re-blurs on
-every paint. Panel translucency now comes from a lower-alpha, cool-tinted
-fill (colors sampled from the reference image) composited directly, plus a
-crisper border for edge legibility now that there's no blur to separate a
-panel from the backdrop. v5's "color stays off the glass fill, lives only
-on content" rule carries over unchanged. See `PROGRESS.md`/`THINKING.md`
-2026-07-12 "v6" entries for the color-sampling method and its caveats.
+**"exact-match" revision** (`GlassColors`, `GlassBackground`, `GlassPanel`,
+`GlassSectionLabel`, `GlassPageTitle`, `GlassListTile`, `GlassStatusBanner`,
+`GlassChip`, `GlassButton`, `GlassNavBar`/`GlassNavRail`). Unlike v1-v6
+(verbal-description/vibe passes, see git history), this revision is a
+token-for-token translation of a real reference file the project owner
+supplied directly — `docs/2026-07-12-conduit-glass-redesign.html` + a
+matching screenshot — rather than another guess against a described intent.
+Every color/alpha/radius traces to a specific CSS rule (see per-field doc
+comments in `glass.dart`). Notably: `BackdropFilter` (blur) is back — v6
+removed it after tracing a real Android flicker bug to it sitting on top of
+a *continuously animating* backdrop; the new reference has no animation
+anywhere (checked — no `@keyframes` in the file), so the specific mechanism
+behind that bug isn't present here, but this hasn't been benchmarked
+on-device (no Flutter/Android environment in the session that made this
+change) — **please verify on a real Android device before relying on this
+holding up.** See `THINKING.md` 2026-07-12 "exact-match" entry for the full
+reasoning, including why the custom titlebar in the reference screenshot
+(traffic-light-style window controls) was deliberately left out of scope
+(a frameless-window change, not a content-styling one — see that entry).
 
 **Per-screen conversion checklist:**
 | File | Status |
 |---|---|
-| `glass.dart` — clear-glass v6 token/component revision (flat backdrop, no `BackdropFilter`, more-translucent panel fill) | ✅ done (2026-07-12) — see `PROGRESS.md`/`THINKING.md` 2026-07-12 "v6" entries. Do this before any further per-screen rows below. |
-| `dashboard_screen.dart` (shell: NavRail/NavBar, Overview, Settings hub) | ✅ still accurate against v6 — this screen only calls the shared widgets' public API (`GlassColors.of`, `GlassPanel`, `GlassListTile`, `GlassStatusBanner`, `GlassChip`, `GlassSectionLabel`, `GlassNavBar`/`GlassNavRail`) and none of the fields/params it references were touched by the v6 rewrite (verified by grep — see `PROGRESS.md`). No edit needed this session. |
-| `folder_pairs_screen.dart` | ⬜ not started — recommended next (see `THINKING.md` 2026-07-12), now against v5 tokens |
+| `glass.dart` — "exact-match" token/component revision (reintroduces `BackdropFilter`, matches `conduit-glass-redesign.html` token-for-token) | ✅ done (2026-07-12) — see `PROGRESS.md`/`THINKING.md` 2026-07-12 "exact-match" entries. Do this before any further per-screen rows below. |
+| `dashboard_screen.dart` — `_OverviewPage` re-touch (drops the per-page `Scaffold`/`AppBar` in favor of the reference's `h1.page-title`; folder-pair rows get a live/idle status dot; device rows get the mono ID/IP treatment; "Paired" chip corrected to violet per the reference's one badge example) | ✅ done (2026-07-12) — see `PROGRESS.md` 2026-07-12 "exact-match" entry. Rest of `dashboard_screen.dart` (NavRail/NavBar, Settings hub) only calls the shared widgets' public API, which is unchanged in shape — no further edit needed. |
+| `folder_pairs_screen.dart` | ⬜ not started — recommended next (same recommendation carried over from the v5/v6 entries), now against exact-match tokens |
 | `pairing_screen.dart` | ⬜ not started |
 | `remote_control_screen.dart` | ⬜ not started |
 | `send_flow_view.dart` | ⬜ not started |

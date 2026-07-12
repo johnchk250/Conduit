@@ -478,18 +478,21 @@ class _OverviewPage extends StatelessWidget {
         .length;
     final discovered = state.discoveredPeers;
 
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      appBar: AppBar(
-        title: const Text('Overview'),
-        backgroundColor: Colors.transparent,
-        foregroundColor: c.textPrimary,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-      ),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
+    // Reference has no separate app-bar row — the "Overview" heading is
+    // just the first thing in the scrollable content
+    // (`h1.page-title` inside `.content`), so this no longer wraps in its
+    // own `Scaffold`/`AppBar` (both the wide-desktop and mobile shells in
+    // `DashboardScreen.build` already provide one Scaffold + a
+    // `GlassBackground` ancestor for this page to sit inside).
+    return SafeArea(
+      child: ListView(
+        // Reference `.content{padding:26px 20px 100px}`. The extra bottom
+        // padding (vs. the CSS's 100px) gives room for the floating
+        // `GlassNavBar` on phones, same purpose the old trailing
+        // `SizedBox(height: 90)` served.
+        padding: const EdgeInsets.fromLTRB(20, 22, 20, 110),
         children: [
+          const GlassPageTitle('Overview'),
           GlassStatusBanner(
             title: state.isStarted ? 'Sync is running' : 'Starting up…',
             subtitle: state.isStarted
@@ -498,9 +501,8 @@ class _OverviewPage extends StatelessWidget {
             icon: state.isStarted ? Icons.check_circle : Icons.hourglass_top,
             accentColor: state.isStarted ? c.mint : c.amber,
           ),
-          const SizedBox(height: 22),
+          const SizedBox(height: 26),
           const GlassSectionLabel('Folder pairs'),
-          const SizedBox(height: 8),
           if (pairs.isEmpty)
             GlassListTile(
               leadingIcon: Icons.folder_off_outlined,
@@ -513,13 +515,37 @@ class _OverviewPage extends StatelessWidget {
           else
             ...pairs.map((p) {
               final st = state.stateFor(p.id);
+              final status = st?.status ?? 'Idle';
+              // Reference only shows `.status-idle`/`.status-live`
+              // (green); `Paused`/`Error` are this app's own states with
+              // no reference example, mapped to sensible dot colors from
+              // the same accent family rather than left unstyled.
+              final Color dotColor;
+              final bool live;
+              if (status == 'Error') {
+                dotColor = c.danger;
+                live = false;
+              } else if (status == 'Paused') {
+                dotColor = c.amber;
+                live = false;
+              } else if (status.startsWith('Idle')) {
+                dotColor = c.textTertiary;
+                live = false;
+              } else {
+                // Scanning / Requesting peer index / actively
+                // transferring — matches reference `.status-live`.
+                dotColor = c.mint;
+                live = true;
+              }
               return Padding(
                 padding: const EdgeInsets.only(bottom: 10),
                 child: GlassListTile(
                   leadingIcon: Icons.folder,
                   accentColor: c.violet,
                   title: p.name,
-                  subtitle: '${p.direction.label} · ${st?.status ?? "Idle"}',
+                  subtitle: '${p.direction.label} · $status',
+                  subtitleDotColor: dotColor,
+                  subtitleLive: live,
                   trailing: st?.progress != null
                       ? SizedBox(
                           width: 40,
@@ -534,9 +560,8 @@ class _OverviewPage extends StatelessWidget {
                 ),
               );
             }),
-          const SizedBox(height: 22),
+          const SizedBox(height: 26),
           const GlassSectionLabel('Devices on this network'),
-          const SizedBox(height: 8),
           if (discovered.isEmpty)
             GlassListTile(
               leadingIcon: Icons.wifi_find_outlined,
@@ -553,7 +578,10 @@ class _OverviewPage extends StatelessWidget {
                         : Icons.computer,
                     accentColor: c.blue,
                     title: d.name,
+                    // Reference `.tile-sub.mono` — JetBrains Mono, no
+                    // status dot (device rows aren't a live/idle state).
                     subtitle: '${d.deviceId} · ${d.address.address}',
+                    subtitleMono: true,
                     trailing: state.isPeerConnected(d.deviceId)
                         ? GlassChip(
                             label: 'Connected',
@@ -564,9 +592,11 @@ class _OverviewPage extends StatelessWidget {
                         : state.pairedPeers
                                 .any((p) => p.deviceId == d.deviceId)
                             ? GlassChip(
+                                // Reference's one `.badge` example is
+                                // exactly this: "Paired", accent-violet.
                                 label: 'Paired',
                                 icon: Icons.handshake_outlined,
-                                accentColor: c.blue,
+                                accentColor: c.violet,
                               )
                             : GlassChip(
                                 label: 'New',
@@ -575,9 +605,8 @@ class _OverviewPage extends StatelessWidget {
                     onTap: () => _goToDevices(ctx),
                   ),
                 )),
-          const SizedBox(height: 22),
+          const SizedBox(height: 26),
           const GlassSectionLabel('Quick actions'),
-          const SizedBox(height: 8),
           GlassListTile(
             leadingIcon: Icons.send_outlined,
             accentColor: c.amber,
@@ -590,10 +619,6 @@ class _OverviewPage extends StatelessWidget {
               );
             },
           ),
-          // Bottom breathing room so the last card never sits under the
-          // floating GlassNavBar on phones (harmless extra scroll on the
-          // wide/desktop NavigationRail layout, which has no floating bar).
-          const SizedBox(height: 90),
         ],
       ),
     );

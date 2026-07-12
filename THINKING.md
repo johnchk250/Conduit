@@ -657,3 +657,131 @@ would need a second touch-up) is exactly what the plan's own suggested
 order says to do first. The other 9 screens are unchanged, `Roadmap.md`
 still shows them as ⬜, and `PROGRESS.md` says so plainly rather than
 implying more got done than did.
+
+---
+
+## 2026-07-12 (new session) — Working from a real reference file instead of a description, and why that changes the job
+
+Every prior entry in this file about `glass.dart` was solving a version of
+the same underlying problem: translating a *verbal* description or a
+remembered reference into CSS-like Flutter decorations, then finding out
+after the fact it didn't match what the person had in mind. This session
+started differently — an actual HTML file with literal `:root` custom
+properties and literal `rgba()` values, plus a screenshot rendering of it.
+That changes the job from "design something that fits the description" to
+"read the file correctly and translate it faithfully," which is a much
+more mechanical, much less guess-prone task — but it's still easy to get
+wrong in a specific way: over-trusting a plausible-looking interpretation
+of the CSS instead of actually reading it. Two places this mattered
+concretely:
+
+**The hero's `::after` "light sweep."** The v5 session (see this file's
+matching entry two sessions back) built an *animated* diagonal sweep for
+this, reasoning from a verbal design brief that called it a "signature
+specular sweep." Reading the actual CSS this time: `.hero::after` has no
+`animation` property at all — it's a static gradient, positioned once and
+left alone. The word "sweep" in a design brief doesn't necessarily mean
+motion; it can just describe the visual shape of a diagonal highlight
+band. This is exactly the kind of thing that's invisible if you're working
+from a description (both interpretations sound equally plausible) but
+becomes obvious the moment there's a real file to check against. Getting
+this right mattered for more than aesthetic accuracy — it's the load-
+bearing fact behind this session's biggest engineering decision (next
+section).
+
+**The active nav-bar item.** v5/v6 made a deliberate, reasoned choice to
+keep the active tab's highlight *neutral* rather than accent-tinted,
+because nothing in either of those sessions' source material specified nav
+treatment one way or the other, and a neutral highlight is a safe default
+that works in both light and dark mode. That reasoning was sound *given
+what those sessions had to work with*. The actual reference shows the
+active dock item with a clear violet gradient glow — not neutral at all.
+Worth noting explicitly: this isn't "v5/v6 made a mistake," it's "v5/v6
+made the best call available without a real reference for that specific
+element, and now there is one." Fixed it to match, and said so in the code
+comment rather than silently changing it without explaining why this
+session's dock treatment disagrees with the immediately prior one.
+
+## The `BackdropFilter` decision — the part of this session that was actually a judgment call, not just reading a file correctly
+
+Everything above is "translate the file accurately." This one is
+different in kind: it's a decision made *despite* not being able to verify
+it, because the alternative (leaving `BackdropFilter` out, per v6) would
+mean not actually matching what was asked for.
+
+The reasoning chain, laid out explicitly because it's the part most worth
+someone double-checking:
+1. The reference uses real `backdrop-filter: blur(24px) saturate(160%)`.
+   Flutter's nearest equivalent is `BackdropFilter` + `ImageFilter.blur`.
+   Without it, panels read as "tinted flat rectangles," not "frosted
+   glass" — a real, visible gap from what was asked for, not a nitpick.
+2. `BackdropFilter` was removed entirely in v6, for a documented, credible
+   reason (this file's 2026-07-12 "Why BackdropFilter + a moving
+   background is the actual flicker cause" entry): it re-samples/re-blurs
+   whatever's beneath it on every single paint, with no caching, so a
+   backdrop that never stops invalidating forces every glass panel on
+   screen to never stop paying full blur cost — and that was traced to a
+   real, reported Android flicker/slowdown symptom.
+3. The *specific* thing that made the backdrop "never stop invalidating"
+   was an `AnimationController.repeat()`-driven light sweep — a 28-second
+   looping animation that ticks at full display refresh rate forever,
+   regardless of how slow it looks. That's what was actually driving
+   continuous repaint, not the mere presence of a gradient or of
+   `BackdropFilter` itself.
+4. This session's reference has no animation anywhere (see above) — the
+   backdrop this time really is static once painted. That's a materially
+   different situation from the one the bug was diagnosed in, not just a
+   smaller version of the same risk.
+
+So the decision was: bring `BackdropFilter` back, because the specific
+mechanism behind the diagnosed bug (continuous animation forcing continuous
+re-blur) genuinely isn't present in what's being built this time. But I
+want to be honest about the shape of this reasoning rather than overstate
+it: it's "the identified cause isn't present," not "I confirmed the effect
+doesn't happen." There's no Flutter SDK, no Android emulator, and no
+device in this sandbox — nothing here can actually run the app and watch a
+frame timeline. A static backdrop removes the *specific* mechanism that was
+diagnosed, but Flutter's own documentation is broader than that one
+mechanism: it generally recommends caution with multiple/stacked
+`BackdropFilter`s regardless of what's beneath them, because each one is
+real per-frame GPU work independent of invalidation. A screen with 5-6
+glass panels (the Overview screen, once folder pairs and discovered
+devices are populated) still pays that cost on every frame the *page
+itself* rebuilds for an unrelated reason (e.g. a sync-progress update from
+`AppState`), even with a perfectly static backdrop underneath. That's a
+smaller, more diffuse risk than the one that was diagnosed and fixed
+before, but it's not literally zero, and I don't have the tooling here to
+put a number on it.
+
+This is why `PROGRESS.md` and the delivery note both call this out as the
+top thing to verify on-device before merging, and why `glass.dart`'s own
+class doc comment spells out the exact one-line fallback (drop the
+`ImageFilter.blur` call) rather than leaving a future session to
+rediscover the same investigation from scratch if it turns out to matter.
+Writing down *both* the reasoning for going ahead *and* the honest limit of
+that reasoning felt more useful here than either (a) silently reintroducing
+blur with no caveat, which would misrepresent this as a confirmed fix, or
+(b) refusing to reintroduce it at all out of excess caution, which would
+mean not actually doing what was asked (match a reference that uses real
+frosted glass) over a risk that the reference's own lack of animation
+substantially — even if not provably completely — mitigates.
+
+## Scoping the titlebar out, and why that's not the same kind of caution as the BackdropFilter call
+
+Worth distinguishing this from the paragraph above, because both are
+"didn't do something the reference technically shows," but for different
+reasons. The `BackdropFilter` decision was "do it, with a flagged,
+specific residual risk." The titlebar decision was closer to "don't do it
+at all this session" — not because it's risky in the same
+performance-uncertainty sense, but because it's a different *category* of
+change: making the Windows build frameless and wiring real window controls
+through `window_manager` is a startup/window-lifecycle change, not a
+paint-time styling one, and this sandbox genuinely cannot compile or run
+the app to check that a window still opens correctly afterward. The
+`BackdropFilter` call at least has a coherent mechanism-level argument for
+why it should be fine; a frameless-window change has no equivalent
+argument available without actually running it — it either works or the
+window doesn't open, and there's no partial-credit static-analysis
+argument for that the way there is for a paint-cost question. Said this
+directly in chat rather than either silently attempting it or silently
+dropping it without explanation.
