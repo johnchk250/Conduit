@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Conduit — Overview redesign v4 (clear glass)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 48px;
+    background: #16161a;
+    font-family: 'Inter', sans-serif;
+    display: flex;
+    justify-content: center;
+  }
+  .note {
+    max-width: 390px;
+    color: #999;
+    font-size: 12.5px;
+    line-height: 1.6;
+    margin-top: 14px;
+    padding: 0 4px;
+  }
+  .col { display: flex; flex-direction: column; align-items: center; }
+
+  .window {
+    width: 390px;
+    border-radius: 22px;
+    overflow: hidden;
+    box-shadow: 0 40px 90px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.06);
+  }
+  .titlebar {
+    height: 40px;
+    background: #04070a;
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    gap: 8px;
+    font-size: 13px;
+    color: #ddd;
+    font-weight: 600;
+    position: relative;
+    z-index: 3;
+  }
+  .titlebar .dot { width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,0.5); }
+
+  /* ===== LIGHTER BACKDROP + LIGHT SWEEP =====
+     v5: v4's near-black backdrop (#0a0d11) had almost no tonal variation,
+     so a clear glass panel had nothing to visibly separate it from its
+     surroundings — the blur had nothing to "reveal." Moved to a mid-tone
+     slate-blue field (dusk-over-water, not midnight) with real luminance
+     range top-to-bottom, so frosted panels now sit visibly lighter/softer
+     than the sharper gradient behind them. Color discipline from v4 is
+     unchanged — still one restrained hue family, still no rainbow wash,
+     content (icons/rings/pill) still carries all the accent color. */
+  .screen {
+    position: relative;
+    height: 780px;
+    overflow: hidden;
+    background: linear-gradient(165deg, #35495c 0%, #26374a 38%, #1a2735 68%, #121b25 100%);
+  }
+  .sweep {
+    position: absolute;
+    inset: -60%;
+    background: linear-gradient(112deg,
+      transparent 36%,
+      rgba(255,255,255,0.10) 47%,
+      rgba(220,235,245,0.16) 50%,
+      rgba(255,255,255,0.10) 53%,
+      transparent 64%);
+    animation: sweep 13s ease-in-out infinite;
+  }
+  @keyframes sweep {
+    0%, 100% { transform: translate(-8%, -4%); }
+    50%      { transform: translate(8%, 4%); }
+  }
+  .screen::after {
+    content: '';
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse at 50% 25%, transparent 45%, rgba(6,10,15,0.42) 100%);
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .content {
+    position: relative;
+    z-index: 2;
+    padding: 18px 18px 100px;
+    height: 100%;
+    overflow-y: auto;
+  }
+  .header {
+    color: #fff;
+    font-size: 26px;
+    font-weight: 700;
+    margin: 6px 0 18px 2px;
+    letter-spacing: -0.3px;
+    text-shadow: 0 2px 10px rgba(0,0,0,0.35);
+  }
+
+  /* ===== CLEAR GLASS PANEL =====
+     Barely-there fill, crisp bright border, one thin specular highlight —
+     the glass itself carries no color. */
+  .glass {
+    position: relative;
+    border-radius: 20px;
+    backdrop-filter: blur(18px) saturate(1.15);
+    -webkit-backdrop-filter: blur(18px) saturate(1.15);
+    background: linear-gradient(160deg, rgba(255,255,255,0.09), rgba(255,255,255,0.02));
+    border: 1px solid rgba(255,255,255,0.24);
+    box-shadow: 0 14px 30px -12px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.28);
+    overflow: hidden;
+  }
+  .glass::before {
+    /* thin specular streak, top edge only — real glass catches light on
+       one edge, not as a full-surface tint */
+    content: '';
+    position: absolute;
+    top: 0; left: 8%; right: 8%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.7), transparent);
+  }
+
+  /* ===== HERO CARD — clear glass, colored ring + icon only ===== */
+  .hero {
+    padding: 20px;
+    margin-bottom: 26px;
+    border: 1px solid rgba(110,231,183,0.4);
+    box-shadow: 0 14px 30px -12px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.28), 0 0 0 1px rgba(110,231,183,0.08);
+  }
+  .hero-row { display: flex; align-items: center; gap: 14px; position: relative; z-index: 1; }
+  .hero-icon {
+    width: 44px; height: 44px; border-radius: 13px;
+    background: rgba(110,231,183,0.10);
+    border: 1px solid rgba(110,231,183,0.5);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .hero-icon svg { width: 21px; height: 21px; }
+  .hero-title { color: #fff; font-size: 17.5px; font-weight: 700; letter-spacing: -0.2px; }
+  .hero-sub { color: rgba(255,255,255,0.6); font-size: 13px; font-weight: 500; margin-top: 3px; }
+
+  /* ===== SECTIONS ===== */
+  .section-label {
+    color: #fff;
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0 0 10px 2px;
+    letter-spacing: -0.1px;
+    text-shadow: 0 1px 8px rgba(0,0,0,0.3);
+  }
+  .section { margin-bottom: 26px; }
+
+  /* ===== ROW CARD ===== */
+  .card {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    padding: 13px 15px;
+    margin-bottom: 10px;
+  }
+  .card > * { position: relative; z-index: 1; }
+  .icon-chip {
+    width: 40px; height: 40px; border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--ic, rgba(255,255,255,0.3));
+  }
+  .icon-chip svg { width: 18px; height: 18px; }
+  .ic-violet { --ic: rgba(167,139,250,0.55); }
+  .ic-blue   { --ic: rgba(96,165,250,0.55); }
+  .ic-amber  { --ic: rgba(252,191,73,0.55); }
+
+  .card-title { color: #fff; font-size: 14.5px; font-weight: 600; text-shadow: 0 1px 5px rgba(0,0,0,0.3); }
+  .card-sub { color: rgba(255,255,255,0.62); font-size: 12px; margin-top: 2px; font-weight: 500; text-shadow: 0 1px 5px rgba(0,0,0,0.25); }
+  .card-body { flex: 1; min-width: 0; }
+  .chevron { color: rgba(255,255,255,0.35); flex-shrink: 0; }
+
+  .pill {
+    display: flex; align-items: center; gap: 5px;
+    padding: 6px 12px; border-radius: 20px;
+    background: rgba(110,231,183,0.10);
+    border: 1px solid rgba(110,231,183,0.55);
+    color: #a8f0cf; font-size: 11.5px; font-weight: 700;
+    flex-shrink: 0;
+  }
+  .pill svg { width: 13px; height: 13px; }
+
+  /* ===== QUICK ACTIONS — clear glass circles, colored icon only ===== */
+  .actions-row { display: flex; gap: 12px; }
+  .action { display: flex; flex-direction: column; align-items: center; gap: 8px; flex: 1; }
+  .action-circle {
+    width: 54px; height: 54px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid var(--ac, rgba(255,255,255,0.32));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.22);
+  }
+  .action-circle svg { width: 20px; height: 20px; }
+  .action-label { color: rgba(255,255,255,0.7); font-size: 11.5px; font-weight: 600; text-shadow: 0 1px 5px rgba(0,0,0,0.3); }
+
+  /* ===== NAV BAR ===== */
+  .navbar {
+    position: absolute;
+    left: 12px; right: 12px; bottom: 10px;
+    height: 62px;
+    border-radius: 22px;
+    backdrop-filter: blur(22px) saturate(1.2);
+    -webkit-backdrop-filter: blur(22px) saturate(1.2);
+    background: linear-gradient(160deg, rgba(255,255,255,0.09), rgba(255,255,255,0.02));
+    border: 1px solid rgba(255,255,255,0.22);
+    display: flex;
+    align-items: center;
+    padding: 0 6px;
+    z-index: 3;
+    box-shadow: 0 16px 34px -8px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.26);
+  }
+  .navitem { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 9px 0; border-radius: 14px; }
+  .navitem.active { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.22); }
+  .navitem svg { width: 19px; height: 19px; color: rgba(255,255,255,0.4); }
+  .navitem.active svg { color: #fff; }
+  .navitem span { font-size: 9px; font-weight: 600; color: rgba(255,255,255,0.4); }
+  .navitem.active span { color: #fff; }
+</style>
+</head>
+<body>
+
+<div class="col">
+  <div class="window">
+    <div class="titlebar"><span class="dot"></span>Conduit</div>
+    <div class="screen">
+      <div class="sweep"></div>
+
+      <div class="content">
+        <div class="header">Overview</div>
+
+        <div class="glass hero">
+          <div class="hero-row">
+            <div class="hero-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#6ee7b7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+            </div>
+            <div>
+              <div class="hero-title">Sync is running</div>
+              <div class="hero-sub">Connected to 1 of 1 paired device(s)</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Folder pairs</div>
+          <div class="glass card">
+            <div class="icon-chip ic-violet">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+            </div>
+            <div class="card-body">
+              <div class="card-title">Aegis Sync</div>
+              <div class="card-sub">Two-way · Idle</div>
+            </div>
+            <svg class="chevron" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>
+          </div>
+          <div class="glass card">
+            <div class="icon-chip ic-blue">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+            </div>
+            <div class="card-body">
+              <div class="card-title">Expense Sync</div>
+              <div class="card-sub">Two-way · Idle</div>
+            </div>
+            <svg class="chevron" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Devices on this network</div>
+          <div class="glass card">
+            <div class="icon-chip ic-amber">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fcbf49" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg>
+            </div>
+            <div class="card-body">
+              <div class="card-title">Android Phone</div>
+              <div class="card-sub">3F02-8EB1 · 10.24.20.37</div>
+            </div>
+            <div class="pill">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#a8f0cf" stroke-width="2.6" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>
+              Connected
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-label">Quick actions</div>
+          <div class="actions-row">
+            <div class="action">
+              <div class="action-circle" style="--ac: rgba(252,191,73,0.5)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="#fcbf49" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+              </div>
+              <div class="action-label">Send files</div>
+            </div>
+            <div class="action">
+              <div class="action-circle" style="--ac: rgba(96,165,250,0.5)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2"/></svg>
+              </div>
+              <div class="action-label">Clipboard</div>
+            </div>
+            <div class="action">
+              <div class="action-circle" style="--ac: rgba(167,139,250,0.5)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M22 8.5l-6 3.5 6 3.5v-7z"/></svg>
+              </div>
+              <div class="action-label">Remote</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="navbar">
+        <div class="navitem active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>Home</span></div>
+        <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg><span>Folders</span></div>
+        <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 6h6"/></svg><span>Devices</span></div>
+        <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2"/></svg><span>Clipboard</span></div>
+        <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M22 8.5l-6 3.5 6 3.5v-7z"/></svg><span>Remote</span></div>
+        <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.6 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.6 1z"/></svg><span>Settings</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="note">Color now lives only in icons, the status ring, and the "Connected" pill — the glass itself is clear (crisp border + one thin specular line + blur), and the background is a quiet neutral field with a single soft light sweep drifting across it, like light glinting on water rather than colored water. Open in a browser to see the sweep move.</div>
+</div>
+
+</body>
+</html>

@@ -5,24 +5,39 @@ import 'package:flutter/material.dart';
 
 /// Liquid-glass design tokens + shared widgets used across every screen.
 ///
-/// Design intent (revised 2026-07-12, see PROGRESS.md "vibrancy + Android
-/// perf pass"): category colors (Power=amber, Media=teal, Volume=blue,
-/// PC-settings/brand=violet, success=mint) now tint each [GlassPanel]'s
-/// fill directly — not just its leading icon chip — so distinct controls
-/// read as distinct colored glass modules (closer to iOS Control Center)
-/// instead of uniform dark cards. Tint alpha is kept low (0.20/0.07) so
-/// panels stay translucent glass rather than solid color; that low-alpha
-/// ceiling, not the absence of color, is what keeps this from repeating
-/// the earlier "flashy" pass.
+/// Design intent (revised 2026-07-12, "clear-glass v5" pass — see
+/// `docs/2026-07-12-clear-glass-v5-plan.md` for the full plan this file was
+/// rewritten against, and `overview_redesign_preview_v5.html` for the source
+/// mockup it was reverse-engineered from): this is the THIRD visual
+/// direction this file has gone through in one day, and it deliberately
+/// walks back the second one.
 ///
-/// [GlassBackground]'s ambient drift no longer runs a continuous 60fps
-/// [Ticker] — every [BackdropFilter] on screen re-blurs whatever's beneath
-/// it on every paint, so a background that never stops moving forces all
-/// of them to redo that work forever, even when idle. It now drifts via a
-/// throttled [Timer] + [AnimatedAlign], animating only in short bursts and
-/// sitting fully static between them — see [_GlassBackgroundState] for the
-/// full reasoning. This was the primary fix for reported Android
-/// flicker/slowdown.
+///  1. Original glass pass — flat, low-contrast panels, color only on the
+///     small leading-icon chip. Read as dull/monochrome.
+///  2. "Vibrancy" pass — fixed that by tinting each [GlassPanel]'s fill and
+///     border with its accent color, so panels read as distinctly-colored
+///     frosted modules (iOS Control Center style). Reported back as "not
+///     quite what I had in mind, looks ugly."
+///  3. **Clear-glass v5 (this revision)** — color moves OUT of the glass
+///     fill entirely. The glass itself (panel fill, panel border, nav
+///     bar/rail) is always a neutral, barely-there frost — one restrained
+///     hue family, never tinted per-accent. Color instead lives only in:
+///     icon-chip borders/strokes, the hero status ring, and filled pills
+///     (`GlassChip`). The backdrop swaps three drifting colored blobs for
+///     one achromatic diagonal light sweep over a lighter, real-luminance-
+///     range gradient — "light glinting on water, not colored water."
+///
+/// [GlassBackground]'s ambient motion still does **not** run a continuous
+/// 60fps [Ticker] — every [BackdropFilter] on screen re-samples and re-blurs
+/// whatever's beneath it on every paint, so anything that never stops moving
+/// forces all of them to redo that work forever, even at rest. This was the
+/// root cause of a reported Android flicker/slowdown (see `PROGRESS.md`,
+/// 2026-07-12) and the fix — a throttled [Timer] driving an *implicit*
+/// animation, so motion only costs anything during short eased bursts and
+/// sits fully idle the rest of the time — carries over unchanged to the v5
+/// sweep, which is exactly as prone to the same mistake as the blobs were if
+/// it were ported as a literal translation of the mockup's CSS
+/// `animation: sweep 13s ease-in-out infinite`. See [_GlassBackgroundState].
 ///
 /// Modal surfaces (AlertDialog, SnackBar, BottomSheet) are deliberately
 /// LEFT as standard Material — glass is for the persistent app chrome and
@@ -36,92 +51,245 @@ class GlassColors {
     required this.teal,
     required this.blue,
     required this.mint,
-    required this.violetGlow,
-    required this.amberGlow,
-    required this.tealGlow,
-    required this.blueGlow,
-    required this.mintGlow,
     required this.textPrimary,
     required this.textSecondary,
     required this.textTertiary,
     required this.bgTop,
     required this.bgMid,
+    required this.bgMid2,
     required this.bgBottom,
     required this.panelFillA,
     required this.panelFillB,
     required this.borderBright,
     required this.borderDim,
+    required this.vignetteEdge,
+    required this.specularLine,
+    required this.sweepCore,
+    required this.sweepEdge,
+    required this.ringBorderAlpha,
+    required this.ringGlowAlpha,
+    required this.navActiveFill,
+    required this.navActiveBorder,
   });
 
+  // Content accents — still used, but now ONLY for icon-chip borders/icon
+  // strokes, the hero ring, filled pills, and GlassButton. Never for a
+  // panel's fill or base border (that's the whole point of clear glass).
   final Color violet, amber, teal, blue, mint;
-  final Color violetGlow, amberGlow, tealGlow, blueGlow, mintGlow;
+
   final Color textPrimary, textSecondary, textTertiary;
-  final Color bgTop, bgMid, bgBottom;
+
+  // Backdrop gradient — 4 stops now (was 3). A near-black backdrop has
+  // almost no tonal variation for a blurred panel to visibly separate from,
+  // so v5 moves to a mid-tone slate-blue field with real luminance range
+  // top-to-bottom (see plan §1, "Backdrop gradient" row).
+  final Color bgTop, bgMid, bgMid2, bgBottom;
+
+  // Panel fill/border — always neutral now, never accent-tinted.
   final Color panelFillA, panelFillB;
   final Color borderBright, borderDim;
+
+  // New in v5:
+  final Color vignetteEdge; // radial overlay darkening the backdrop's edges
+  final Color specularLine; // the discrete 1px top-edge highlight on glass
+  final Color sweepCore; // center of the diagonal light-sweep band
+  final Color sweepEdge; // shoulders of the light-sweep band
+
+  // Hero/status-banner "ring" alphas — the one place v5 still puts color
+  // directly on a panel, as a border + glow ring rather than a fill tint.
+  // Kept as tunable tokens (not literals in GlassPanel) so light mode can
+  // use a toned-down scale without touching widget code — see plan §7.
+  final double ringBorderAlpha;
+  final double ringGlowAlpha;
+
+  // Nav bar/rail active-item highlight. Kept as tokens (not hardcoded
+  // white-alpha literals in GlassNavBar/GlassNavRail) because a literal
+  // white wash reads fine on dark glass but is nearly invisible on light
+  // glass — light mode needs a darkening highlight instead of a
+  // brightening one. See plan §7 (nav treatment isn't covered by the
+  // dark-only mockup, so this split is a designed, not copied, choice).
+  final Color navActiveFill;
+  final Color navActiveBorder;
 
   static GlassColors of(BuildContext context) =>
       Theme.of(context).brightness == Brightness.dark ? dark : light;
 
-  /// Dark-mode tokens — the primary, fully-realized direction (matches the
-  /// reviewed mockup exactly: same hexes for the five accents).
+  /// Dark-mode tokens — matches `overview_redesign_preview_v5.html` exactly
+  /// for every value the mockup specifies (see plan §1/§2/Appendix).
   static final GlassColors dark = GlassColors._(
     violet: const Color(0xFFAFA4F2),
     amber: const Color(0xFFF0B47A),
     teal: const Color(0xFF6FE0D2),
     blue: const Color(0xFF8FB0EE),
     mint: const Color(0xFF7BDDA0),
-    violetGlow: const Color(0xFF8B7CF6).withValues(alpha: 0.11),
-    amberGlow: const Color(0xFFFFA24D).withValues(alpha: 0.10),
-    tealGlow: const Color(0xFF2DD4BF).withValues(alpha: 0.10),
-    blueGlow: const Color(0xFF5B8DEF).withValues(alpha: 0.10),
-    mintGlow: const Color(0xFF4ADE80).withValues(alpha: 0.12),
     textPrimary: const Color(0xFFF8F9FC),
     textSecondary: const Color(0xFFB4B9CE),
     textTertiary: const Color(0xFF7F86A0),
-    bgTop: const Color(0xFF0B0A14),
-    bgMid: const Color(0xFF0E0D1A),
-    bgBottom: const Color(0xFF0A0911),
-    panelFillA: Colors.white.withValues(alpha: 0.08),
+    bgTop: const Color(0xFF35495C),
+    bgMid: const Color(0xFF26374A),
+    bgMid2: const Color(0xFF1A2735),
+    bgBottom: const Color(0xFF121B25),
+    panelFillA: Colors.white.withValues(alpha: 0.09),
     panelFillB: Colors.white.withValues(alpha: 0.02),
-    borderBright: Colors.white.withValues(alpha: 0.20),
+    borderBright: Colors.white.withValues(alpha: 0.24),
     borderDim: Colors.white.withValues(alpha: 0.04),
+    vignetteEdge: const Color(0xFF060A0F).withValues(alpha: 0.42),
+    specularLine: Colors.white.withValues(alpha: 0.7),
+    sweepCore: const Color(0xFFDCEBF5).withValues(alpha: 0.16),
+    sweepEdge: Colors.white.withValues(alpha: 0.10),
+    ringBorderAlpha: 0.4,
+    ringGlowAlpha: 0.08,
+    navActiveFill: Colors.white.withValues(alpha: 0.08),
+    navActiveBorder: Colors.white.withValues(alpha: 0.22),
   );
 
-  /// Light-mode tokens — same structure (translucent panels over a soft
-  /// gradient wash) so the app doesn't look broken under
-  /// `ThemeMode.system`, but necessarily quieter: light glass reads well
-  /// with much lower fill/border contrast than dark glass.
+  /// Light-mode tokens — v5's mockup is dark-only, so this palette is
+  /// *designed*, not copied: same structural rules (real backdrop luminance
+  /// range, neutral glass, specular line, accent-only-on-content) at
+  /// light-mode-appropriate contrast. See plan §7 for the full reasoning.
   static final GlassColors light = GlassColors._(
     violet: const Color(0xFF6C5CE7),
     amber: const Color(0xFFB5690C),
     teal: const Color(0xFF0F8F7E),
     blue: const Color(0xFF2E5FAE),
     mint: const Color(0xFF1F9D5C),
-    violetGlow: const Color(0xFF6C5CE7).withValues(alpha: 0.10),
-    amberGlow: const Color(0xFFB5690C).withValues(alpha: 0.08),
-    tealGlow: const Color(0xFF0F8F7E).withValues(alpha: 0.08),
-    blueGlow: const Color(0xFF2E5FAE).withValues(alpha: 0.08),
-    mintGlow: const Color(0xFF1F9D5C).withValues(alpha: 0.10),
     textPrimary: const Color(0xFF1B1D28),
     textSecondary: const Color(0xFF4B4F63),
     textTertiary: const Color(0xFF767B93),
-    bgTop: const Color(0xFFF3F1FA),
-    bgMid: const Color(0xFFEFEDF8),
-    bgBottom: const Color(0xFFF6F4FC),
+    // Same lavender-leaning hue family as before, but with genuine
+    // top-to-bottom luminance range (cool sky-lavender top → warm-white
+    // bottom) instead of three near-identical near-whites — the same "flat,
+    // nothing for a blur to reveal" problem v5 fixes in dark mode existed
+    // here too, just less obviously.
+    bgTop: const Color(0xFFDCE3F0),
+    bgMid: const Color(0xFFE9E6F5),
+    bgMid2: const Color(0xFFF3EFFA),
+    bgBottom: const Color(0xFFFAF8FC),
+    // Fill/border stay at their existing, much higher light-mode alphas —
+    // light glass fundamentally needs more opacity to read than dark glass
+    // (pre-existing rule, unchanged by v5).
     panelFillA: Colors.white.withValues(alpha: 0.55),
     panelFillB: Colors.white.withValues(alpha: 0.22),
     borderBright: Colors.white.withValues(alpha: 0.85),
     borderDim: Colors.white.withValues(alpha: 0.25),
+    vignetteEdge: const Color(0xFF4A4458).withValues(alpha: 0.12),
+    specularLine: Colors.white.withValues(alpha: 0.9),
+    sweepCore: const Color(0xFFFFFBF3).withValues(alpha: 0.08),
+    sweepEdge: Colors.white.withValues(alpha: 0.05),
+    // Tuned down from dark mode's 0.4/0.08 per plan §7's guidance to land in
+    // the same 0.08-0.10 magnitude the old *Glow tokens used, rather than
+    // the stronger accent presence dark glass can carry.
+    ringBorderAlpha: 0.30,
+    ringGlowAlpha: 0.09,
+    // White washes over an already-light panel are nearly invisible, so
+    // light mode's active-nav highlight darkens instead of brightens.
+    navActiveFill: Colors.black.withValues(alpha: 0.06),
+    navActiveBorder: Colors.black.withValues(alpha: 0.14),
   );
 }
 
-/// Persistent ambient backdrop: a soft gradient wash with three diffuse
-/// color blobs (violet / teal / amber) that drift very slowly. Rendered
-/// with plain [RadialGradient]s rather than [BackdropFilter], since the
-/// blobs have no fine detail to blur — a gradient is visually equivalent
-/// here and avoids paying a blur cost on every frame for a full-screen
-/// layer. Meant to be used once per screen, behind that screen's content.
+/// Shared frosted-glass surface: gradient border, blurred neutral fill, and
+/// a discrete top-edge specular highlight. Used directly by [GlassPanel]
+/// and — via this same function, not a copy-pasted decoration — by
+/// [GlassNavBar] / [GlassNavRail], so the three can no longer silently drift
+/// out of sync the way they had before (see plan §3.7).
+///
+/// [ringColor], when set, is v5's one remaining place color touches the
+/// glass itself directly: the border gradient's bright corner becomes the
+/// accent color instead of neutral white, and a thin accent glow ring is
+/// added alongside the panel's normal drop shadow. Everything else about
+/// the surface (fill, specular line) stays neutral either way — this is a
+/// ring, not a tint.
+Widget _clearGlassSurface(
+  BuildContext context, {
+  required Widget child,
+  required double borderRadius,
+  double blurSigma = 18,
+  Color? ringColor,
+  bool specular = true,
+}) {
+  final c = GlassColors.of(context);
+  final borderTop = ringColor != null
+      ? ringColor.withValues(alpha: c.ringBorderAlpha)
+      : c.borderBright;
+
+  return Container(
+    decoration: BoxDecoration(
+      borderRadius: BorderRadius.circular(borderRadius),
+      gradient: LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [borderTop, c.borderDim],
+      ),
+      boxShadow: [
+        BoxShadow(
+          color: Colors.black.withValues(alpha: 0.6),
+          blurRadius: 30,
+          offset: const Offset(0, 14),
+          spreadRadius: -12,
+        ),
+        if (ringColor != null)
+          BoxShadow(
+            color: ringColor.withValues(alpha: c.ringGlowAlpha),
+            blurRadius: 0,
+            spreadRadius: 1,
+          ),
+      ],
+    ),
+    padding: const EdgeInsets.all(1.1),
+    child: ClipRRect(
+      borderRadius: BorderRadius.circular(borderRadius - 1.1),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(borderRadius - 1.1),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [c.panelFillA, c.panelFillB],
+            ),
+          ),
+          child: specular ? Stack(children: [child, _specularLine(c)]) : child,
+        ),
+      ),
+    ),
+  );
+}
+
+/// The discrete 1px top-edge highlight every clear-glass surface gets —
+/// inset 8% from each side, fading to transparent at both ends. Replaces
+/// the old full-width `inset box-shadow` highlight with the mockup's more
+/// literal "light catching one edge of real glass" treatment (plan §1,
+/// "Panel highlight" row).
+Widget _specularLine(GlassColors c) {
+  return Positioned(
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 1,
+    child: Align(
+      alignment: Alignment.topCenter,
+      child: FractionalSizedBox(
+        widthFactor: 0.84, // 100% - 8% inset each side
+        child: SizedBox(
+          height: 1,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.transparent, c.specularLine, Colors.transparent],
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/// Persistent ambient backdrop: the v5 gradient field, a radial vignette,
+/// and one diagonal light sweep drifting across it. Meant to be used once
+/// per screen, behind that screen's content.
 class GlassBackground extends StatefulWidget {
   const GlassBackground({super.key, this.child});
   final Widget? child;
@@ -132,31 +300,32 @@ class GlassBackground extends StatefulWidget {
 
 // Every GlassPanel/GlassListTile/GlassNavBar/GlassNavRail on screen paints
 // itself with BackdropFilter, which re-samples and re-blurs whatever is
-// beneath it EVERY time it paints. The old implementation drove this
-// background with a SingleTickerProviderStateMixin AnimationController on
-// `repeat(reverse: true)`, which — regardless of its 28s duration — ticks
-// and repaints at a full 60fps *forever*, forcing every blur layer above it
-// to redo an 18-24 sigma Gaussian blur pass on every single frame, even
-// while the screen is completely idle. That sustained, uncapped per-frame
-// cost (worse on Android's rasterizer than on Windows) is what surfaces as
-// flicker/slowdown. Fix: drive the drift from a slow Timer that nudges the
-// target position every few seconds, and let AnimatedAlign (an *implicit*
-// animation) ease to it. This means the background — and everything
-// blurring it above — only repaints during the short ease window, then
-// sits fully static (zero repaint, zero re-blur cost) the rest of the
-// time, cutting sustained animation load by roughly 60-65% versus before.
+// beneath it EVERY time it paints. A background that never stops moving
+// forces all of them to redo that work forever, even while the screen is
+// completely idle — that was the root cause of the reported Android
+// flicker/slowdown (see PROGRESS.md, 2026-07-12 "vibrancy + perf" entry),
+// and it applies just as much to v5's sweep as it did to the old drifting
+// color blobs it replaces (see plan §3.1/§6 — porting the mockup's literal
+// `animation: sweep 13s ease-in-out infinite` as a free-running
+// AnimationController.repeat() would silently reintroduce the exact bug
+// that session just fixed). Fix, unchanged in mechanism from that session:
+// drive the drift from a slow Timer that toggles a target position, and let
+// an *implicit* animation (AnimatedAlign) ease to it. The sweep then only
+// repaints — and only forces every blur layer above it to re-blur — during
+// the short ease window, and sits fully static (zero repaint cost) the rest
+// of the time.
 class _GlassBackgroundState extends State<GlassBackground> {
-  static const _driftPeriod = Duration(seconds: 10);
-  static const _driftEase = Duration(seconds: 4);
+  static const _driftPeriod = Duration(seconds: 13); // matches mockup's 13s cycle
+  static const _driftEase = Duration(seconds: 7);
   Timer? _timer;
-  double _t = 0; // 0..1, toggled — NOT ticked every frame.
+  bool _swept = false; // toggled — NOT ticked every frame.
 
   @override
   void initState() {
     super.initState();
     _timer = Timer.periodic(_driftPeriod, (_) {
       if (!mounted) return;
-      setState(() => _t = _t == 0 ? 1 : 0);
+      setState(() => _swept = !_swept);
     });
   }
 
@@ -169,62 +338,96 @@ class _GlassBackgroundState extends State<GlassBackground> {
   @override
   Widget build(BuildContext context) {
     final c = GlassColors.of(context);
-    final t = _t;
     return Stack(
       fit: StackFit.expand,
       children: [
+        // 4-stop backdrop gradient, 165deg (converted to Alignment via
+        // dx=sin(theta), dy=-cos(theta) — see plan Appendix for the source
+        // CSS this is copied from).
         DecoratedBox(
           decoration: BoxDecoration(
             gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [c.bgTop, c.bgMid, c.bgBottom],
+              begin: const Alignment(-0.2588, -0.9659),
+              end: const Alignment(0.2588, 0.9659),
+              colors: [c.bgTop, c.bgMid, c.bgMid2, c.bgBottom],
+              stops: const [0.0, 0.38, 0.68, 1.0],
             ),
           ),
         ),
-        _blob(c.violet, Alignment(-1.1 + t * 0.12, -1.15), 0.55),
-        _blob(c.teal, Alignment(1.15, -0.75 - t * 0.10), 0.5),
-        _blob(c.amber, Alignment(-0.55 + t * 0.08, 1.2), 0.55),
+        // Diagonal light sweep — oversized band (220% of the screen, same
+        // proportions as the mockup's `inset: -60%`), drifting back and
+        // forth. Gradient direction (112deg) uses the same angle→Alignment
+        // conversion as the backdrop above.
+        ClipRect(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final w = constraints.maxWidth.isFinite
+                  ? constraints.maxWidth * 2.2
+                  : 2000.0;
+              final h = constraints.maxHeight.isFinite
+                  ? constraints.maxHeight * 2.2
+                  : 2000.0;
+              return AnimatedAlign(
+                duration: _driftEase,
+                curve: Curves.easeInOutSine,
+                alignment: _swept
+                    ? const Alignment(0.08, 0.04)
+                    : const Alignment(-0.08, -0.04),
+                child: SizedBox(
+                  width: w,
+                  height: h,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: const Alignment(-0.9272, -0.3746),
+                        end: const Alignment(0.9272, 0.3746),
+                        colors: [
+                          Colors.transparent,
+                          c.sweepEdge,
+                          c.sweepCore,
+                          c.sweepEdge,
+                          Colors.transparent,
+                        ],
+                        stops: const [0.36, 0.47, 0.50, 0.53, 0.64],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        // Radial vignette — darkens the edges/bottom slightly so the sweep
+        // and top content stay legible against the now-lighter backdrop.
+        DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: RadialGradient(
+              center: const Alignment(0, -0.5),
+              radius: 1.1,
+              colors: [Colors.transparent, c.vignetteEdge],
+              stops: const [0.45, 1.0],
+            ),
+          ),
+        ),
         if (widget.child != null) widget.child!,
       ],
-    );
-  }
-
-  Widget _blob(Color color, Alignment align, double radiusFactor) {
-    return AnimatedAlign(
-      duration: _driftEase,
-      curve: Curves.easeInOutSine,
-      alignment: align,
-      child: FractionallySizedBox(
-        widthFactor: radiusFactor,
-        heightFactor: radiusFactor,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            gradient: RadialGradient(
-              colors: [
-                color.withValues(alpha: 0.16),
-                color.withValues(alpha: 0.0),
-              ],
-            ),
-          ),
-        ),
-      ),
     );
   }
 }
 
 /// The core glass surface: gradient border (bright top-left, dim
 /// bottom-right — light catching a curved rim) around a blurred,
-/// translucent fill. Drop-in replacement for [Card] wherever a bounded
-/// container is needed.
+/// translucent, always-neutral fill, with a discrete top-edge specular
+/// highlight. Drop-in replacement for [Card] wherever a bounded container
+/// is needed. Thin wrapper around [_clearGlassSurface] that adds padding and
+/// an optional outer margin.
 class GlassPanel extends StatelessWidget {
   const GlassPanel({
     super.key,
     required this.child,
     this.padding = const EdgeInsets.all(14),
     this.borderRadius = 18,
-    this.accentColor,
+    this.ringColor,
     this.blurSigma = 18,
     this.margin,
   });
@@ -232,87 +435,41 @@ class GlassPanel extends StatelessWidget {
   final Widget child;
   final EdgeInsetsGeometry padding;
   final double borderRadius;
-  final Color? accentColor;
+
+  /// v5: this used to be `accentColor`, and used to tint the panel's FILL
+  /// (the "vibrancy pass" — see this file's top doc comment). Renamed
+  /// deliberately, not just re-purposed under the old name: it now only
+  /// affects the border + a thin glow ring, never the fill, and every
+  /// caller that used to pass a fill-tinting accent needed to be looked at
+  /// individually anyway (there were only two: [GlassListTile] and
+  /// [GlassStatusBanner]) — see plan §3.2 for why a rename was preferred
+  /// over silently changing what `accentColor` meant.
+  final Color? ringColor;
   final double blurSigma;
   final EdgeInsetsGeometry? margin;
 
   @override
   Widget build(BuildContext context) {
-    final c = GlassColors.of(context);
-    final radius = BorderRadius.circular(borderRadius);
-
-    // When a control has an accent color, let that color tint the glass
-    // itself (like iOS Control Center's colored modules — WiFi reads blue,
-    // Focus reads indigo) rather than only tinting the small icon chip.
-    // Alphas are kept low (0.20/0.07) so the panel stays translucent glass,
-    // not a flat solid-colored card — this was the previous "flashy" pass's
-    // mistake, not the presence of color itself.
-    final fillTop = accentColor != null
-        ? accentColor!.withValues(alpha: 0.20)
-        : c.panelFillA;
-    final fillBottom = accentColor != null
-        ? accentColor!.withValues(alpha: 0.07)
-        : c.panelFillB;
-    final borderTop = accentColor != null
-        ? Color.lerp(c.borderBright, accentColor, 0.22)!
-        : c.borderBright;
-
-    Widget panel = Container(
-      decoration: BoxDecoration(
-        borderRadius: radius,
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [borderTop, c.borderDim],
-        ),
-      ),
-      padding: const EdgeInsets.all(1.1),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(borderRadius - 1.1),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma),
-          child: Container(
-            padding: padding,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(borderRadius - 1.1),
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [fillTop, fillBottom],
-              ),
-            ),
-            child: child,
-          ),
-        ),
-      ),
+    Widget panel = _clearGlassSurface(
+      context,
+      borderRadius: borderRadius,
+      blurSigma: blurSigma,
+      ringColor: ringColor,
+      child: Padding(padding: padding, child: child),
     );
-
-    if (accentColor != null) {
-      panel = Container(
-        margin: margin,
-        decoration: BoxDecoration(
-          borderRadius: radius,
-          boxShadow: [
-            BoxShadow(
-              color: accentColor!.withValues(alpha: 0.16),
-              blurRadius: 26,
-              offset: const Offset(0, 12),
-              spreadRadius: -14,
-            ),
-          ],
-        ),
-        child: panel,
-      );
-    } else if (margin != null) {
+    if (margin != null) {
       panel = Padding(padding: margin!, child: panel);
     }
-
     return panel;
   }
 }
 
-/// Small uppercase section header, e.g. "Folder pairs" / "Devices on this
-/// network" — matches the type treatment used across the app already.
+/// Small section header, e.g. "Folder pairs" / "Devices on this
+/// network". v5: bumped to `textPrimary`/15px/w700 + a text-shadow (was
+/// `textSecondary`/12.5px with letter-spacing) — this now matches what
+/// `dashboard_screen.dart`'s own private `_sectionHeader` helper already
+/// did, so that helper is deleted in favor of this shared widget rather
+/// than the two staying divergent (see plan §3.6).
 class GlassSectionLabel extends StatelessWidget {
   const GlassSectionLabel(this.text, {super.key});
   final String text;
@@ -325,10 +482,17 @@ class GlassSectionLabel extends StatelessWidget {
       child: Text(
         text,
         style: TextStyle(
-          color: c.textSecondary,
-          fontSize: 12.5,
+          color: c.textPrimary,
+          fontSize: 15,
           fontWeight: FontWeight.w700,
-          letterSpacing: 0.4,
+          letterSpacing: -0.1,
+          shadows: [
+            Shadow(
+              color: Colors.black.withValues(alpha: 0.3),
+              blurRadius: 8,
+              offset: const Offset(0, 1),
+            ),
+          ],
         ),
       ),
     );
@@ -366,13 +530,17 @@ class GlassListTile extends StatelessWidget {
     final row = Row(
       children: [
         if (leadingIcon != null) ...[
+          // v5: bordered chip, not a filled wash — background stays neutral
+          // (white α.06) and the accent shows up only as the border/icon
+          // stroke color. Matches the mockup's `.icon-chip` exactly.
           Container(
             width: 36,
             height: 36,
             alignment: Alignment.center,
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(11),
-              color: accent.withValues(alpha: 0.16),
+              color: Colors.white.withValues(alpha: 0.06),
+              border: Border.all(color: accent.withValues(alpha: 0.55)),
             ),
             child: Icon(leadingIcon, size: 18, color: accent),
           ),
@@ -391,6 +559,13 @@ class GlassListTile extends StatelessWidget {
                   color: c.textPrimary,
                   fontSize: dense ? 13 : 14,
                   fontWeight: FontWeight.w600,
+                  shadows: [
+                    Shadow(
+                      color: Colors.black.withValues(alpha: 0.3),
+                      blurRadius: 5,
+                      offset: const Offset(0, 1),
+                    ),
+                  ],
                 ),
               ),
               if (subtitle != null) ...[
@@ -402,6 +577,13 @@ class GlassListTile extends StatelessWidget {
                   style: TextStyle(
                     color: c.textTertiary,
                     fontSize: dense ? 11 : 12,
+                    shadows: [
+                      Shadow(
+                        color: Colors.black.withValues(alpha: 0.25),
+                        blurRadius: 5,
+                        offset: const Offset(0, 1),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -415,15 +597,16 @@ class GlassListTile extends StatelessWidget {
       ],
     );
 
+    // v5: deliberately does NOT forward `accentColor` into the panel below
+    // as a `ringColor` — this is the one place in this file that's a
+    // literal re-reversal of the prior "vibrancy" session's fix (which
+    // forwarded it so the panel's FILL would tint). Rows never get a ring
+    // in v5; only the hero/status banner does. Calling this out explicitly
+    // so it doesn't read as accidentally regressing that session's work —
+    // see plan §3.3.
     final panel = GlassPanel(
-      padding: EdgeInsets.symmetric(
-          horizontal: 14, vertical: dense ? 10 : 12),
+      padding: EdgeInsets.symmetric(horizontal: 14, vertical: dense ? 10 : 12),
       borderRadius: 16,
-      // Previously dropped: GlassListTile computed an accentColor for every
-      // caller (violet/teal per row in Settings) but never passed it to the
-      // panel underneath, so the tile only ever showed color on its small
-      // icon chip — the glass itself stayed a flat, uncolored white fill.
-      accentColor: accentColor,
       child: row,
     );
 
@@ -444,7 +627,11 @@ class GlassListTile extends StatelessWidget {
 }
 
 /// Status/hero banner — success or in-progress state at the top of a
-/// screen (e.g. "Sync is running", "Remote control enabled").
+/// screen (e.g. "Sync is running", "Remote control enabled"). v5: the one
+/// place color still touches the glass directly — as a border + glow ring
+/// via `GlassPanel(ringColor:)`, never as a fill tint. Icon chip switches
+/// from a filled gradient circle to the same bordered treatment every row
+/// icon chip uses, just larger (44px vs 36px) — see plan §3.4.
 class GlassStatusBanner extends StatelessWidget {
   const GlassStatusBanner({
     super.key,
@@ -464,26 +651,22 @@ class GlassStatusBanner extends StatelessWidget {
     final c = GlassColors.of(context);
     final accent = accentColor ?? c.mint;
     return GlassPanel(
-      accentColor: accent,
+      ringColor: accent,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
       child: Row(
         children: [
           Container(
-            width: 28,
-            height: 28,
+            width: 44,
+            height: 44,
             alignment: Alignment.center,
             decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: RadialGradient(
-                colors: [
-                  accent.withValues(alpha: 0.9),
-                  accent.withValues(alpha: 0.35),
-                ],
-              ),
+              borderRadius: BorderRadius.circular(13),
+              color: Colors.white.withValues(alpha: 0.06),
+              border: Border.all(color: accent.withValues(alpha: 0.5)),
             ),
-            child: Icon(icon, size: 16, color: Colors.black.withValues(alpha: 0.65)),
+            child: Icon(icon, size: 21, color: accent),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: 14),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -493,15 +676,34 @@ class GlassStatusBanner extends StatelessWidget {
                   title,
                   style: TextStyle(
                     color: c.textPrimary,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 13.5,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 17.5,
+                    letterSpacing: -0.2,
+                    shadows: [
+                      Shadow(
+                        color: Colors.black.withValues(alpha: 0.3),
+                        blurRadius: 5,
+                        offset: const Offset(0, 1),
+                      ),
+                    ],
                   ),
                 ),
                 if (subtitle != null) ...[
-                  const SizedBox(height: 2),
+                  const SizedBox(height: 3),
                   Text(
                     subtitle!,
-                    style: TextStyle(color: c.textSecondary, fontSize: 11.5),
+                    style: TextStyle(
+                      color: c.textSecondary,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      shadows: [
+                        Shadow(
+                          color: Colors.black.withValues(alpha: 0.25),
+                          blurRadius: 5,
+                          offset: const Offset(0, 1),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
               ],
@@ -514,6 +716,8 @@ class GlassStatusBanner extends StatelessWidget {
 }
 
 /// Small pill, e.g. a time chip or a "Connected"/"Paired"/"New" status tag.
+/// v5: quieter fill, more visible border (plan §3.8 — "already structurally
+/// right, just needs the numbers moved").
 class GlassChip extends StatelessWidget {
   const GlassChip({
     super.key,
@@ -538,8 +742,8 @@ class GlassChip extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(20),
-        color: accent.withValues(alpha: filled ? 0.22 : 0.13),
-        border: Border.all(color: accent.withValues(alpha: 0.36)),
+        color: accent.withValues(alpha: filled ? 0.10 : 0.05),
+        border: Border.all(color: accent.withValues(alpha: 0.55)),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -573,7 +777,8 @@ class GlassChip extends StatelessWidget {
 /// Icon+label glass button with a press-scale animation. Three visual
 /// weights: tinted (default), primary (more saturated fill+glow, for the
 /// one emphasized action in a group), and outline (for a rare/destructive
-/// action like "Cancel shutdown").
+/// action like "Cancel shutdown"). v5: unchanged — nothing in the mockup
+/// implies a change to this component (plan §3.9).
 class GlassButton extends StatefulWidget {
   const GlassButton({
     super.key,
@@ -674,7 +879,6 @@ class _GlassButtonState extends State<GlassButton>
             ),
           ),
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
@@ -711,7 +915,11 @@ class GlassNavDestination {
   final String label;
 }
 
-/// Floating glass bottom nav bar — replaces [NavigationBar].
+/// Floating glass bottom nav bar — replaces [NavigationBar]. v5: now built
+/// from [_clearGlassSurface] (same formula as [GlassPanel]) instead of its
+/// own hand-rolled decoration, so this and [GlassPanel] can't silently
+/// drift apart again (plan §3.7). Active-item highlight is neutral —
+/// v5 removes the violet tint that used to mark the selected tab.
 class GlassNavBar extends StatelessWidget {
   const GlassNavBar({
     super.key,
@@ -729,28 +937,18 @@ class GlassNavBar extends StatelessWidget {
     final c = GlassColors.of(context);
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(24),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-          child: Container(
-            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(24),
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [c.panelFillA, c.panelFillB],
-              ),
-              border: Border.all(color: c.borderDim),
-            ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                for (var i = 0; i < destinations.length; i++)
-                  _navItem(context, c, i),
-              ],
-            ),
+      child: _clearGlassSurface(
+        context,
+        borderRadius: 24,
+        blurSigma: 22,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              for (var i = 0; i < destinations.length; i++)
+                _navItem(context, c, i),
+            ],
           ),
         ),
       ),
@@ -770,7 +968,8 @@ class GlassNavBar extends StatelessWidget {
           margin: const EdgeInsets.symmetric(horizontal: 3),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(16),
-            color: active ? c.violet.withValues(alpha: 0.20) : null,
+            color: active ? c.navActiveFill : null,
+            border: active ? Border.all(color: c.navActiveBorder) : null,
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -799,7 +998,9 @@ class GlassNavBar extends StatelessWidget {
 
 /// Floating glass side rail — replaces [NavigationRail] on wide desktop
 /// layouts. Keeps the same leading/trailing slot shape as the app's
-/// existing `_NavRail` so callers barely change.
+/// existing `_NavRail` so callers barely change. v5: same
+/// [_clearGlassSurface]-based rebuild and neutral active-item highlight as
+/// [GlassNavBar] — see that class's doc comment.
 class GlassNavRail extends StatelessWidget {
   const GlassNavRail({
     super.key,
@@ -821,32 +1022,19 @@ class GlassNavRail extends StatelessWidget {
     final c = GlassColors.of(context);
     return Padding(
       padding: const EdgeInsets.fromLTRB(10, 14, 6, 14),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(22),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-          child: Container(
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(22),
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [c.panelFillA, c.panelFillB],
-              ),
-              border: Border.all(color: c.borderDim),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                if (leading != null) leading!,
-                const SizedBox(height: 4),
-                for (var i = 0; i < destinations.length; i++)
-                  _railItem(c, i),
-                const Spacer(),
-                if (trailing != null) trailing!,
-              ],
-            ),
-          ),
+      child: _clearGlassSurface(
+        context,
+        borderRadius: 22,
+        blurSigma: 24,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (leading != null) leading!,
+            const SizedBox(height: 4),
+            for (var i = 0; i < destinations.length; i++) _railItem(c, i),
+            const Spacer(),
+            if (trailing != null) trailing!,
+          ],
         ),
       ),
     );
@@ -867,7 +1055,8 @@ class GlassNavRail extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(14),
-              color: active ? c.violet.withValues(alpha: 0.20) : null,
+              color: active ? c.navActiveFill : null,
+              border: active ? Border.all(color: c.navActiveBorder) : null,
             ),
             child: Row(
               children: [
