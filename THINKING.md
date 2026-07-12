@@ -422,3 +422,89 @@ a cosmetic detail — the color of an already-teal-accented switch — that
 doesn't need it. Simplicity matched to the actual stakes: this is styling,
 not sync-critical logic, so the lowest-risk fix that unblocks the build is
 correct, not a compromise.
+
+---
+
+## 2026-07-12 (new session) — Why BackdropFilter + a moving background is the actual flicker cause
+
+**Starting point:** two symptoms reported together — "not colorful enough"
+and "flickers/slower on Android." Treated as two separate bugs rather than
+assuming they share one cause, since a styling complaint and a performance
+complaint don't usually come from the same line of code. They turned out to
+be genuinely separate (one a dropped parameter, one an animation-scheduling
+choice), both localized to `glass.dart`.
+
+**On the color bug:** before changing anything, traced where `accentColor`
+actually flows for a Settings row. `_SettingsHubPage` passes a real,
+distinct color per row. `GlassListTile` accepts it as a parameter... and
+then only uses it for the 36×36 icon-chip background — the `GlassPanel` it
+builds internally never receives it. This is the kind of bug that's
+invisible from reading either file in isolation (both look individually
+correct) and only shows up when tracing the value across the call
+boundary. Fixed by forwarding it, plus giving `GlassPanel` something
+meaningful to do with it beyond the pre-existing drop-shadow.
+
+**On the performance bug — the reasoning that mattered most:** the
+temptation was to jump straight to "too many `BackdropFilter`s, remove
+some." That's a real, valid lever (Flutter's own docs warn against
+stacking/animating many of them), but it doesn't explain the specific
+symptom shape: this isn't just "slightly slow all the time," it's
+_flicker_ — which points more precisely at *inconsistent* frame timing
+(work that sometimes finishes before vsync and sometimes doesn't), not
+uniformly-expensive-but-stable rendering. That pattern fits "continuous,
+unnecessary work happening even at rest" better than "several expensive
+layers that are at least each doing something visually necessary."
+
+Traced what's actually driving repaints continuously: `GlassBackground`'s
+`AnimationController` on `repeat(reverse: true)`. Its 28-second duration is
+a red herring for performance purposes — Flutter's animation system still
+ticks that controller's `Listenable` at the full display refresh rate for
+the entire 28 seconds (and every subsequent 28 seconds, forever), regardless
+of how slow the visual drift looks to a human eye. A slow-*looking*
+animation and a slow-*ticking* animation are not the same thing, and
+conflating them would have been an easy mistake — the doc comment even
+already claimed this was "restrained" (true for color/opacity choices, not
+true for the ticking rate).
+
+The mechanism that turns "background is always repainting" into "everything
+above it is always re-blurring": `BackdropFilter` doesn't cache a blurred
+snapshot — by design, it samples whatever is *currently* composited beneath
+it at paint time, every time it paints. A layer that never stops
+invalidating therefore forces every `BackdropFilter` layer stacked on top of
+it to also never stop doing full-cost blur work, independent of whether
+their own content changed at all. On the Settings screen specifically,
+that's the nav rail/bar plus every `GlassListTile` — five or six blur
+passes, all paying this "invisible tax" on every frame, forever, even with
+zero user interaction. That composite cost is a plausible, specific
+explanation for why Android in particular struggles (weaker/more variable
+GPU headroom than a Windows desktop target) and specifically presents as
+flicker (frame budget gets blown intermittently rather than uniformly, so
+frames drop unevenly rather than the whole app simply running at a
+consistently lower but stable fps).
+
+**Why `Timer` + `AnimatedAlign` instead of, say, just slowing the ticker
+down further, or removing the background animation entirely:** slowing
+`AnimationController.repeat()` down doesn't change its *tick rate* — it
+still repaints every frame, just moving a smaller distance per frame.
+Duration was never the lever that mattered. Removing the ambient animation
+entirely would have fixed performance completely but throws away a
+deliberate visual-design decision from two sessions ago ("carries a single
+slow drift") without being asked to. `Timer.periodic` + `AnimatedAlign`
+(an *implicit* animation) was chosen specifically because implicit
+animations only run their internal ticker while actively transitioning
+between two target values, then stop completely and repaint nothing once
+they arrive — which converts "always animating" into "animating in short,
+periodic bursts," preserving the visual intent while eliminating almost
+all of the idle-time cost. This is a general pattern worth remembering for
+this codebase: prefer implicit animations (`AnimatedX` widgets) over a
+raw looping `AnimationController` for anything that sits underneath a
+`BackdropFilter`, specifically because of this idle-repaint-cost
+difference, not just as a general style preference.
+
+**What I did not have the tools to confirm:** whether 60-65% less
+sustained repaint time is actually enough to eliminate the flicker on the
+person's specific Android device, versus needing the further
+BackdropFilter-consolidation step flagged in `PROGRESS.md`. No profiler, no
+emulator, no device in this sandbox — this is a confident diagnosis of
+mechanism, not a benchmarked-and-confirmed fix, and I said so rather than
+overstating it.

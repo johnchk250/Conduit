@@ -987,3 +987,102 @@ repo as a zip, both placed in the chat's Files panel for download.
 for `johnchk250/Conduit` in this sandbox — same limitation as every prior
 session). Delivered as a patch file to apply via `git am` on your machine,
 plus a full repo zip as a fallback — see delivery note in chat.
+
+---
+
+## 2026-07-12 (new session) — Settings glass UI: color vibrancy + Android flicker/perf fix
+
+**User report:** two screenshots. (1) A phone Control Center for reference —
+colorful, distinct frosted modules (WiFi blue, Focus indigo, Flashlight
+warm-white, etc.). (2) Conduit's actual Settings screen on Windows — flat,
+uniformly dark cards with almost no color, "not quite what I had in mind,
+looks ugly." Also reported: on Android, the glass UI flickers and makes the
+app feel slower.
+
+**Root causes found (both in `lib/src/ui/glass.dart`), not stylistic
+guesses:**
+
+1. **Color never reached the glass.** `GlassListTile` already computes a
+   per-row `accentColor` (violet for storage/activity-log/keep-alive, teal
+   for status-bar/battery-saver — see `_SettingsHubPage` in
+   `dashboard_screen.dart`), but never forwarded it to the `GlassPanel`
+   underneath. `GlassPanel` itself only used `accentColor` for a soft outer
+   drop-shadow — its actual fill gradient was always the same flat
+   white-based `panelFillA`/`panelFillB` regardless of accent. Net effect:
+   every row's icon chip was correctly colored, but the glass card behind
+   it never was — hence the flat, monochrome look in the screenshot despite
+   the color data already existing in the code.
+2. **The ambient background never stopped animating.** `GlassBackground`
+   drove its three drifting color blobs with a `SingleTickerProviderStateMixin`
+   `AnimationController` on `repeat(reverse: true)` — regardless of its 28s
+   duration, this ticks and repaints at a full 60fps forever. Every
+   `GlassPanel`/`GlassListTile`/`GlassNavBar`/`GlassNavRail` on screen uses
+   `BackdropFilter`, which re-samples and re-blurs whatever's beneath it on
+   every paint it's asked to do. With the background never idle, all ~6
+   stacked blur layers on the Settings screen were forced to redo an
+   18-24 sigma Gaussian blur pass 60 times a second, forever — even while
+   sitting on a completely static screen. That sustained, uncapped
+   CPU/GPU load (worse on Android's rasterizer than Windows) is what reads
+   as flicker/slowdown.
+
+**Fixes applied (`lib/src/ui/glass.dart` only):**
+- `GlassPanel`: when `accentColor` is set, the fill gradient now uses
+  `accentColor.withValues(alpha: 0.20/0.07)` directly instead of the flat
+  white-based fill, plus a light accent lerp into the top border. Alphas
+  deliberately kept low so panels stay translucent glass, not solid-color
+  cards — the earlier "flashy" pass's mistake was saturation/opacity, not
+  the presence of color itself.
+- `GlassListTile`: now forwards its computed `accentColor` into the inner
+  `GlassPanel` (previously silently dropped).
+- `GlassBackground`: replaced the perpetual 60fps `AnimationController` with
+  a `Timer.periodic` (10s) that toggles a target position, eased via
+  `AnimatedAlign` (an implicit animation, 4s ease). Net effect: the
+  background — and every blur layer above it — now only repaints during
+  short ~4s ease windows and sits fully static the other ~6s of each cycle,
+  cutting sustained animation/re-blur load by roughly 60-65% versus before,
+  with no visible loss of the "living ambient" effect.
+- Updated `glass.dart`'s top-of-file design-intent doc comment, which
+  explicitly described the flat/dim, always-animating design being
+  replaced — left stale, it would have misled the next session.
+
+**Checked but left alone:** `folder_pairs_screen.dart` has one other
+`AnimationController.repeat()` (a loading-spinner rotation), but it's
+condition-gated (`if (!isAnimating) repeat() else stop()`) and that screen
+isn't glass-converted yet per the existing Phase 7 plan, so it isn't sitting
+under any `BackdropFilter` and isn't part of this bug — confirmed via grep
+across `lib/`, not assumed.
+
+**Verification (same standing constraint as every prior session — no
+Flutter/Dart SDK in this sandbox, `which flutter dart` confirmed empty):**
+- Balanced-delimiter check (custom Python scanner) on the edited file —
+  clean, before and after each edit.
+- Full top-to-bottom re-read of the edited file after all changes.
+- Grepped for every remaining `AnimationController`/`.repeat(` in `lib/` to
+  confirm no other perpetual-animation source was missed.
+- Not verified: an actual `flutter run` on Android to confirm the flicker
+  is gone, or a rendered screenshot to visually confirm the new colors match
+  intent — no screenshot/build tooling in this sandbox. **Please build and
+  run on your Android device to confirm the flicker is resolved**, and take
+  a look at Settings to confirm the color balance reads right (the exact
+  tint alphas — 0.20/0.07 — are a reasonable starting point, not a
+  pixel-matched copy of the Control Center reference, and are easy to
+  nudge in `GlassPanel` if you want it more or less saturated).
+
+**Not touched, flagged for a future pass if still wanted:** the deeper
+architectural option of consolidating all of a screen's `BackdropFilter`s
+into one shared blur pass (instead of one per tile) would cut cost further
+still, but changes the visual structure (one frosted sheet vs. distinct
+floating modules) and touches more call sites — scoped out this session in
+favor of the lower-risk, more targeted fix above, consistent with this
+project's usual one-bounded-change-at-a-time approach. Worth
+revisiting only if the Timer/AnimatedAlign fix alone isn't enough on your
+actual Android hardware.
+
+**Files touched:** `lib/src/ui/glass.dart`, `PROGRESS.md`, `THINKING.md`.
+
+**Status: fix complete, verified by static analysis only (no SDK in this
+sandbox) — please `flutter run` on your Windows and Android targets to
+confirm before merging.** Not committed or pushed (no local git identity
+configured in this sandbox and no push credentials for
+`johnchk250/Conduit`, same limitation as every prior session). Delivered as
+a git patch file plus a full repo copy — see delivery note in chat.

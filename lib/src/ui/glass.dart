@@ -1,17 +1,28 @@
+import 'dart:async';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
 
 /// Liquid-glass design tokens + shared widgets used across every screen.
 ///
-/// Design intent (matches the approved mockup, see PROGRESS.md 2026-07-12):
-/// category colors are kept (Power=amber, Media=teal, Volume=blue,
-/// PC-settings/brand=violet, success=mint) but re-expressed as translucent
-/// glass rather than flat fills. Deliberately restrained: no per-card
-/// [BackdropFilter] animation, no loud saturated colors — the ambient
-/// background carries a single slow ~28s drift and every surface leans on
-/// gradient fills + a bright top-left border rather than heavy blur/glow,
-/// since the previous, more vivid pass read as "flashy" in review.
+/// Design intent (revised 2026-07-12, see PROGRESS.md "vibrancy + Android
+/// perf pass"): category colors (Power=amber, Media=teal, Volume=blue,
+/// PC-settings/brand=violet, success=mint) now tint each [GlassPanel]'s
+/// fill directly — not just its leading icon chip — so distinct controls
+/// read as distinct colored glass modules (closer to iOS Control Center)
+/// instead of uniform dark cards. Tint alpha is kept low (0.20/0.07) so
+/// panels stay translucent glass rather than solid color; that low-alpha
+/// ceiling, not the absence of color, is what keeps this from repeating
+/// the earlier "flashy" pass.
+///
+/// [GlassBackground]'s ambient drift no longer runs a continuous 60fps
+/// [Ticker] — every [BackdropFilter] on screen re-blurs whatever's beneath
+/// it on every paint, so a background that never stops moving forces all
+/// of them to redo that work forever, even when idle. It now drifts via a
+/// throttled [Timer] + [AnimatedAlign], animating only in short bursts and
+/// sitting fully static between them — see [_GlassBackgroundState] for the
+/// full reasoning. This was the primary fix for reported Android
+/// flicker/slowdown.
 ///
 /// Modal surfaces (AlertDialog, SnackBar, BottomSheet) are deliberately
 /// LEFT as standard Material — glass is for the persistent app chrome and
@@ -119,28 +130,46 @@ class GlassBackground extends StatefulWidget {
   State<GlassBackground> createState() => _GlassBackgroundState();
 }
 
-class _GlassBackgroundState extends State<GlassBackground>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _ctrl;
+// Every GlassPanel/GlassListTile/GlassNavBar/GlassNavRail on screen paints
+// itself with BackdropFilter, which re-samples and re-blurs whatever is
+// beneath it EVERY time it paints. The old implementation drove this
+// background with a SingleTickerProviderStateMixin AnimationController on
+// `repeat(reverse: true)`, which — regardless of its 28s duration — ticks
+// and repaints at a full 60fps *forever*, forcing every blur layer above it
+// to redo an 18-24 sigma Gaussian blur pass on every single frame, even
+// while the screen is completely idle. That sustained, uncapped per-frame
+// cost (worse on Android's rasterizer than on Windows) is what surfaces as
+// flicker/slowdown. Fix: drive the drift from a slow Timer that nudges the
+// target position every few seconds, and let AnimatedAlign (an *implicit*
+// animation) ease to it. This means the background — and everything
+// blurring it above — only repaints during the short ease window, then
+// sits fully static (zero repaint, zero re-blur cost) the rest of the
+// time, cutting sustained animation load by roughly 60-65% versus before.
+class _GlassBackgroundState extends State<GlassBackground> {
+  static const _driftPeriod = Duration(seconds: 10);
+  static const _driftEase = Duration(seconds: 4);
+  Timer? _timer;
+  double _t = 0; // 0..1, toggled — NOT ticked every frame.
 
   @override
   void initState() {
     super.initState();
-    _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 28),
-    )..repeat(reverse: true);
+    _timer = Timer.periodic(_driftPeriod, (_) {
+      if (!mounted) return;
+      setState(() => _t = _t == 0 ? 1 : 0);
+    });
   }
 
   @override
   void dispose() {
-    _ctrl.dispose();
+    _timer?.cancel();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final c = GlassColors.of(context);
+    final t = _t;
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -153,27 +182,18 @@ class _GlassBackgroundState extends State<GlassBackground>
             ),
           ),
         ),
-        AnimatedBuilder(
-          animation: _ctrl,
-          builder: (context, _) {
-            final t = _ctrl.value; // 0..1..0
-            return Stack(
-              fit: StackFit.expand,
-              children: [
-                _blob(c.violet, Alignment(-1.1 + t * 0.12, -1.15), 0.55),
-                _blob(c.teal, Alignment(1.15, -0.75 - t * 0.10), 0.5),
-                _blob(c.amber, Alignment(-0.55 + t * 0.08, 1.2), 0.55),
-              ],
-            );
-          },
-        ),
+        _blob(c.violet, Alignment(-1.1 + t * 0.12, -1.15), 0.55),
+        _blob(c.teal, Alignment(1.15, -0.75 - t * 0.10), 0.5),
+        _blob(c.amber, Alignment(-0.55 + t * 0.08, 1.2), 0.55),
         if (widget.child != null) widget.child!,
       ],
     );
   }
 
   Widget _blob(Color color, Alignment align, double radiusFactor) {
-    return Align(
+    return AnimatedAlign(
+      duration: _driftEase,
+      curve: Curves.easeInOutSine,
       alignment: align,
       child: FractionallySizedBox(
         widthFactor: radiusFactor,
@@ -221,13 +241,29 @@ class GlassPanel extends StatelessWidget {
     final c = GlassColors.of(context);
     final radius = BorderRadius.circular(borderRadius);
 
+    // When a control has an accent color, let that color tint the glass
+    // itself (like iOS Control Center's colored modules — WiFi reads blue,
+    // Focus reads indigo) rather than only tinting the small icon chip.
+    // Alphas are kept low (0.20/0.07) so the panel stays translucent glass,
+    // not a flat solid-colored card — this was the previous "flashy" pass's
+    // mistake, not the presence of color itself.
+    final fillTop = accentColor != null
+        ? accentColor!.withValues(alpha: 0.20)
+        : c.panelFillA;
+    final fillBottom = accentColor != null
+        ? accentColor!.withValues(alpha: 0.07)
+        : c.panelFillB;
+    final borderTop = accentColor != null
+        ? Color.lerp(c.borderBright, accentColor, 0.22)!
+        : c.borderBright;
+
     Widget panel = Container(
       decoration: BoxDecoration(
         borderRadius: radius,
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: [c.borderBright, c.borderDim],
+          colors: [borderTop, c.borderDim],
         ),
       ),
       padding: const EdgeInsets.all(1.1),
@@ -242,7 +278,7 @@ class GlassPanel extends StatelessWidget {
               gradient: LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
-                colors: [c.panelFillA, c.panelFillB],
+                colors: [fillTop, fillBottom],
               ),
             ),
             child: child,
@@ -383,6 +419,11 @@ class GlassListTile extends StatelessWidget {
       padding: EdgeInsets.symmetric(
           horizontal: 14, vertical: dense ? 10 : 12),
       borderRadius: 16,
+      // Previously dropped: GlassListTile computed an accentColor for every
+      // caller (violet/teal per row in Settings) but never passed it to the
+      // panel underneath, so the tile only ever showed color on its small
+      // icon chip — the glass itself stayed a flat, uncolored white fill.
+      accentColor: accentColor,
       child: row,
     );
 
