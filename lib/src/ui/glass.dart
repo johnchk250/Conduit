@@ -272,6 +272,22 @@ Widget _specularLine(GlassColors c) {
 /// `.hero{border-color; background:}`) and by the dock (flat, more-opaque
 /// override per `.dock{background; border;}`). Every other caller uses the
 /// plain neutral defaults, same as the reference's base `.glass` class.
+///
+/// [blur]: **added 2026-07-12, post-delivery perf fix — not something the
+/// reference distinguishes.** `BackdropFilter` is real per-frame GPU work,
+/// paid independently by every surface that uses it, and a screen like
+/// Overview stacks up to 6 of them at once (hero + several list tiles +
+/// nav bar) — the person reported this as perceptible lag switching tabs,
+/// worst right when a page's panels all build/paint together. `false`
+/// skips the `BackdropFilter` entirely and paints the flat/gradient fill
+/// directly over the (unblurred) ambient background — still translucent,
+/// still reads as glass, just a tinted pane instead of literally frosted.
+/// Reserved for [GlassListTile] (the widget that multiplies per screen);
+/// [GlassStatusBanner] (one per screen, the visual focal point) and the
+/// dock (`GlassNavBar`/`GlassNavRail`, calls `_glassSurface` directly, not
+/// through [GlassPanel]) keep the default `true` — those are the two
+/// surfaces the reference itself puts front and center, and there's only
+/// ever one of each on screen at a time, so the cost doesn't multiply.
 Widget _glassSurface(
   BuildContext context, {
   required Widget child,
@@ -280,8 +296,19 @@ Widget _glassSurface(
   Gradient? fillOverride,
   Color? borderOverride,
   bool sweep = false,
+  bool blur = true,
 }) {
   final c = GlassColors.of(context);
+  final fill = DecoratedBox(
+    decoration: BoxDecoration(
+      gradient:
+          fillOverride ?? LinearGradient(colors: [c.glassFill, c.glassFill]),
+      border: Border.all(
+        color: borderOverride ?? c.glassBorder,
+        width: 1,
+      ),
+    ),
+  );
   return Container(
     decoration: BoxDecoration(
       borderRadius: BorderRadius.circular(borderRadius),
@@ -307,21 +334,15 @@ Widget _glassSurface(
           // then paint the translucent fill on top in the same layer —
           // the standard Flutter frosted-glass recipe. Sigma is a visual
           // approximation of the reference's `blur(24px)`, not a literal
-          // unit conversion (see class doc comment).
+          // unit conversion (see class doc comment). Skipped entirely
+          // when `blur: false` — see the parameter doc above.
           Positioned.fill(
-            child: BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: fillOverride ??
-                      LinearGradient(colors: [c.glassFill, c.glassFill]),
-                  border: Border.all(
-                    color: borderOverride ?? c.glassBorder,
-                    width: 1,
-                  ),
-                ),
-              ),
-            ),
+            child: blur
+                ? BackdropFilter(
+                    filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                    child: fill,
+                  )
+                : fill,
           ),
           // The hero's diagonal light band (`.hero::after`) — a static
           // gradient, not an animation (see class doc comment on why that
@@ -467,6 +488,7 @@ class GlassPanel extends StatelessWidget {
     this.borderRadius = 18, // reference `.glass{border-radius:18px}`
     this.ringColor,
     this.margin,
+    this.blur = true,
   });
 
   final Widget child;
@@ -481,6 +503,12 @@ class GlassPanel extends StatelessWidget {
   final Color? ringColor;
   final EdgeInsetsGeometry? margin;
 
+  /// See [_glassSurface]'s `blur` parameter doc — `false` skips
+  /// `BackdropFilter` for this panel (real GPU cost, paid per-instance).
+  /// Defaults `true` so plain [GlassPanel] usage is unaffected; only
+  /// [GlassListTile] overrides this to `false`.
+  final bool blur;
+
   @override
   Widget build(BuildContext context) {
     final c = GlassColors.of(context);
@@ -489,6 +517,7 @@ class GlassPanel extends StatelessWidget {
       borderRadius: borderRadius,
       padding: padding,
       sweep: ringColor != null,
+      blur: blur,
       borderOverride:
           ringColor != null ? ringColor!.withValues(alpha: c.ringBorderAlpha) : null,
       fillOverride: ringColor != null
@@ -707,6 +736,13 @@ class GlassListTile extends StatelessWidget {
     final panel = GlassPanel(
       padding: EdgeInsets.symmetric(horizontal: 16, vertical: dense ? 10 : 14),
       borderRadius: 18,
+      // Perf fix, 2026-07-12: list tiles are the surface that multiplies
+      // per screen (a folder-pair or device row per item) — skipping the
+      // real BackdropFilter blur here removes most of the per-tab-switch
+      // cost while GlassStatusBanner (the hero, one per screen) and the
+      // dock keep it, since those are the reference's actual visual
+      // focal points and there's only ever one of each on screen.
+      blur: false,
       child: row,
     );
 

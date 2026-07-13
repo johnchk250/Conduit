@@ -1554,3 +1554,49 @@ to the person for exactly how to bring these commits into your own local
 clone and push to GitHub yourself — no push credentials for
 `johnchk250/Conduit` here, same limitation as every prior session in this
 log).
+
+---
+
+## 2026-07-12 (same-day follow-up) — Perf fix: skip `BackdropFilter` on list tiles
+
+**Reported:** tab switching felt slightly slower after the exact-match pass
+landed and built successfully. Confirmed this was the expected trade-off,
+not a bug: the Overview screen alone stacks up to 6 `BackdropFilter`
+instances at once (1 hero + up to 3-4 list tiles + the nav bar), each a
+real per-frame GPU blur pass, all built/painted together the moment a tab
+switch brings a fresh page on screen — exactly the situation flagged as a
+risk to verify when this was delivered (see the "exact-match" entry above),
+just showing up as plain sluggishness rather than the Android-flicker
+scenario that entry focused on.
+
+**Fix (option 2 of 3 offered):** added a `blur` parameter to
+`_glassSurface`/`GlassPanel` (defaults `true`, unchanged for normal
+callers) and set it to `false` specifically in `GlassListTile` — the one
+surface that multiplies per screen. `GlassStatusBanner` (hero, one per
+screen) and the dock (`GlassNavBar`/`GlassNavRail`, calls `_glassSurface`
+directly) keep the real blur, since those are the reference's actual
+visual focal points and there's only ever one of each on screen — no
+per-instance multiplication, so no per-instance cost to cut. List tiles
+now paint a flat translucent fill directly over the (still-blurred, via
+the hero/dock, and still-gradient) ambient background — reads as tinted
+glass rather than literally frosted glass, a small, contained visual
+difference for the majority of the perf win.
+
+**Not done:** did not touch sigma value (still 16, unchanged) or attempt
+sigma-reduction as an additional/alternative fix, since removing blur
+entirely from the multiplying surface should already remove most of the
+cost — no reason to also degrade the two remaining (single-instance)
+blurred surfaces unless this alone turns out insufficient.
+
+**Verification:** balanced-delimiter check clean (same tool as every prior
+entry). Same standing limitation as always — no Flutter/Dart SDK in this
+sandbox, so the actual before/after frame-time improvement has not been
+measured here. Asked the person to confirm via Flutter DevTools'
+Performance tab (`flutter run --profile`) before assuming this fully
+resolves it; if tiles still feel busy with many folder pairs/devices, the
+next lever is lowering the hero/dock's blur sigma, not re-adding blur
+anywhere.
+
+**Files touched:** `lib/src/ui/glass.dart` only (`_glassSurface`'s new
+`blur` param, `GlassPanel`'s passthrough, `GlassListTile`'s override) —
+isolated, no other file needed a change for this fix.
