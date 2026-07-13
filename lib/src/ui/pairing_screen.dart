@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -8,6 +9,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../app_state.dart';
 import '../core/config_store.dart';
 import '../net/discovery.dart';
+import 'glass.dart';
 
 /// Human-friendly explanation for a pairing/socket failure. Detects the
 /// common "firewall / device unreachable" case from the exception and returns
@@ -40,38 +42,130 @@ class PairingScreen extends StatefulWidget {
   State<PairingScreen> createState() => _PairingScreenState();
 }
 
-class _PairingScreenState extends State<PairingScreen>
-    with SingleTickerProviderStateMixin {
-  late TabController _tabs;
-
-  @override
-  void initState() {
-    super.initState();
-    _tabs = TabController(length: 2, vsync: this);
-  }
-
-  @override
-  void dispose() {
-    _tabs.dispose();
-    super.dispose();
-  }
+class _PairingScreenState extends State<PairingScreen> {
+  int _segment = 0; // 0 = discovered/paired, 1 = manual connect
 
   @override
   Widget build(BuildContext ctx) {
+    // Shell matches _OverviewPage's pattern — see THINKING.md. The header
+    // (title + segmented control) doesn't scroll; each segment's own
+    // content below is independently scrollable, same as the TabBarView it
+    // replaces.
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Devices'),
-        bottom: TabBar(
-          controller: _tabs,
-          tabs: const [
-            Tab(icon: Icon(Icons.wifi_tethering), text: 'On this network'),
-            Tab(icon: Icon(Icons.qr_code), text: 'Manual connect'),
+      backgroundColor: Colors.transparent,
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 22, 20, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const GlassPageTitle('Devices'),
+                  _GlassSegmentedControl(
+                    segments: const ['On this network', 'Manual connect'],
+                    icons: const [Icons.wifi_tethering, Icons.qr_code],
+                    selectedIndex: _segment,
+                    onChanged: (i) => setState(() => _segment = i),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: _segment == 0
+                  ? const _DiscoveredList()
+                  : const _ManualConnect(),
+            ),
           ],
         ),
       ),
-      body: TabBarView(
-        controller: _tabs,
-        children: const [_DiscoveredList(), _ManualConnect()],
+    );
+  }
+}
+
+/// Two-segment glass pill switcher, replacing [TabBar]/[TabBarView] on this
+/// screen — no reference example exists for a segmented control (the HTML
+/// mockup is single-screen), so this reuses [GlassNavBar]/[GlassNavRail]'s
+/// exact active-item recipe (violet gradient fill + white-alpha border)
+/// rather than inventing a new accent treatment. See THINKING.md.
+class _GlassSegmentedControl extends StatelessWidget {
+  const _GlassSegmentedControl({
+    required this.segments,
+    required this.icons,
+    required this.selectedIndex,
+    required this.onChanged,
+  });
+
+  final List<String> segments;
+  final List<IconData> icons;
+  final int selectedIndex;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = GlassColors.of(context);
+    return GlassPanel(
+      padding: const EdgeInsets.all(4),
+      borderRadius: 16,
+      child: Row(
+        children: [
+          for (var i = 0; i < segments.length; i++)
+            Expanded(
+              child: InkWell(
+                onTap: () => onChanged(i),
+                borderRadius: BorderRadius.circular(12),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  padding: const EdgeInsets.symmetric(vertical: 9),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    gradient: i == selectedIndex
+                        ? LinearGradient(
+                            begin: const Alignment(-0.3, -1),
+                            end: const Alignment(0.3, 1),
+                            colors: [
+                              c.violet.withValues(alpha: 0.28),
+                              c.violet.withValues(alpha: 0.14),
+                            ],
+                          )
+                        : null,
+                    border: i == selectedIndex
+                        ? Border.all(color: Colors.white.withValues(alpha: 0.12))
+                        : null,
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        icons[i],
+                        size: 16,
+                        color: i == selectedIndex
+                            ? Colors.white
+                            : c.textTertiary,
+                      ),
+                      const SizedBox(width: 6),
+                      Flexible(
+                        child: Text(
+                          segments[i],
+                          overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.manrope(
+                            textStyle: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: i == selectedIndex
+                                  ? c.textPrimary
+                                  : c.textTertiary,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -89,31 +183,38 @@ class _DiscoveredList extends StatelessWidget {
         .where((d) => !paired.any((p) => p.deviceId == d.deviceId))
         .toList(growable: false);
 
+    final c = GlassColors.of(ctx);
     return ListView(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 110),
       children: [
-        Padding(
-          padding: const EdgeInsets.only(left: 4, bottom: 8),
-          child: Text('Paired devices (${paired.length})',
-              style: Theme.of(ctx).textTheme.titleSmall),
-        ),
+        GlassSectionLabel('Paired devices (${paired.length})'),
         if (paired.isEmpty)
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                children: [
-                  const Icon(Icons.devices_other, size: 48, color: Colors.grey),
-                  const SizedBox(height: 12),
-                  const Text('No paired devices yet'),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Use a QR code or pair with a device discovered on this network.',
-                    textAlign: TextAlign.center,
-                    style: Theme.of(ctx).textTheme.bodySmall,
+          GlassPanel(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              children: [
+                Icon(Icons.devices_other, size: 44, color: c.textTertiary),
+                const SizedBox(height: 12),
+                Text(
+                  'No paired devices yet',
+                  style: GoogleFonts.manrope(
+                    textStyle: TextStyle(
+                      color: c.textPrimary,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 14.5,
+                    ),
                   ),
-                ],
-              ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Use a QR code or pair with a device discovered on this '
+                  'network.',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.inter(
+                    textStyle: TextStyle(color: c.textSecondary, fontSize: 12),
+                  ),
+                ),
+              ],
             ),
           )
         else
@@ -126,56 +227,63 @@ class _DiscoveredList extends StatelessWidget {
               onDisconnect: () => _confirmDisconnect(ctx, state, peer),
               onUnpair: () => _confirmUnpair(ctx, state, peer),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 10),
           ],
-        const SizedBox(height: 20),
-        Padding(
-          padding: const EdgeInsets.only(left: 4, bottom: 8),
-          child: Text(
-            unpairedDiscovered.isEmpty
-                ? 'Searching for new devices...'
-                : 'New devices on this network (${unpairedDiscovered.length})',
-            style: Theme.of(ctx).textTheme.titleSmall,
-          ),
+        const SizedBox(height: 22),
+        GlassSectionLabel(
+          unpairedDiscovered.isEmpty
+              ? 'Searching for new devices…'
+              : 'New devices on this network (${unpairedDiscovered.length})',
         ),
         if (unpairedDiscovered.isEmpty)
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                children: [
-                  const Icon(Icons.wifi_find, size: 48, color: Colors.grey),
-                  const SizedBox(height: 12),
-                  const Text('Looking for devices...'),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Both devices must be on the same Wi-Fi. If auto-discovery is blocked on this network, use the Manual connect tab.',
-                    textAlign: TextAlign.center,
-                    style: Theme.of(ctx).textTheme.bodySmall,
+          GlassPanel(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              children: [
+                Icon(Icons.wifi_find, size: 44, color: c.textTertiary),
+                const SizedBox(height: 12),
+                Text(
+                  'Looking for devices...',
+                  style: GoogleFonts.manrope(
+                    textStyle: TextStyle(
+                      color: c.textPrimary,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 14.5,
+                    ),
                   ),
-                ],
-              ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Both devices must be on the same Wi-Fi. If auto-discovery '
+                  'is blocked on this network, use the Manual connect tab.',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.inter(
+                    textStyle: TextStyle(color: c.textSecondary, fontSize: 12),
+                  ),
+                ),
+              ],
             ),
           )
         else
           for (final p in unpairedDiscovered) ...[
-            Card(
-              child: ListTile(
-                leading: Icon(
-                    p.platform == 'android'
-                        ? Icons.phone_android
-                        : Icons.computer,
-                    size: 36),
-                title: Text(p.name),
-                subtitle: Text(
-                    '${p.platform[0].toUpperCase()}${p.platform.substring(1)} - ${p.address.address}'),
-                trailing: ElevatedButton(
-                  onPressed: () => _connect(ctx, state, p, false),
-                  child: const Text('Pair'),
-                ),
+            GlassListTile(
+              leadingIcon:
+                  p.platform == 'android' ? Icons.phone_android : Icons.computer,
+              accentColor: c.blue,
+              title: p.name,
+              subtitle:
+                  '${p.platform[0].toUpperCase()}${p.platform.substring(1)} · ${p.address.address}',
+              subtitleMono: true,
+              trailing: GlassButton(
+                icon: Icons.handshake_outlined,
+                label: 'Pair',
+                accentColor: c.violet,
+                style: GlassButtonStyle.primary,
+                compact: true,
+                onTap: () => _connect(ctx, state, p, false),
               ),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 10),
           ],
       ],
     );
@@ -334,6 +442,7 @@ class _PairedPeerTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = GlassColors.of(context);
     final platform = peer.platform.isEmpty
         ? 'Device'
         : '${peer.platform[0].toUpperCase()}${peer.platform.substring(1)}';
@@ -342,46 +451,49 @@ class _PairedPeerTile extends StatelessWidget {
         : discovered
             ? 'Seen on network'
             : 'Offline';
-    return Card(
-      child: ListTile(
-        leading: Icon(
+    return GlassListTile(
+      leadingIcon:
           peer.platform == 'android' ? Icons.phone_android : Icons.computer,
-          size: 36,
-          color: connected ? Theme.of(context).colorScheme.primary : null,
-        ),
-        title: Text(peer.name),
-        subtitle: Text('$platform - $status'),
-        trailing: PopupMenuButton<String>(
-          onSelected: (value) {
-            switch (value) {
-              case 'reconnect':
-                onReconnect();
-                break;
-              case 'disconnect':
-                onDisconnect();
-                break;
-              case 'unpair':
-                onUnpair();
-                break;
-            }
-          },
-          itemBuilder: (context) => [
-            if (!connected)
-              const PopupMenuItem(
-                value: 'reconnect',
-                child: ListTile(
-                  leading: Icon(Icons.link),
-                  title: Text('Reconnect'),
-                ),
+      accentColor: connected ? c.mint : c.textSecondary,
+      title: peer.name,
+      subtitle: '$platform · $status',
+      subtitleDotColor: connected ? c.mint : c.textTertiary,
+      subtitleLive: connected,
+      // PopupMenuButton is an overlay/menu surface, same standard-Material
+      // carve-out glass.dart's class doc gives dialogs/SnackBars/
+      // BottomSheets — only its trigger icon is restyled to blend in.
+      trailing: PopupMenuButton<String>(
+        icon: Icon(Icons.more_vert, color: c.textTertiary, size: 20),
+        onSelected: (value) {
+          switch (value) {
+            case 'reconnect':
+              onReconnect();
+              break;
+            case 'disconnect':
+              onDisconnect();
+              break;
+            case 'unpair':
+              onUnpair();
+              break;
+          }
+        },
+        itemBuilder: (context) => [
+          if (!connected)
+            const PopupMenuItem(
+              value: 'reconnect',
+              child: ListTile(
+                leading: Icon(Icons.link),
+                title: Text('Reconnect'),
               ),
-            if (connected)
-              const PopupMenuItem(
-                value: 'disconnect',
-                child: ListTile(
-                  leading: Icon(Icons.link_off),
-                  title: Text('Disconnect'),
-                ),
+            ),
+          if (connected)
+            const PopupMenuItem(
+              value: 'disconnect',
+              child: ListTile(
+                leading: Icon(Icons.link_off),
+                title: Text('Disconnect'),
               ),
+            ),
             const PopupMenuItem(
               value: 'unpair',
               child: ListTile(
@@ -391,8 +503,7 @@ class _PairedPeerTile extends StatelessWidget {
             ),
           ],
         ),
-      ),
-    );
+      );
   }
 }
 
@@ -402,17 +513,27 @@ class _ManualConnect extends StatelessWidget {
   @override
   Widget build(BuildContext ctx) {
     final state = ctx.watch<AppState>();
+    final c = GlassColors.of(ctx);
     return ListView(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 110),
       children: [
-        Text('Show this QR on the other device',
-            style: Theme.of(ctx).textTheme.titleMedium),
+        Text(
+          'Show this QR on the other device',
+          textAlign: TextAlign.center,
+          style: GoogleFonts.manrope(
+            textStyle: TextStyle(
+              color: c.textPrimary,
+              fontWeight: FontWeight.w700,
+              fontSize: 15.5,
+            ),
+          ),
+        ),
         const SizedBox(height: 8),
         Text(
           'Scan this QR code from the other device to connect automatically.',
-          style: Theme.of(ctx).textTheme.bodyMedium?.copyWith(
-                color: Theme.of(ctx).colorScheme.onSurfaceVariant,
-              ),
+          style: GoogleFonts.inter(
+            textStyle: TextStyle(color: c.textSecondary, fontSize: 13),
+          ),
           textAlign: TextAlign.center,
         ),
         const SizedBox(height: 24),
@@ -422,8 +543,12 @@ class _ManualConnect extends StatelessWidget {
             builder: (ctx, snap) {
               if (snap.connectionState != ConnectionState.done ||
                   !snap.hasData) {
-                return const CircularProgressIndicator();
+                return CircularProgressIndicator(color: c.violet);
               }
+              // Kept a real solid-white container (not a glass panel) —
+              // a QR code needs real black-on-white contrast to scan
+              // reliably, so this is a deliberate exception to the glass
+              // surface recipe rather than an oversight.
               return Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
@@ -441,16 +566,25 @@ class _ManualConnect extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 28),
-        FilledButton.icon(
-          onPressed: () => _scan(ctx, state),
-          icon: const Icon(Icons.qr_code_scanner),
-          label: const Text('Scan code on this device'),
-        ),
-        const SizedBox(height: 8),
-        OutlinedButton.icon(
-          onPressed: () => _generateCode(ctx, state),
-          icon: const Icon(Icons.pin),
-          label: const Text('Pair manually (no camera)'),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            GlassButton(
+              icon: Icons.qr_code_scanner,
+              label: 'Scan code on this device',
+              accentColor: c.violet,
+              style: GlassButtonStyle.primary,
+              onTap: () => _scan(ctx, state),
+            ),
+            const SizedBox(height: 8),
+            GlassButton(
+              icon: Icons.pin,
+              label: 'Pair manually (no camera)',
+              accentColor: c.textSecondary,
+              style: GlassButtonStyle.outline,
+              onTap: () => _generateCode(ctx, state),
+            ),
+          ],
         ),
       ],
     );

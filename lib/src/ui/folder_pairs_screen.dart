@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 
@@ -9,6 +10,7 @@ import '../app_state.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
 import '../sync/engine.dart';
+import 'glass.dart';
 import 'version_history_screen.dart';
 
 /// Folder pairs list + add/invite/accept flow + per-pair detail view.
@@ -41,149 +43,88 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
   @override
   Widget build(BuildContext ctx) {
     final state = ctx.watch<AppState>();
+    final c = GlassColors.of(ctx);
     final pairs = state.config.folderPairs;
+    // Shell matches _OverviewPage's pattern (GlassPageTitle inline, no own
+    // AppBar) rather than _SettingsHubPage's older AppBar convention — see
+    // THINKING.md, "Design-system choice" for why. FAB stays a real
+    // Material FloatingActionButton (no reference example to translate,
+    // and mixing a custom glass FAB shape into Flutter's built-in
+    // Hero/motion handling for FABs isn't worth it for a single button),
+    // just recolored to the accent family instead of the default M3 color.
     return Scaffold(
-      appBar: AppBar(title: const Text('Folder pairs')),
+      backgroundColor: Colors.transparent,
       floatingActionButton: FloatingActionButton.extended(
         onPressed: () => _showPairDialog(ctx, state, null),
+        backgroundColor: c.violet,
+        foregroundColor: Colors.white,
         icon: const Icon(Icons.add),
         label: const Text('Add synced folder'),
       ),
-      body: pairs.isEmpty
-          ? _emptyState(ctx)
-          : ListView.separated(
-              padding: const EdgeInsets.all(16),
-              itemCount: pairs.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 8),
-              itemBuilder: (_, i) {
-                final p = pairs[i];
-                final st = state.stateFor(p.id);
-                return Card(
-                  child: ExpansionTile(
-                    leading: _SyncBadge(
-                      state: st,
-                      isPeerConnected: p.peerDeviceId != null &&
-                          state.isPeerConnected(p.peerDeviceId!),
-                    ),
-                    title: Text(p.name),
-                    subtitle: Text(
-                      '${p.direction.label}\n${p.localPath}',
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                    children: [
-                      if (st != null) ...[
-                        Row(
-                          children: [
-                            Expanded(
-                              child: LinearProgressIndicator(
-                                value: st.progress,
-                                backgroundColor: Theme.of(ctx)
-                                    .colorScheme
-                                    .surfaceContainerHighest,
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Text(st.status ?? 'Idle'),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        if (st.lastSyncedAt != null)
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: Text(
-                              'Last synced: ${_fmtDateTime(st.lastSyncedAt!)}',
-                              style: Theme.of(ctx).textTheme.bodySmall,
-                            ),
-                          ),
-                        const SizedBox(height: 12),
-                      ],
-                      // Pending-invite indicator for pairs the peer hasn't
-                      // accepted yet.
-                      if (p.peerDeviceId != null &&
-                          st?.status?.contains('Waiting') == true)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Row(
-                            children: [
-                              const Icon(Icons.hourglass_top, size: 16),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  'Invite sent — waiting for the other device to accept.',
-                                  style: Theme.of(ctx).textTheme.bodySmall,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: () => Navigator.of(ctx).push(
-                                MaterialPageRoute(
-                                  builder: (_) => _PairDetailScreen(pair: p),
-                                ),
-                              ),
-                              icon: const Icon(Icons.list_alt),
-                              label: const Text('Details'),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: () => _syncNow(ctx, state, p),
-                              icon: const Icon(Icons.sync),
-                              label: const Text('Sync now'),
-                            ),
-                          ),
-                        ],
+      body: SafeArea(
+        child: ListView(
+          // Same content padding recipe as _OverviewPage — see that file's
+          // comment for the reference source (`.content{padding:26px 20px
+          // 100px}`, extra bottom room for the floating GlassNavBar).
+          padding: const EdgeInsets.fromLTRB(20, 22, 20, 110),
+          children: [
+            const GlassPageTitle('Folders'),
+            if (pairs.isEmpty)
+              _emptyState(ctx, c)
+            else ...[
+              const GlassSectionLabel('Folder pairs'),
+              for (final p in pairs)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: _FolderPairCard(
+                    pair: p,
+                    state: state,
+                    onDetails: () => Navigator.of(ctx).push(
+                      MaterialPageRoute(
+                        builder: (_) => _PairDetailScreen(pair: p),
                       ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: () => _showPairDialog(ctx, state, p),
-                              icon: const Icon(Icons.edit_outlined),
-                              label: const Text('Edit'),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          IconButton.outlined(
-                            onPressed: () => _confirmRemove(ctx, state, p.id),
-                            icon: const Icon(Icons.delete_outline),
-                            tooltip: 'Remove',
-                          ),
-                        ],
-                      ),
-                    ],
+                    ),
+                    onSyncNow: () => _syncNow(ctx, state, p),
+                    onEdit: () => _showPairDialog(ctx, state, p),
+                    onRemove: () => _confirmRemove(ctx, state, p.id),
                   ),
-                );
-              },
-            ),
+                ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 
-  Widget _emptyState(BuildContext ctx) {
-    return Center(
-      child: Padding(
+  Widget _emptyState(BuildContext ctx, GlassColors c) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 30),
+      child: GlassPanel(
         padding: const EdgeInsets.all(32),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.folder_copy_outlined,
-                size: 64, color: Theme.of(ctx).colorScheme.outline),
+            Icon(Icons.folder_copy_outlined, size: 56, color: c.textTertiary),
             const SizedBox(height: 16),
-            Text('No folders yet', style: Theme.of(ctx).textTheme.titleMedium),
+            Text(
+              'No folders yet',
+              style: GoogleFonts.manrope(
+                textStyle: TextStyle(
+                  color: c.textPrimary,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
             const SizedBox(height: 8),
-            const Text(
+            Text(
               'Tap "Add synced folder", pick a folder on this device, then '
               'send it to a paired device. The other device picks where the '
               'files should go, and syncing starts.',
               textAlign: TextAlign.center,
+              style: GoogleFonts.inter(
+                textStyle: TextStyle(color: c.textSecondary, fontSize: 13),
+              ),
             ),
           ],
         ),
@@ -371,6 +312,226 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// One folder pair's row on the Folders tab: a [GlassListTile] header (tap
+/// to expand/collapse) plus, when expanded, a second [GlassPanel] directly
+/// beneath it holding progress/last-synced info and the Details/Sync-now/
+/// Edit/Remove actions. See THINKING.md ("Folder pairs: the one real
+/// judgment call this pass") for why this shape was chosen over collapsing
+/// straight into [_PairDetailScreen] on tap.
+class _FolderPairCard extends StatefulWidget {
+  const _FolderPairCard({
+    required this.pair,
+    required this.state,
+    required this.onDetails,
+    required this.onSyncNow,
+    required this.onEdit,
+    required this.onRemove,
+  });
+
+  final FolderPair pair;
+  final AppState state;
+  final VoidCallback onDetails;
+  final VoidCallback onSyncNow;
+  final VoidCallback onEdit;
+  final VoidCallback onRemove;
+
+  @override
+  State<_FolderPairCard> createState() => _FolderPairCardState();
+}
+
+class _FolderPairCardState extends State<_FolderPairCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = GlassColors.of(context);
+    final p = widget.pair;
+    final st = widget.state.stateFor(p.id);
+    final status = st?.status ?? 'Idle';
+
+    // Same status -> dot-color/live mapping _OverviewPage uses for its own
+    // folder-pair rows — kept identical rather than reinventing a second
+    // status vocabulary for this screen (see THINKING.md).
+    final Color dotColor;
+    final bool live;
+    if (status == 'Error') {
+      dotColor = c.danger;
+      live = false;
+    } else if (status == 'Paused') {
+      dotColor = c.amber;
+      live = false;
+    } else if (status.startsWith('Idle')) {
+      dotColor = c.textTertiary;
+      live = false;
+    } else {
+      dotColor = c.mint;
+      live = true;
+    }
+
+    final pendingInvite =
+        p.peerDeviceId != null && (st?.status?.contains('Waiting') ?? false);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        GlassListTile(
+          leadingIcon: Icons.folder,
+          accentColor: c.violet,
+          title: p.name,
+          subtitle: '${p.direction.label} · $status',
+          subtitleDotColor: dotColor,
+          subtitleLive: live,
+          trailing: AnimatedRotation(
+            turns: _expanded ? 0.5 : 0,
+            duration: const Duration(milliseconds: 180),
+            child: Icon(Icons.expand_more, color: c.textTertiary),
+          ),
+          onTap: () => setState(() => _expanded = !_expanded),
+        ),
+        if (_expanded)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: GlassPanel(
+              // blur:false — same perf rule as GlassListTile: this panel
+              // multiplies per expanded pair, so it skips the real
+              // BackdropFilter (see glass.dart's `blur` param doc).
+              blur: false,
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    p.localPath,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.jetBrainsMono(
+                      textStyle: TextStyle(
+                        color: c.textSecondary,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ),
+                  if (st != null) ...[
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(4),
+                            child: LinearProgressIndicator(
+                              value: st.progress,
+                              minHeight: 4,
+                              color: c.violet,
+                              backgroundColor:
+                                  c.violet.withValues(alpha: 0.15),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Text(
+                          status,
+                          style: GoogleFonts.inter(
+                            textStyle: TextStyle(
+                              color: c.textSecondary,
+                              fontSize: 11.5,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (st.lastSyncedAt != null) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        'Last synced: ${_fmtDateTime(st.lastSyncedAt!)}',
+                        style: GoogleFonts.inter(
+                          textStyle: TextStyle(
+                            color: c.textTertiary,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                  if (pendingInvite) ...[
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Icon(Icons.hourglass_top, size: 15, color: c.amber),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Invite sent — waiting for the other device to '
+                            'accept.',
+                            style: GoogleFonts.inter(
+                              textStyle: TextStyle(
+                                color: c.textSecondary,
+                                fontSize: 11.5,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: GlassButton(
+                          icon: Icons.list_alt,
+                          label: 'Details',
+                          accentColor: c.violet,
+                          compact: true,
+                          onTap: widget.onDetails,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: GlassButton(
+                          icon: Icons.sync,
+                          label: 'Sync now',
+                          accentColor: c.teal,
+                          compact: true,
+                          onTap: widget.onSyncNow,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: GlassButton(
+                          icon: Icons.edit_outlined,
+                          label: 'Edit',
+                          accentColor: c.textSecondary,
+                          style: GlassButtonStyle.outline,
+                          compact: true,
+                          onTap: widget.onEdit,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: GlassButton(
+                          icon: Icons.delete_outline,
+                          label: 'Remove',
+                          accentColor: c.danger,
+                          style: GlassButtonStyle.outline,
+                          compact: true,
+                          onTap: widget.onRemove,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
@@ -708,102 +869,4 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
   }
 }
 
-class _SyncBadge extends StatefulWidget {
-  final PairSyncState? state;
-  final bool isPeerConnected;
 
-  const _SyncBadge({required this.state, required this.isPeerConnected});
-
-  @override
-  State<_SyncBadge> createState() => _SyncBadgeState();
-}
-
-class _SyncBadgeState extends State<_SyncBadge>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _rotationController;
-
-  @override
-  void initState() {
-    super.initState();
-    _rotationController = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 2),
-    );
-    _updateRotation();
-  }
-
-  @override
-  void didUpdateWidget(covariant _SyncBadge oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    _updateRotation();
-  }
-
-  void _updateRotation() {
-    final isSyncing = widget.state != null &&
-        (widget.state!.scanning || widget.state!.transferring);
-    if (isSyncing) {
-      if (!_rotationController.isAnimating) {
-        _rotationController.repeat();
-      }
-    } else {
-      _rotationController.stop();
-    }
-  }
-
-  @override
-  void dispose() {
-    _rotationController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final st = widget.state;
-    final isConnected = widget.isPeerConnected;
-
-    if (st == null || !isConnected) {
-      return const CircleAvatar(
-        backgroundColor: Colors.grey,
-        child: Icon(Icons.folder_off_outlined, color: Colors.white, size: 20),
-      );
-    }
-
-    final isSyncing = st.scanning || st.transferring;
-    final isError = st.status == 'Error';
-    final isSynced = st.status == 'Idle' && st.lastSyncedAt != null;
-
-    if (isSyncing) {
-      return RotationTransition(
-        turns: _rotationController,
-        child: CircleAvatar(
-          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
-          child: Icon(
-            Icons.sync,
-            color: Theme.of(context).colorScheme.onPrimaryContainer,
-            size: 20,
-          ),
-        ),
-      );
-    } else if (isError) {
-      return CircleAvatar(
-        backgroundColor: Colors.amber.shade800,
-        child: const Icon(Icons.warning_amber_rounded,
-            color: Colors.white, size: 20),
-      );
-    } else if (isSynced) {
-      return CircleAvatar(
-        backgroundColor: Colors.green.shade600,
-        child: const Icon(Icons.check, color: Colors.white, size: 20),
-      );
-    } else {
-      return CircleAvatar(
-        backgroundColor: Theme.of(context).colorScheme.secondaryContainer,
-        child: Icon(
-          Icons.folder_open_outlined,
-          color: Theme.of(context).colorScheme.onSecondaryContainer,
-          size: 20,
-        ),
-      );
-    }
-  }
-}

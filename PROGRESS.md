@@ -1666,3 +1666,83 @@ flashing on unrelated state changes, which would confirm this landed as
 intended.
 
 **Files touched:** `lib/src/ui/glass.dart` only.
+
+---
+
+## 2026-07-13 (session 2) — Glass redesign: Folders, Devices, Clipboard tabs
+
+Extended the glass redesign from Overview + Settings (both in
+`dashboard_screen.dart`, the only glass.dart consumer so far) to the three
+remaining primary tabs: Folders, Devices, and Clipboard. Confirmed before
+starting that `origin/main` HEAD (`86521b6`, the perf-fix commit on top of
+the exact-match redesign) is the version to build on — no revert or rework
+of `glass.dart` itself needed, this session only adds new consumers.
+
+**Folders tab (`folder_pairs_screen.dart`):** replaced the
+`Scaffold`+`AppBar`+`Card(ExpansionTile(...))` list with Overview's shell
+pattern (`GlassPageTitle` inline, no own `AppBar`) and a new local
+`_FolderPairCard` widget: a `GlassListTile` header (tap toggles
+expand/collapse) with a second `GlassPanel` appearing directly beneath it
+when expanded, holding progress/last-synced/pending-invite info and the
+Details/Sync now/Edit/Remove actions as `GlassButton`s. Preserves the
+original's one-tap-away actions rather than moving them behind a
+drill-down into `_PairDetailScreen`. Removed the now-unused `_SyncBadge`/
+`_SyncBadgeState` (rotating-avatar) classes — status is now conveyed by
+the same colored/glowing subtitle dot Overview already uses for its own
+folder-pair rows, for one consistent status vocabulary across the two
+screens instead of two slightly different ones. FAB kept as a real
+`FloatingActionButton.extended` (just recolored to the violet accent),
+not reskinned into a custom glass shape.
+
+**Devices tab (`pairing_screen.dart`):** replaced `TabController`/`TabBar`/
+`TabBarView` with a new local `_GlassSegmentedControl` (two-segment pill
+switcher) reusing `GlassNavBar`/`GlassNavRail`'s existing active-item
+recipe (violet gradient fill + white-alpha border) rather than inventing a
+new accent treatment. Paired-device and discovered-device lists reskinned
+with `GlassListTile`/`GlassPanel`/`GlassButton`; the paired-device row's
+`PopupMenuButton` (reconnect/disconnect/unpair) is kept as-is — same
+standard-Material carve-out `glass.dart`'s own doc comment gives dialogs/
+SnackBars/BottomSheets — only its trigger icon was restyled. Manual-connect
+QR flow reskinned; the QR code's white background container was
+deliberately *not* converted to a glass panel (a QR code needs real
+black-on-white contrast to scan reliably). `_ScanScreen` (the pushed
+camera route) is untouched, out of scope like other pushed sub-routes.
+
+**Clipboard tab (`clipboard_screen.dart`):** the most direct translation —
+every element already had a 1:1 `glass.dart` primitive: the sync toggle
+became a `GlassListTile` with a `Switch` trailing, the three info cards
+became `GlassPanel`s, and the send button reuses `GlassButton`'s existing
+`selected` state (checkmark + "Sent!") instead of building a separate
+result indicator. The original's inline spinner while sending isn't
+reproduced (`GlassButton` has no spinner slot) — disabling the button and
+swapping its icon to a sync glyph communicates the busy state instead, a
+small, deliberate simplification. Removed the now-unused `_Card` helper
+class (the interrupted cleanup from the end of the previous session,
+finished at the start of this one) since every one of its call sites is
+now a `GlassPanel`.
+
+**Design decisions and the reasoning behind each are written up in
+`THINKING.md`** (search "session 2") rather than repeated here — worth
+reading before reviewing the diff, especially the Folders expand/collapse
+call and the Devices segmented control, since neither has a reference
+mockup to check against.
+
+**Verification:** balanced-delimiter check clean on all three files (and
+`glass.dart`, unchanged, as a sanity check) — braces/parens/brackets all
+net zero. Cross-checked every `Glass*` widget call against its actual
+constructor signature in `glass.dart` (params and types match) rather than
+assuming from memory. No Flutter/Dart SDK in this sandbox, so — same
+standing caveat as every glass-related entry above — please run
+`flutter analyze` and a real build on both Windows and Android before
+merging. Nothing in `sync/engine.dart`, `app_state.dart`, or any
+protocol/wire code was touched; this is UI-layer only.
+
+**Files touched:** `lib/src/ui/folder_pairs_screen.dart`,
+`lib/src/ui/pairing_screen.dart`, `lib/src/ui/clipboard_screen.dart`.
+`glass.dart` and `dashboard_screen.dart` untouched this pass.
+
+**Remaining for future passes:** `_PairDetailScreen`, `_ScanScreen`,
+`VersionHistoryScreen`, `ActivityScreen`, `RemoteControlScreen`,
+`send_flow_view.dart`, `send_panel.dart`, `send_widget_screen.dart`, and
+all dialogs — same "pushed sub-routes and modal surfaces stay standard
+Material for now" boundary the redesign has followed since Settings.

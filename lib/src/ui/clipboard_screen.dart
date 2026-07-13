@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
+import 'glass.dart';
 
 /// Clipboard sync screen (Roadmap Phase 2).
 ///
@@ -29,157 +31,206 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
   @override
   Widget build(BuildContext ctx) {
     final state = ctx.watch<AppState>();
+    final c = GlassColors.of(ctx);
     final clipboard = state.clipboard;
     final enabled = state.config.clipboardSyncEnabled;
     final hasPeer = clipboard?.hasConnectedPeer() ?? false;
     final isAndroid = state.identity.platform == 'android';
 
+    // Shell matches _OverviewPage's pattern — see THINKING.md.
     return Scaffold(
-      appBar: AppBar(title: const Text('Clipboard sync')),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          // ---- Master toggle ------------------------------------------------
-          _Card(
-            child: SwitchListTile(
-              title: const Text('Sync clipboard'),
-              subtitle: Text(enabled
+      backgroundColor: Colors.transparent,
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 22, 20, 110),
+          children: [
+            const GlassPageTitle('Clipboard'),
+
+            // ---- Master toggle ---------------------------------------------
+            GlassListTile(
+              leadingIcon: enabled ? Icons.link : Icons.link_off,
+              accentColor: enabled ? c.violet : c.textSecondary,
+              title: 'Sync clipboard',
+              subtitle: enabled
                   ? hasPeer
                       ? (isAndroid
                           ? 'PC→phone auto · Phone→PC manual (tap below)'
-                          : 'PC→phone auto · clipboard changes sync automatically')
+                          : 'PC→phone auto · clipboard changes sync '
+                              'automatically')
                       : 'Enabled, but no peer connected'
-                  : 'Off — clipboard is not shared'),
-              value: enabled,
-              onChanged: (v) => state.setClipboardSyncEnabled(v),
-              secondary: Icon(
-                enabled ? Icons.link : Icons.link_off,
-                color: enabled
-                    ? Theme.of(ctx).colorScheme.primary
-                    : Theme.of(ctx).colorScheme.outline,
+                  : 'Off — clipboard is not shared',
+              trailing: Switch(
+                value: enabled,
+                onChanged: (v) => state.setClipboardSyncEnabled(v),
+                activeColor: c.violet,
               ),
             ),
-          ),
-          const SizedBox(height: 12),
+            const SizedBox(height: 12),
 
-          // ---- Connected devices -------------------------------------------
-          _Card(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            // ---- Connected devices ------------------------------------------
+            GlassPanel(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Row(
                     children: [
-                      Icon(Icons.devices,
-                          size: 18, color: Theme.of(ctx).colorScheme.outline),
+                      Icon(Icons.devices, size: 17, color: c.textTertiary),
                       const SizedBox(width: 8),
-                      Text('Connected devices',
-                          style: Theme.of(ctx).textTheme.titleSmall),
+                      Text(
+                        'Connected devices',
+                        style: GoogleFonts.manrope(
+                          textStyle: TextStyle(
+                            color: c.textPrimary,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
                     ],
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 10),
                   if (hasPeer) ...[
                     for (final peer in state.connectedPeers)
                       Padding(
-                        padding: const EdgeInsets.only(bottom: 4),
+                        padding: const EdgeInsets.only(bottom: 6),
                         child: Row(
                           children: [
-                            Icon(Icons.circle,
-                                size: 8, color: Colors.green.shade600),
+                            Container(
+                              width: 5,
+                              height: 5,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: c.mint,
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: c.mint.withValues(alpha: 0.9),
+                                    blurRadius: 6,
+                                  ),
+                                ],
+                              ),
+                            ),
                             const SizedBox(width: 8),
-                            Text(peer.name,
-                                style: Theme.of(ctx).textTheme.bodyMedium),
+                            Text(
+                              peer.name,
+                              style: GoogleFonts.inter(
+                                textStyle: TextStyle(
+                                  color: c.textPrimary,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
                           ],
                         ),
                       ),
                   ] else
                     Text(
                       enabled
-                          ? 'No peer connected — clipboard will sync when a peer connects'
+                          ? 'No peer connected — clipboard will sync when a '
+                              'peer connects'
                           : 'Enable clipboard sync to start',
-                      style: Theme.of(ctx).textTheme.bodyMedium?.copyWith(
-                            color: Theme.of(ctx).colorScheme.outline,
-                          ),
+                      style: GoogleFonts.inter(
+                        textStyle:
+                            TextStyle(color: c.textSecondary, fontSize: 12.5),
+                      ),
                     ),
                 ],
               ),
             ),
-          ),
-          const SizedBox(height: 12),
+            const SizedBox(height: 12),
 
-          // ---- Manual send (the streamlined flow) ---------------------------
-          // Present on both platforms. On PC it's an explicit action; on phone
-          // the QuickShare chip surfaces it with one tap from the copy action.
-          if (enabled && hasPeer)
-            _Card(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            // ---- Manual send (the streamlined flow) --------------------------
+            // Present on both platforms. On PC it's an explicit action; on
+            // phone the QuickShare chip surfaces it with one tap from the
+            // copy action.
+            if (enabled && hasPeer) ...[
+              GlassPanel(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Send clipboard now',
-                        style: Theme.of(ctx).textTheme.titleSmall),
+                    Text(
+                      'Send clipboard now',
+                      style: GoogleFonts.manrope(
+                        textStyle: TextStyle(
+                          color: c.textPrimary,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
                     const SizedBox(height: 4),
                     Text(
-                      'Reads your current clipboard and sends it to all connected devices.',
-                      style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
-                            color: Theme.of(ctx).colorScheme.outline,
-                          ),
+                      'Reads your current clipboard and sends it to all '
+                      'connected devices.',
+                      style: GoogleFonts.inter(
+                        textStyle:
+                            TextStyle(color: c.textSecondary, fontSize: 12),
+                      ),
                     ),
                     const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      child: FilledButton.icon(
-                        onPressed: _sending ? null : _sendClipboard,
-                        icon: _sending
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.send),
-                        label: Text(_sending
-                            ? 'Sending…'
-                            : _sendResultShown
-                                ? 'Sent!'
-                                : 'Send clipboard'),
-                      ),
+                    // GlassButton's built-in `selected` state already
+                    // renders a checkmark + "Sent!" — reused directly
+                    // instead of building a separate result indicator.
+                    // The original's inline CircularProgressIndicator
+                    // while sending isn't reproduced (GlassButton has no
+                    // spinner slot); disabling the button + an icon swap
+                    // to Icons.sync communicates the busy state instead,
+                    // a small, deliberate simplification.
+                    GlassButton(
+                      icon: _sending ? Icons.sync : Icons.send,
+                      label: _sending ? 'Sending…' : 'Send clipboard',
+                      accentColor: c.violet,
+                      style: GlassButtonStyle.primary,
+                      enabled: !_sending,
+                      selected: _sendResultShown,
+                      onTap: _sendClipboard,
                     ),
                   ],
                 ),
               ),
-            ),
+              const SizedBox(height: 12),
+            ],
 
-          // ---- Last received (content-free) ---------------------------------
-          if (enabled)
-            _Card(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            // ---- Last received (content-free) ---------------------------------
+            if (enabled)
+              GlassPanel(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Last received',
-                        style: Theme.of(ctx).textTheme.titleSmall),
+                    Text(
+                      'Last received',
+                      style: GoogleFonts.manrope(
+                        textStyle: TextStyle(
+                          color: c.textPrimary,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
                     const SizedBox(height: 4),
                     _lastReceivedAt != null
                         ? Text(
                             'From ${_lastReceivedFrom ?? "a device"} at '
                             '${_formatTime(_lastReceivedAt!)}',
-                            style: Theme.of(ctx).textTheme.bodyMedium,
+                            style: GoogleFonts.inter(
+                              textStyle: TextStyle(
+                                  color: c.textPrimary, fontSize: 12.5),
+                            ),
                           )
                         : Text(
                             'Nothing received yet',
-                            style: Theme.of(ctx).textTheme.bodyMedium?.copyWith(
-                                  color: Theme.of(ctx).colorScheme.outline,
-                                ),
+                            style: GoogleFonts.inter(
+                              textStyle: TextStyle(
+                                  color: c.textSecondary, fontSize: 12.5),
+                            ),
                           ),
                   ],
                 ),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -228,19 +279,5 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     final m = dt.minute.toString().padLeft(2, '0');
     final s = dt.second.toString().padLeft(2, '0');
     return '$h:$m:$s';
-  }
-}
-
-/// A styled card matching the app's Material 3 card theme.
-class _Card extends StatelessWidget {
-  const _Card({required this.child});
-  final Widget child;
-
-  @override
-  Widget build(BuildContext ctx) {
-    return Card(
-      margin: EdgeInsets.zero,
-      child: child,
-    );
   }
 }
