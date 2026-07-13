@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
-import '../desktop/background_survival_screen.dart';
 import '../desktop/tray.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
@@ -18,6 +17,19 @@ import 'send_panel.dart';
 import 'send_widget_screen.dart';
 import 'remote_control_screen.dart';
 import 'glass.dart';
+
+/// A fast 180 ms fade transition used for all pushed sub-screens.
+/// The default [MaterialPageRoute] slide takes ~300 ms and feels heavy on top
+/// of a glass UI that already has backdrop-blur compositing overhead.
+PageRoute<T> _fadeRoute<T>(WidgetBuilder builder) => PageRouteBuilder<T>(
+      pageBuilder: (ctx, _, secondary) => builder(ctx),
+      transitionDuration: const Duration(milliseconds: 180),
+      reverseTransitionDuration: const Duration(milliseconds: 140),
+      transitionsBuilder: (_, animation, secondary, child) => FadeTransition(
+        opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
+        child: child,
+      ),
+    );
 
 /// Responsive app shell. Desktop gets a NavigationRail; phones a BottomNav.
 ///
@@ -116,7 +128,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         // and doesn't get obscured or make the back stack confusing.
         Navigator.of(context).popUntil((route) => route.isFirst);
         Navigator.of(context).push(
-          MaterialPageRoute(builder: (_) => const SendPanel()),
+          _fadeRoute((_) => const SendPanel()),
         ).then((_) {
           _sendPanelPushed = false;
         });
@@ -201,28 +213,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     final desktopPages = [
       _OverviewPage(
-        state: state,
         onNavigate: (i) => setState(() => _index = i),
       ),
-      const FolderPairsScreen(),
-      const PairingScreen(),
-      const SendPanel(),
-      const ActivityScreen(),
-      const ClipboardScreen(),
-      const RemoteControlScreen(),
-      const BackgroundSurvivalScreen(),
+      const RepaintBoundary(child: FolderPairsScreen()),
+      const RepaintBoundary(child: PairingScreen()),
+      const RepaintBoundary(child: SendPanel()),
+      const RepaintBoundary(child: ActivityScreen()),
+      const RepaintBoundary(child: ClipboardScreen()),
+      const RepaintBoundary(child: RemoteControlScreen()),
+      const RepaintBoundary(child: _SettingsHubPage()),
     ];
 
     final mobilePages = [
       _OverviewPage(
-        state: state,
         onNavigate: (i) => setState(() => _index = i),
       ),
-      const FolderPairsScreen(),
-      const PairingScreen(),
-      const ClipboardScreen(),
-      const RemoteControlScreen(),
-      const _SettingsHubPage(),
+      const RepaintBoundary(child: FolderPairsScreen()),
+      const RepaintBoundary(child: PairingScreen()),
+      const RepaintBoundary(child: ClipboardScreen()),
+      const RepaintBoundary(child: RemoteControlScreen()),
+      const RepaintBoundary(child: _SettingsHubPage()),
     ];
 
     final activeIndex = isWide
@@ -262,47 +272,49 @@ class _DashboardScreenState extends State<DashboardScreen> {
               // No VerticalDivider here — GlassNavRail is a floating panel
               // with its own border/blur, so a hard-line divider next to it
               // reads as a glass rendering artifact rather than a boundary.
-              Expanded(child: desktopPages[activeIndex]),
+              Expanded(
+                child: desktopPages[activeIndex],
+              ),
             ],
           ),
         ),
       );
     }
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      // The nav bar floats above the content (its own blurred panel with
-      // margin on all sides), so the body needs to paint underneath it.
-      extendBody: true,
-      body: GlassBackground(child: mobilePages[activeIndex]),
-      bottomNavigationBar: GlassNavBar(
-        selectedIndex: activeIndex,
-        onDestinationSelected: (i) => setState(() => _index = i),
-        destinations: const [
-          GlassNavDestination(
-              icon: Icons.dashboard_outlined,
-              selectedIcon: Icons.dashboard,
-              label: 'Home'),
-          GlassNavDestination(
-              icon: Icons.folder_outlined,
-              selectedIcon: Icons.folder,
-              label: 'Folders'),
-          GlassNavDestination(
-              icon: Icons.devices_outlined,
-              selectedIcon: Icons.devices,
-              label: 'Devices'),
-          GlassNavDestination(
-              icon: Icons.content_copy_outlined,
-              selectedIcon: Icons.content_copy,
-              label: 'Clipboard'),
-          GlassNavDestination(
-              icon: Icons.settings_remote_outlined,
-              selectedIcon: Icons.settings_remote,
-              label: 'Remote'),
-          GlassNavDestination(
-              icon: Icons.settings_outlined,
-              selectedIcon: Icons.settings,
-              label: 'Settings'),
-        ],
+    return GlassBackground(
+      child: Scaffold(
+        backgroundColor: Colors.transparent,
+        extendBody: false,
+        body: mobilePages[activeIndex],
+        bottomNavigationBar: GlassNavBar(
+          selectedIndex: activeIndex,
+          onDestinationSelected: (i) => setState(() => _index = i),
+          destinations: const [
+            GlassNavDestination(
+                icon: Icons.dashboard_outlined,
+                selectedIcon: Icons.dashboard,
+                label: 'Home'),
+            GlassNavDestination(
+                icon: Icons.folder_outlined,
+                selectedIcon: Icons.folder,
+                label: 'Folders'),
+            GlassNavDestination(
+                icon: Icons.devices_outlined,
+                selectedIcon: Icons.devices,
+                label: 'Devices'),
+            GlassNavDestination(
+                icon: Icons.content_copy_outlined,
+                selectedIcon: Icons.content_copy,
+                label: 'Clipboard'),
+            GlassNavDestination(
+                icon: Icons.settings_remote_outlined,
+                selectedIcon: Icons.settings_remote,
+                label: 'Remote'),
+            GlassNavDestination(
+                icon: Icons.settings_outlined,
+                selectedIcon: Icons.settings,
+                label: 'Settings'),
+          ],
+        ),
       ),
     );
   }
@@ -456,21 +468,21 @@ class _NavRail extends StatelessWidget {
             selectedIcon: Icons.settings_remote,
             label: 'Remote'),
         GlassNavDestination(
-            icon: Icons.power_settings_new_outlined,
-            selectedIcon: Icons.power_settings_new,
-            label: 'Survival'),
+            icon: Icons.settings_outlined,
+            selectedIcon: Icons.settings,
+            label: 'Settings'),
       ],
     );
   }
 }
 
 class _OverviewPage extends StatelessWidget {
-  const _OverviewPage({required this.state, required this.onNavigate});
-  final AppState state;
+  const _OverviewPage({required this.onNavigate});
   final ValueChanged<int> onNavigate;
 
   @override
   Widget build(BuildContext ctx) {
+    final state = ctx.watch<AppState>();
     final c = GlassColors.of(ctx);
     final pairs = state.config.folderPairs;
     final connectedCount = state.pairedPeers
@@ -490,17 +502,49 @@ class _OverviewPage extends StatelessWidget {
         // padding (vs. the CSS's 100px) gives room for the floating
         // `GlassNavBar` on phones, same purpose the old trailing
         // `SizedBox(height: 90)` served.
-        padding: const EdgeInsets.fromLTRB(20, 22, 20, 110),
+        padding: const EdgeInsets.fromLTRB(20, 22, 20, 32),
         children: [
           const GlassPageTitle('Overview'),
-          GlassStatusBanner(
-            title: state.isStarted ? 'Sync is running' : 'Starting up…',
-            subtitle: state.isStarted
-                ? 'Connected to $connectedCount of ${state.pairedPeers.length} paired device(s)'
-                : 'Warming up identity and discovery',
-            icon: state.isStarted ? Icons.check_circle : Icons.hourglass_top,
-            accentColor: state.isStarted ? c.mint : c.amber,
-          ),
+          () {
+            final String title;
+            final String subtitle;
+            final IconData icon;
+            final Color accentColor;
+
+            if (!state.isStarted) {
+              title = 'Starting up…';
+              subtitle = 'Warming up identity and discovery';
+              icon = Icons.hourglass_top;
+              accentColor = c.amber;
+            } else if (state.isPaused) {
+              title = 'Sync is paused';
+              subtitle = 'Syncing is temporarily suspended';
+              icon = Icons.pause_circle_filled;
+              accentColor = c.amber;
+            } else if (state.pairedPeers.isEmpty) {
+              title = 'No paired devices';
+              subtitle = 'Pair a device in the Devices tab to start syncing';
+              icon = Icons.info_outline;
+              accentColor = c.blue;
+            } else if (connectedCount == 0) {
+              title = 'Waiting for connection';
+              subtitle = 'Searching for ${state.pairedPeers.length} paired device(s) on local network';
+              icon = Icons.sync;
+              accentColor = c.blue;
+            } else {
+              title = 'Sync is running';
+              subtitle = 'Connected to $connectedCount of ${state.pairedPeers.length} paired device(s)';
+              icon = Icons.check_circle;
+              accentColor = c.mint;
+            }
+
+            return GlassStatusBanner(
+              title: title,
+              subtitle: subtitle,
+              icon: icon,
+              accentColor: accentColor,
+            );
+          }(),
           const SizedBox(height: 26),
           const GlassSectionLabel('Folder pairs'),
           if (pairs.isEmpty)
@@ -615,7 +659,7 @@ class _OverviewPage extends StatelessWidget {
             trailing: Icon(Icons.chevron_right, color: c.textTertiary),
             onTap: () {
               Navigator.of(ctx).push(
-                MaterialPageRoute(builder: (_) => const SendPanel()),
+                _fadeRoute((_) => const SendPanel()),
               );
             },
           ),
@@ -754,8 +798,8 @@ class _InviteDialogState extends State<_InviteDialog> {
   }
 }
 
-/// A compact, premium Settings Hub page for mobile users (Roadmap Phase 5).
-/// Collapses "Send files", "Activity log", and "Keep alive" screens into one
+/// A compact, premium Settings Hub page (Roadmap Phase 5).
+/// Collapses "Send files", "Activity log", and execution settings into one
 /// easily accessible, clean and unified layout.
 class _SettingsHubPage extends StatelessWidget {
   const _SettingsHubPage();
@@ -767,122 +811,168 @@ class _SettingsHubPage extends StatelessWidget {
 
     return Scaffold(
       backgroundColor: Colors.transparent,
-      appBar: AppBar(
-        title: const Text('Settings'),
-        backgroundColor: Colors.transparent,
-        foregroundColor: c.textPrimary,
-        elevation: 0,
-        scrolledUnderElevation: 0,
-      ),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
-        children: [
-          // ---- Storage ----
-          // Each former Card(ListTile) row is now its own GlassListTile —
-          // that's the intended 1:1 replacement (see glass.dart doc comment)
-          // rather than one big panel with internal dividers.
-          GlassListTile(
-            leadingIcon: Icons.download,
-            accentColor: c.violet,
-            title: 'Received files folder',
-            subtitle: state.receivedFilesPath ??
-                (Platform.isWindows
-                    ? 'Defaults to Documents\\Sync'
-                    : 'Required: tap to pick folder'),
-            // Swaps the old red-text warning for a "Required" chip — the
-            // GlassListTile subtitle style is fixed, so the warning signal
-            // moves to the trailing slot instead of a color override.
-            trailing: (Platform.isAndroid && state.receivedFilesPath == null)
-                ? GlassChip(
-                    label: 'Required',
-                    icon: Icons.priority_high,
-                    accentColor: c.amber,
-                    filled: true,
-                  )
-                : Icon(Icons.edit_outlined, size: 20, color: c.textTertiary),
-            onTap: () async {
-              String? path;
-              if (Platform.isAndroid) {
-                path = await SafFileSystemAccess.pickTree();
-              } else {
-                path = await FilePicker.platform.getDirectoryPath();
-              }
-              if (path != null) {
-                await state.setReceivedFilesPath(path);
-              }
-            },
-          ),
-          const SizedBox(height: 10),
-          GlassListTile(
-            leadingIcon: Icons.history_outlined,
-            accentColor: c.violet,
-            title: 'Activity log',
-            subtitle: 'View history of sync operations and events',
-            trailing:
-                Icon(Icons.chevron_right, size: 20, color: c.textTertiary),
-            onTap: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const ActivityScreen()),
-              );
-            },
-          ),
-          const SizedBox(height: 10),
-          GlassListTile(
-            leadingIcon: Icons.power_settings_new_outlined,
-            accentColor: c.violet,
-            title: 'Keep alive',
-            subtitle: 'Execution controls and background battery settings',
-            trailing:
-                Icon(Icons.chevron_right, size: 20, color: c.textTertiary),
-            onTap: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                    builder: (_) => const BackgroundSurvivalScreen()),
-              );
-            },
-          ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 22, 20, 32),
+          children: [
+            const GlassPageTitle('Settings'),
 
-          const SizedBox(height: 20),
-
-          // ---- System (Android-only UI, but the section is always shown) ----
-          GlassSectionLabel('System'),
-          const SizedBox(height: 2),
-          // Notification visibility: show/hide the status-bar icon.
-          // Android only — on Windows there is no persistent notification.
-          if (Platform.isAndroid) ...[
+            // ---- Storage ----
+            // Each former Card(ListTile) row is now its own GlassListTile —
+            // that's the intended 1:1 replacement (see glass.dart doc comment)
+            // rather than one big panel with internal dividers.
             GlassListTile(
-              leadingIcon: Icons.notifications_outlined,
+              leadingIcon: Icons.download,
+              accentColor: c.violet,
+              title: 'Received files folder',
+              subtitle: state.receivedFilesPath ??
+                  (Platform.isWindows
+                      ? 'Defaults to Documents\\Sync'
+                      : 'Required: tap to pick folder'),
+              // Swaps the old red-text warning for a "Required" chip — the
+              // GlassListTile subtitle style is fixed, so the warning signal
+              // moves to the trailing slot instead of a color override.
+              trailing: (Platform.isAndroid && state.receivedFilesPath == null)
+                  ? GlassChip(
+                      label: 'Required',
+                      icon: Icons.priority_high,
+                      accentColor: c.amber,
+                      filled: true,
+                    )
+                  : Icon(Icons.edit_outlined, size: 20, color: c.textTertiary),
+              onTap: () async {
+                String? path;
+                if (Platform.isAndroid) {
+                  path = await SafFileSystemAccess.pickTree();
+                } else {
+                  path = await FilePicker.platform.getDirectoryPath();
+                }
+                if (path != null) {
+                  await state.setReceivedFilesPath(path);
+                }
+              },
+            ),
+            const SizedBox(height: 10),
+            GlassListTile(
+              leadingIcon: Icons.history_outlined,
+              accentColor: c.violet,
+              title: 'Activity log',
+              subtitle: 'View history of sync operations and events',
+              trailing:
+                  Icon(Icons.chevron_right, size: 20, color: c.textTertiary),
+              onTap: () {
+                Navigator.of(context).push(
+                  _fadeRoute((_) => const ActivityScreen()),
+                );
+              },
+            ),
+
+            const SizedBox(height: 20),
+
+            // ---- System (Android-only UI, but the section is always shown) ----
+            const GlassSectionLabel('System'),
+            const SizedBox(height: 2),
+            // Notification visibility: show/hide the status-bar icon.
+            // Android only — on Windows there is no persistent notification.
+            if (Platform.isAndroid) ...[
+              GlassListTile(
+                leadingIcon: Icons.notifications_outlined,
+                accentColor: c.teal,
+                title: 'Show in status bar',
+                subtitle:
+                    'Display a Conduit icon in the Android status bar while '
+                    'sync is running in the background.',
+                trailing: Switch(
+                  value: state.showPersistentNotification,
+                  onChanged: (v) => state.setShowPersistentNotification(v),
+                  activeColor: c.teal,
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+
+            // Battery-saver mode: 1-hour watcher cadence.
+            GlassListTile(
+              leadingIcon: Icons.battery_saver_outlined,
               accentColor: c.teal,
-              title: 'Show in status bar',
+              title: 'Battery saver mode',
               subtitle:
-                  'Display a Conduit icon in the Android status bar while '
-                  'sync is running in the background.',
+                  'Scan folders every hour instead of every 4\u202fs — greatly '
+                  'reduces battery use. Local changes sync with up to 1-hour delay.',
               trailing: Switch(
-                value: state.showPersistentNotification,
-                onChanged: (v) => state.setShowPersistentNotification(v),
+                value: state.batterySaverMode,
+                onChanged: (v) => state.setBatterySaverMode(v),
                 activeColor: c.teal,
               ),
             ),
-            const SizedBox(height: 10),
-          ],
 
-          // Battery-saver mode: 1-hour watcher cadence.
-          GlassListTile(
-            leadingIcon: Icons.battery_saver_outlined,
-            accentColor: c.teal,
-            title: 'Battery saver mode',
-            subtitle:
-                'Scan folders every hour instead of every 4\u202fs — greatly '
-                'reduces battery use. Local changes sync with up to 1-hour delay.',
-            trailing: Switch(
-              value: state.batterySaverMode,
-              onChanged: (v) => state.setBatterySaverMode(v),
-              activeColor: c.teal,
+            if (Platform.isAndroid) ...[
+              const SizedBox(height: 10),
+              GlassListTile(
+                leadingIcon: Icons.battery_saver_rounded,
+                accentColor: c.amber,
+                title: 'Battery optimization',
+                subtitle:
+                    'Set battery setting to "Unrestricted" so the OS doesn\'t interrupt background synchronization.',
+                trailing: GestureDetector(
+                  onTap: () => state.openBatteryOptimizationSettings(),
+                  child: GlassChip(
+                    label: 'Configure',
+                    icon: Icons.open_in_new_rounded,
+                    accentColor: c.amber,
+                  ),
+                ),
+              ),
+            ],
+
+            const SizedBox(height: 30),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: GlassButton(
+                icon: Icons.power_settings_new_rounded,
+                label: 'Quit Conduit',
+                accentColor: c.danger,
+                style: GlassButtonStyle.outline,
+                onTap: () => _confirmQuit(context, state),
+              ),
             ),
+            const SizedBox(height: 80),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Confirmation for the intentional Quit.
+  Future<void> _confirmQuit(BuildContext ctx, AppState state) async {
+    final ok = await showDialog<bool>(
+      context: ctx,
+      builder: (dctx) => AlertDialog(
+        title: const Text('Quit Conduit?'),
+        content: const Text(
+          'This stops sync completely and closes the app. Your folder pairs and '
+          'pairing are kept, and syncing resumes the next time you start '
+          'Conduit.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dctx).pop(false),
+            child: const Text('Cancel'),
           ),
-          const SizedBox(height: 90),
+          FilledButton.tonalIcon(
+            onPressed: () => Navigator.of(dctx).pop(true),
+            icon: const Icon(Icons.power_settings_new),
+            label: const Text('Quit'),
+          ),
         ],
       ),
     );
+    if (ok != true) return;
+    if (Platform.isWindows) {
+      await DesktopTray.quitApp(state);
+    } else {
+      await state.quit();
+      exit(0);
+    }
   }
 }

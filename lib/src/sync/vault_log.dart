@@ -93,7 +93,7 @@ class VaultLog {
   /// actual vaulted files on disk are unaffected either way) is treated as
   /// empty rather than surfacing an error to the UI.
   Future<List<VaultLogEntry>> all() async {
-    if (!await _file.exists()) return const [];
+    if (!await _file.exists()) return [];
     try {
       final raw = await _file.readAsString();
       final list = jsonDecode(raw) as List;
@@ -103,7 +103,7 @@ class VaultLog {
       entries.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       return entries;
     } catch (_) {
-      return const [];
+      return [];
     }
   }
 

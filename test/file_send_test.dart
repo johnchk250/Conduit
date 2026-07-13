@@ -213,6 +213,12 @@ class _FakeNotifier implements AppNotifier {
   String? receivedName;
 
   @override
+  void Function(String treeUri, String relPath)? onFileNotificationTap;
+
+  @override
+  void Function(String offerId)? onCancelReceiveTap;
+
+  @override
   Future<void> init() async {}
 
   @override
@@ -221,16 +227,23 @@ class _FakeNotifier implements AppNotifier {
   }
 
   @override
-  Future<void> showFileReceived(String name, String peerName) async {
+  Future<void> showFileReceived(String name, String peerName,
+      {String? treeUri}) async {
     receivedName = name;
   }
 
   @override
   Future<void> showReceiveProgress(
-      String name, int received, int total) async {}
+      String name, int received, int total, {required String offerId}) async {}
 
   @override
   Future<void> showSendProgress(String name, int sent, int total) async {}
+
+  @override
+  Future<void> cancelReceiveProgress(String name) async {}
+
+  @override
+  Future<void> cancelSendProgress(String name) async {}
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);

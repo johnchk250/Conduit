@@ -1,9 +1,11 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../core/config_store.dart';
+import 'glass.dart';
 
 /// The ad-hoc "send a file to a paired device" flow (Roadmap Phase 3d),
 /// factored out of the old `SendPanel` so it can be shared by two hosts:
@@ -20,7 +22,12 @@ import '../core/config_store.dart';
 /// and whether finishing a send asks the host to close via
 /// [onRequestClose] instead of resetting in place.
 class SendFlowView extends StatefulWidget {
-  const SendFlowView({super.key, this.compact = false, this.onRequestClose});
+  const SendFlowView({
+    super.key,
+    this.compact = false,
+    this.onRequestClose,
+    this.hideTitle = false,
+  });
 
   /// True for the small send-widget popup; false for the full "Send" tab.
   final bool compact;
@@ -30,6 +37,9 @@ class SendFlowView extends StatefulWidget {
   /// full mode, which just resets in place instead of trying to close
   /// anything — there's no popup to close.
   final VoidCallback? onRequestClose;
+
+  /// If true, suppresses rendering the default 'Send' page title inside the layout.
+  final bool hideTitle;
 
   @override
   State<SendFlowView> createState() => _SendFlowViewState();
@@ -418,7 +428,7 @@ class _SendFlowViewState extends State<SendFlowView> {
       _selectedPeer = connectedPeers.isNotEmpty ? connectedPeers.first : null;
     }
 
-    final theme = Theme.of(context);
+    final c = GlassColors.of(context);
     final fromShare = _sharedFiles != null && _sharedFiles!.isNotEmpty;
     final anyConnected = connectedPeers.isNotEmpty;
 
@@ -437,14 +447,14 @@ class _SendFlowViewState extends State<SendFlowView> {
     }
 
     return widget.compact
-        ? _buildCompactLayout(theme, state, fromShare, anyConnected)
-        : _buildFullLayout(theme, state, fromShare, anyConnected);
+        ? _buildCompactLayout(context, c, state, fromShare, anyConnected)
+        : _buildFullLayout(context, c, state, fromShare, anyConnected);
   }
 
   // ── Layouts ───────────────────────────────────────────────────────────────
 
   Widget _buildCompactLayout(
-      ThemeData theme, AppState state, bool fromShare, bool anyConnected) {
+      BuildContext context, GlassColors c, AppState state, bool fromShare, bool anyConnected) {
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
       child: Column(
@@ -452,85 +462,51 @@ class _SendFlowViewState extends State<SendFlowView> {
         mainAxisSize: MainAxisSize.min,
         children: [
           if (fromShare && _phase == _SendPhase.idle) ...[
-            _buildSharedBanner(theme, compact: true),
+            _buildSharedBanner(context, c, compact: true),
             const SizedBox(height: 12),
           ],
-          _sectionLabel(theme, 'SEND TO'),
-          const SizedBox(height: 8),
-          _buildDeviceRow(theme, state),
+          const GlassSectionLabel('SEND TO'),
+          const SizedBox(height: 4),
+          _buildDeviceRow(context, c, state),
           const SizedBox(height: 16),
-          _buildMainContent(theme, state, anyConnected),
+          _buildMainContent(context, c, state, anyConnected),
         ],
       ),
     );
   }
 
   Widget _buildFullLayout(
-      ThemeData theme, AppState state, bool fromShare, bool anyConnected) {
+      BuildContext context, GlassColors c, AppState state, bool fromShare, bool anyConnected) {
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 640),
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              if (fromShare && _phase == _SendPhase.idle) ...[
-                _buildSharedBanner(theme, compact: false),
-                const SizedBox(height: 16),
-              ],
-              Card(
-                elevation: 0,
-                color: theme.colorScheme.surfaceContainerLow,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16)),
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _sectionLabel(theme, 'SEND TO'),
-                      const SizedBox(height: 10),
-                      _buildDeviceRow(theme, state),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 20),
-              Expanded(
-                child: Card(
-                  elevation: 0,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    side: BorderSide(color: theme.colorScheme.outlineVariant),
-                  ),
-                  child: Center(
-                      child: _buildMainContent(theme, state, anyConnected)),
-                ),
-              ),
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 22, 20, 32),
+          children: [
+            if (!widget.hideTitle) const GlassPageTitle('Send'),
+            if (fromShare && _phase == _SendPhase.idle) ...[
+              _buildSharedBanner(context, c, compact: false),
+              const SizedBox(height: 16),
             ],
-          ),
+            const GlassSectionLabel('SEND TO'),
+            GlassPanel(
+              padding: const EdgeInsets.all(12),
+              child: _buildDeviceRow(context, c, state),
+            ),
+            const SizedBox(height: 20),
+            _buildMainContent(context, c, state, anyConnected),
+          ],
         ),
       ),
     );
   }
 
-  Widget _sectionLabel(ThemeData theme, String text) => Text(
-        text,
-        style: theme.textTheme.labelSmall?.copyWith(
-          color: theme.colorScheme.outline,
-          letterSpacing: 0.6,
-          fontWeight: FontWeight.w600,
-        ),
-      );
-
   // ── Device row ────────────────────────────────────────────────────────────
 
-  Widget _buildDeviceRow(ThemeData theme, AppState state) {
+  Widget _buildDeviceRow(BuildContext context, GlassColors c, AppState state) {
     final peers = state.pairedPeers;
     if (peers.isEmpty) {
-      return _buildNoPeersEmptyState(theme);
+      return _buildNoPeersEmptyState(context, c);
     }
     final connectedIds = state.connectedPeers.map((p) => p.deviceId).toSet();
     return SizedBox(
@@ -556,23 +532,21 @@ class _SendFlowViewState extends State<SendFlowView> {
     );
   }
 
-  Widget _buildNoPeersEmptyState(ThemeData theme) {
-    return Container(
+  Widget _buildNoPeersEmptyState(BuildContext context, GlassColors c) {
+    return GlassPanel(
       padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.errorContainer.withValues(alpha: 0.5),
-        borderRadius: BorderRadius.circular(14),
-      ),
+      ringColor: c.danger,
       child: Row(
         children: [
-          Icon(Icons.link_off, color: theme.colorScheme.error, size: 20),
+          Icon(Icons.link_off_rounded, color: c.danger, size: 20),
           const SizedBox(width: 12),
           Expanded(
             child: Text(
               'No paired devices yet. Pair a device first, then come back '
               'here to send.',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.error),
+              style: GoogleFonts.inter(
+                textStyle: TextStyle(color: c.danger, fontSize: 12.5),
+              ),
             ),
           ),
         ],
@@ -582,23 +556,11 @@ class _SendFlowViewState extends State<SendFlowView> {
 
   // ── Shared-files banner (Phase 3d) ──────────────────────────────────────
 
-  Widget _buildSharedBanner(ThemeData theme, {required bool compact}) {
-    return Container(
+  Widget _buildSharedBanner(BuildContext context, GlassColors c, {required bool compact}) {
+    return GlassPanel(
+      ringColor: c.violet,
       padding: EdgeInsets.symmetric(
           horizontal: compact ? 14 : 20, vertical: compact ? 10 : 16),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [
-            theme.colorScheme.primary.withValues(alpha: 0.16),
-            theme.colorScheme.primary.withValues(alpha: 0.04),
-          ],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-            color: theme.colorScheme.primary.withValues(alpha: 0.25)),
-      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
@@ -606,16 +568,16 @@ class _SendFlowViewState extends State<SendFlowView> {
           Row(
             children: [
               Icon(Icons.share_rounded,
-                  size: compact ? 16 : 20, color: theme.colorScheme.primary),
+                  size: compact ? 16 : 20, color: c.violet),
               const SizedBox(width: 8),
               Text(
                 'Ready to send',
-                style: (compact
-                        ? theme.textTheme.labelMedium
-                        : theme.textTheme.titleMedium)
-                    ?.copyWith(
-                  fontWeight: FontWeight.bold,
-                  color: theme.colorScheme.primary,
+                style: GoogleFonts.manrope(
+                  textStyle: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: c.violet,
+                    fontSize: compact ? 14 : 16,
+                  ),
                 ),
               ),
             ],
@@ -626,12 +588,11 @@ class _SendFlowViewState extends State<SendFlowView> {
             runSpacing: 6,
             children: [
               for (final f in (_sharedFiles ?? const <PendingSharedFile>[]))
-                Chip(
-                  visualDensity: VisualDensity.compact,
-                  avatar: const Icon(Icons.insert_drive_file, size: 14),
-                  label: Text(f.name, overflow: TextOverflow.ellipsis),
-                  deleteIcon: const Icon(Icons.close, size: 14),
-                  onDeleted: () => setState(() {
+                GlassChip(
+                  label: f.name,
+                  icon: Icons.insert_drive_file_rounded,
+                  accentColor: c.textSecondary,
+                  onTap: () => setState(() {
                     _sharedFiles = List.of(_sharedFiles!)..remove(f);
                   }),
                 ),
@@ -644,40 +605,27 @@ class _SendFlowViewState extends State<SendFlowView> {
 
   // ── Main content states ──────────────────────────────────────────────────
 
-  Widget _buildMainContent(ThemeData theme, AppState state, bool anyConnected) {
+  Widget _buildMainContent(BuildContext context, GlassColors c, AppState state, bool anyConnected) {
     switch (_phase) {
       case _SendPhase.sending:
-        return _buildSendingState(theme);
+        return _buildSendingState(context, c);
       case _SendPhase.done:
       case _SendPhase.error:
-        return _buildResultState(theme);
+        return _buildResultState(context, c);
       case _SendPhase.idle:
         return _hasFiles
-            ? _buildReadyState(theme, state, anyConnected)
-            : _buildPickState(theme, anyConnected);
+            ? _buildReadyState(context, c, state, anyConnected)
+            : _buildPickState(context, c, anyConnected);
     }
   }
 
-  Widget _buildPickState(ThemeData theme, bool anyConnected) {
+  Widget _buildPickState(BuildContext context, GlassColors c, bool anyConnected) {
+    final accent = anyConnected ? c.violet : c.textTertiary;
     return InkWell(
       onTap: anyConnected ? _pickAndQueueFiles : null,
       borderRadius: BorderRadius.circular(18),
-      child: Container(
-        width: double.infinity,
+      child: GlassPanel(
         padding: EdgeInsets.all(widget.compact ? 20 : 32),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(
-            color: anyConnected
-                ? theme.colorScheme.primary.withValues(alpha: 0.35)
-                : theme.colorScheme.outlineVariant,
-            width: 1.6,
-          ),
-          color: anyConnected
-              ? theme.colorScheme.primary.withValues(alpha: 0.04)
-              : theme.colorScheme.surfaceContainerHighest
-                  .withValues(alpha: 0.4),
-        ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -686,27 +634,29 @@ class _SendFlowViewState extends State<SendFlowView> {
               height: widget.compact ? 60 : 92,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: anyConnected
-                    ? theme.colorScheme.primaryContainer
-                    : theme.colorScheme.surfaceContainerHighest,
+                gradient: RadialGradient(
+                  colors: [
+                    accent.withValues(alpha: 0.2),
+                    accent.withValues(alpha: 0.05),
+                  ],
+                ),
+                border: Border.all(color: accent.withValues(alpha: 0.3)),
               ),
               child: Icon(
-                Icons.upload_file,
+                Icons.upload_file_rounded,
                 size: widget.compact ? 28 : 44,
-                color: anyConnected
-                    ? theme.colorScheme.onPrimaryContainer
-                    : theme.colorScheme.outline,
+                color: accent,
               ),
             ),
             SizedBox(height: widget.compact ? 14 : 24),
             Text(
               'Click to choose files',
-              style: (widget.compact
-                      ? theme.textTheme.titleSmall
-                      : theme.textTheme.titleMedium)
-                  ?.copyWith(
-                fontWeight: FontWeight.bold,
-                color: anyConnected ? null : theme.colorScheme.outline,
+              style: GoogleFonts.manrope(
+                textStyle: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: anyConnected ? c.textPrimary : c.textTertiary,
+                  fontSize: widget.compact ? 15 : 17,
+                ),
               ),
               textAlign: TextAlign.center,
             ),
@@ -716,8 +666,9 @@ class _SendFlowViewState extends State<SendFlowView> {
                   ? 'Or share from any app — Conduit shows up in your '
                       'share sheet automatically.'
                   : 'Connect a device first, then pick a file to send.',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.outline),
+              style: GoogleFonts.inter(
+                textStyle: TextStyle(color: c.textSecondary, fontSize: 12.5),
+              ),
               textAlign: TextAlign.center,
             ),
           ],
@@ -726,9 +677,9 @@ class _SendFlowViewState extends State<SendFlowView> {
     );
   }
 
-  Widget _buildReadyState(ThemeData theme, AppState state, bool anyConnected) {
+  Widget _buildReadyState(BuildContext context, GlassColors c, AppState state, bool anyConnected) {
     final names = _fileNames;
-    return Padding(
+    return GlassPanel(
       padding: EdgeInsets.all(widget.compact ? 16 : 24),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -737,25 +688,37 @@ class _SendFlowViewState extends State<SendFlowView> {
             width: widget.compact ? 64 : 80,
             height: widget.compact ? 64 : 80,
             decoration: BoxDecoration(
-              color: theme.colorScheme.primaryContainer,
               shape: BoxShape.circle,
+              gradient: RadialGradient(
+                colors: [
+                  c.violet.withValues(alpha: 0.2),
+                  c.violet.withValues(alpha: 0.05),
+                ],
+              ),
+              border: Border.all(color: c.violet.withValues(alpha: 0.3)),
             ),
-            child: Icon(Icons.insert_drive_file,
+            child: Icon(Icons.insert_drive_file_rounded,
                 size: widget.compact ? 30 : 40,
-                color: theme.colorScheme.onPrimaryContainer),
+                color: c.violet),
           ),
           SizedBox(height: widget.compact ? 12 : 20),
           Text(
             '$_fileCount file${_fileCount == 1 ? '' : 's'} ready',
-            style: theme.textTheme.titleMedium
-                ?.copyWith(fontWeight: FontWeight.bold),
+            style: GoogleFonts.manrope(
+              textStyle: TextStyle(
+                color: c.textPrimary,
+                fontWeight: FontWeight.bold,
+                fontSize: 16.5,
+              ),
+            ),
           ),
           const SizedBox(height: 6),
           Text(
             names.take(4).join(', ') +
                 (names.length > 4 ? ', +${names.length - 4} more' : ''),
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.outline),
+            style: GoogleFonts.inter(
+              textStyle: TextStyle(color: c.textSecondary, fontSize: 12.5),
+            ),
             textAlign: TextAlign.center,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
@@ -764,22 +727,26 @@ class _SendFlowViewState extends State<SendFlowView> {
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              OutlinedButton.icon(
-                onPressed: anyConnected ? _pickAndQueueFiles : null,
-                icon: const Icon(Icons.add),
-                label: const Text('Add'),
+              GlassButton(
+                icon: Icons.add_rounded,
+                label: 'Add',
+                accentColor: c.violet,
+                style: GlassButtonStyle.outline,
+                enabled: anyConnected,
+                onTap: _pickAndQueueFiles,
+                compact: true,
               ),
               const SizedBox(width: 10),
-              FilledButton.icon(
-                onPressed: (anyConnected && _selectedPeer != null)
-                    ? () => _sendFiles(state)
-                    : null,
-                icon: const Icon(Icons.send),
-                label: Text(
-                  _selectedPeer != null
-                      ? 'Send to ${_selectedPeer!.name}'
-                      : 'Send',
-                ),
+              GlassButton(
+                icon: Icons.send_rounded,
+                label: _selectedPeer != null
+                    ? 'Send to ${_selectedPeer!.name}'
+                    : 'Send',
+                accentColor: c.violet,
+                style: GlassButtonStyle.primary,
+                enabled: anyConnected && _selectedPeer != null,
+                onTap: () => _sendFiles(state),
+                compact: true,
               ),
             ],
           ),
@@ -788,20 +755,25 @@ class _SendFlowViewState extends State<SendFlowView> {
     );
   }
 
-  Widget _buildSendingState(ThemeData theme) {
+  Widget _buildSendingState(BuildContext context, GlassColors c) {
     final speed = _speedLabel;
     final eta = _etaLabel(_currentSentBytes, _currentTotalBytes);
-    return Padding(
+    return GlassPanel(
       padding: EdgeInsets.all(widget.compact ? 20 : 32),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          _TransferRing(progress: _currentProgress),
+          _TransferRing(progress: _currentProgress, color: c.violet),
           SizedBox(height: widget.compact ? 14 : 22),
           Text(
             _currentFileName ?? 'Sending…',
-            style: theme.textTheme.titleSmall
-                ?.copyWith(fontWeight: FontWeight.bold),
+            style: GoogleFonts.manrope(
+              textStyle: TextStyle(
+                color: c.textPrimary,
+                fontWeight: FontWeight.bold,
+                fontSize: 14.5,
+              ),
+            ),
             textAlign: TextAlign.center,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
@@ -810,8 +782,7 @@ class _SendFlowViewState extends State<SendFlowView> {
             const SizedBox(height: 2),
             Text(
               'File $_currentIndex of $_totalInBatch',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.outline),
+              style: TextStyle(color: c.textSecondary, fontSize: 12),
             ),
           ],
           const SizedBox(height: 8),
@@ -821,50 +792,59 @@ class _SendFlowViewState extends State<SendFlowView> {
             children: [
               Text(
                 _formatBytesProgress(_currentSentBytes, _currentTotalBytes),
-                style: theme.textTheme.bodySmall
-                    ?.copyWith(color: theme.colorScheme.outline),
+                style: TextStyle(color: c.textSecondary, fontSize: 12),
               ),
               if (speed != null)
                 Text(speed,
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: theme.colorScheme.outline)),
+                    style: TextStyle(color: c.textSecondary, fontSize: 12)),
               if (eta != null && !_transferPaused && !_cancelRequested)
                 Text(eta,
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: theme.colorScheme.outline)),
+                    style: TextStyle(color: c.textSecondary, fontSize: 12)),
               if (_transferPaused)
                 Text('Paused',
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: theme.colorScheme.primary)),
+                    style: TextStyle(
+                      color: c.violet,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    )),
               if (_cancelRequested)
                 Text('Cancelling...',
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: theme.colorScheme.error)),
+                    style: TextStyle(
+                      color: c.danger,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    )),
             ],
           ),
           const SizedBox(height: 18),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              OutlinedButton.icon(
-                onPressed: _cancelRequested
-                    ? null
-                    : () {
-                        final state = context.read<AppState>();
-                        _transferPaused
-                            ? _resumeActiveTransfer(state)
-                            : _pauseActiveTransfer(state);
-                      },
-                icon: Icon(_transferPaused ? Icons.play_arrow : Icons.pause),
-                label: Text(_transferPaused ? 'Resume' : 'Pause'),
+              GlassButton(
+                icon: _transferPaused
+                    ? Icons.play_arrow_rounded
+                    : Icons.pause_rounded,
+                label: _transferPaused ? 'Resume' : 'Pause',
+                accentColor: c.violet,
+                style: GlassButtonStyle.outline,
+                enabled: !_cancelRequested,
+                onTap: () {
+                  final state = context.read<AppState>();
+                  _transferPaused
+                      ? _resumeActiveTransfer(state)
+                      : _pauseActiveTransfer(state);
+                },
+                compact: true,
               ),
               const SizedBox(width: 10),
-              OutlinedButton.icon(
-                onPressed: _cancelRequested
-                    ? null
-                    : () => _cancelActiveTransfer(context.read<AppState>()),
-                icon: const Icon(Icons.close),
-                label: const Text('Cancel'),
+              GlassButton(
+                icon: Icons.close_rounded,
+                label: 'Cancel',
+                accentColor: c.danger,
+                style: GlassButtonStyle.outline,
+                enabled: !_cancelRequested,
+                onTap: () => _cancelActiveTransfer(context.read<AppState>()),
+                compact: true,
               ),
             ],
           ),
@@ -873,10 +853,10 @@ class _SendFlowViewState extends State<SendFlowView> {
     );
   }
 
-  Widget _buildResultState(ThemeData theme) {
+  Widget _buildResultState(BuildContext context, GlassColors c) {
     final isSuccess = _phase == _SendPhase.done;
-    final color = isSuccess ? Colors.green : theme.colorScheme.error;
-    return Padding(
+    final color = isSuccess ? c.mint : c.danger;
+    return GlassPanel(
       padding: EdgeInsets.all(widget.compact ? 20 : 32),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -901,8 +881,13 @@ class _SendFlowViewState extends State<SendFlowView> {
           const SizedBox(height: 18),
           Text(
             _resultMessage ?? (isSuccess ? 'Sent!' : 'Send failed'),
-            style: theme.textTheme.titleMedium
-                ?.copyWith(fontWeight: FontWeight.bold),
+            style: GoogleFonts.manrope(
+              textStyle: TextStyle(
+                color: c.textPrimary,
+                fontWeight: FontWeight.bold,
+                fontSize: 16,
+              ),
+            ),
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 20),
@@ -910,18 +895,25 @@ class _SendFlowViewState extends State<SendFlowView> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               if (!isSuccess) ...[
-                OutlinedButton.icon(
-                  onPressed: () => setState(() {
+                GlassButton(
+                  icon: Icons.refresh_rounded,
+                  label: 'Try again',
+                  accentColor: c.violet,
+                  style: GlassButtonStyle.outline,
+                  onTap: () => setState(() {
                     _phase = _SendPhase.idle;
                     _resultMessage = null;
                   }),
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('Try again'),
+                  compact: true,
                 ),
                 const SizedBox(width: 12),
               ],
-              FilledButton.icon(
-                onPressed: () {
+              GlassButton(
+                icon: widget.compact ? Icons.close_rounded : Icons.add_rounded,
+                label: widget.compact ? 'Close' : 'Send more',
+                accentColor: c.violet,
+                style: GlassButtonStyle.primary,
+                onTap: () {
                   setState(() {
                     _phase = _SendPhase.idle;
                     _resultMessage = null;
@@ -930,8 +922,7 @@ class _SendFlowViewState extends State<SendFlowView> {
                   });
                   if (widget.compact) widget.onRequestClose?.call();
                 },
-                icon: Icon(widget.compact ? Icons.close : Icons.add),
-                label: Text(widget.compact ? 'Close' : 'Send more'),
+                compact: true,
               ),
             ],
           ),
@@ -1012,20 +1003,21 @@ class _DeviceChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+    final c = GlassColors.of(context);
     final icon =
-        peer.platform == 'windows' ? Icons.computer : Icons.phone_android;
-    final ringColor = selected ? theme.colorScheme.primary : Colors.transparent;
-    final avatarColor = !connected
-        ? theme.colorScheme.surfaceContainerHighest
+        peer.platform == 'windows' ? Icons.computer_rounded : Icons.phone_android_rounded;
+
+    final Color ringColor = selected ? c.violet : Colors.transparent;
+    final Color avatarColor = !connected
+        ? c.textTertiary.withValues(alpha: 0.1)
         : selected
-            ? theme.colorScheme.primaryContainer
-            : theme.colorScheme.secondaryContainer;
-    final iconColor = !connected
-        ? theme.colorScheme.outline
+            ? c.violet.withValues(alpha: 0.25)
+            : c.textTertiary.withValues(alpha: 0.15);
+    final Color iconColor = !connected
+        ? c.textTertiary
         : selected
-            ? theme.colorScheme.onPrimaryContainer
-            : theme.colorScheme.onSecondaryContainer;
+            ? c.violet
+            : c.textSecondary;
 
     return InkWell(
       onTap: onTap,
@@ -1067,10 +1059,10 @@ class _DeviceChip extends StatelessWidget {
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
                         color: connected
-                            ? Colors.green.shade500
-                            : theme.colorScheme.outlineVariant,
+                            ? c.mint
+                            : c.textTertiary,
                         border: Border.all(
-                            color: theme.colorScheme.surface, width: 2),
+                            color: c.bgMid, width: 2),
                       ),
                     ),
                   ),
@@ -1082,9 +1074,12 @@ class _DeviceChip extends StatelessWidget {
               width: 72,
               child: Text(
                 peer.name,
-                style: theme.textTheme.labelSmall?.copyWith(
-                  fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-                  color: connected ? null : theme.colorScheme.outline,
+                style: GoogleFonts.manrope(
+                  textStyle: TextStyle(
+                    fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+                    color: connected ? c.textPrimary : c.textTertiary,
+                    fontSize: 11,
+                  ),
                 ),
                 textAlign: TextAlign.center,
                 maxLines: 1,
@@ -1102,15 +1097,16 @@ class _DeviceChip extends StatelessWidget {
 /// animated progress ring (smoothly tweening between progress updates
 /// instead of jumping) with an arrow glyph at its center.
 class _TransferRing extends StatelessWidget {
-  const _TransferRing({required this.progress});
+  const _TransferRing({required this.progress, required this.color});
 
   /// 0.0–1.0. Expected to already be in range — the source computation
   /// (`sentBytes / totalBytes`, both from the wire) can't exceed it.
   final double progress;
+  final Color color;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+    final c = GlassColors.of(context);
     return SizedBox(
       width: 108,
       height: 108,
@@ -1125,12 +1121,12 @@ class _TransferRing extends StatelessWidget {
               child: CircularProgressIndicator(
                 value: value,
                 strokeWidth: 7,
-                backgroundColor: theme.colorScheme.surfaceContainerHighest,
-                color: theme.colorScheme.primary,
+                backgroundColor: c.textTertiary.withValues(alpha: 0.15),
+                color: color,
               ),
             ),
           ),
-          Icon(Icons.arrow_upward, size: 34, color: theme.colorScheme.primary),
+          Icon(Icons.arrow_upward_rounded, size: 34, color: color),
         ],
       ),
     );

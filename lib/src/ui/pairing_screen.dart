@@ -11,6 +11,17 @@ import '../core/config_store.dart';
 import '../net/discovery.dart';
 import 'glass.dart';
 
+/// Fast 180 ms fade push for the QR scan sub-screen.
+PageRoute<T> _fadeRoute<T>(WidgetBuilder builder) => PageRouteBuilder<T>(
+      pageBuilder: (ctx, _, secondary) => builder(ctx),
+      transitionDuration: const Duration(milliseconds: 180),
+      reverseTransitionDuration: const Duration(milliseconds: 140),
+      transitionsBuilder: (_, animation, secondary, child) => FadeTransition(
+        opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
+        child: child,
+      ),
+    );
+
 /// Human-friendly explanation for a pairing/socket failure. Detects the
 /// common "firewall / device unreachable" case from the exception and returns
 /// an actionable message (with the firewall command for the PC), instead of
@@ -185,7 +196,7 @@ class _DiscoveredList extends StatelessWidget {
 
     final c = GlassColors.of(ctx);
     return ListView(
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 110),
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
       children: [
         GlassSectionLabel('Paired devices (${paired.length})'),
         if (paired.isEmpty)
@@ -515,7 +526,7 @@ class _ManualConnect extends StatelessWidget {
     final state = ctx.watch<AppState>();
     final c = GlassColors.of(ctx);
     return ListView(
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 110),
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
       children: [
         Text(
           'Show this QR on the other device',
@@ -622,7 +633,7 @@ class _ManualConnect extends StatelessWidget {
 
   Future<void> _scan(BuildContext ctx, AppState state) async {
     final token = await Navigator.of(ctx).push<String>(
-      MaterialPageRoute(builder: (sctx) => const _ScanScreen()),
+      _fadeRoute((sctx) => const _ScanScreen()),
     );
     if (token == null) return;
 

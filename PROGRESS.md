@@ -5,6 +5,95 @@
 
 ---
 
+## 2026-07-14 (session 2) — UI Cleanup + Open Received File from Notification
+
+**Context:** Two related requests landed in one session:
+1. Simplify the Keep Alive / Survival tab — it had grown redundant once the foreground service was reliable. Consolidate its useful controls elsewhere and remove the tab.
+2. Tapping the "File received" system notification should open the received file directly (like KDE Connect does), not just bring the Conduit app to the foreground.
+
+**What was implemented:**
+
+**UI Cleanup (no new packages needed):**
+- **Removed Keep Alive tab** — deleted `lib/src/desktop/background_survival_screen.dart` entirely (the foreground-service machinery still runs; only the dedicated guidance screen is gone). The desktop nav-rail destination now points to `_SettingsHubPage` instead.
+- **Settings screen redesign** (`dashboard_screen.dart`):
+  - Removed the `AppBar`; uses inline `GlassPageTitle('Settings')` for glassmorphic consistency with every other tab.
+  - Added an **Android-only Battery Optimization** config tile under a "System" section (calls `openBatterySettings` via the existing `conduit/sync_service` channel).
+  - Added a prominent **Quit Conduit** button at the very bottom of the Settings page, behind a teardown/exit confirmation dialog.
+- **Sync Pause/Resume on Folders tab** (`folder_pairs_screen.dart`) — added a "Sync enabled" `SwitchListTile`-style `GlassListTile` directly under the page title. Users can pause/resume syncing from the same screen where their folder pairs live, without diving into Settings.
+- **Dashboard status banner** (`dashboard_screen.dart` `_OverviewPage`) — the banner now reflects real state instead of always showing "Sync is running":
+  - `Starting up…` → engine boot
+  - `Sync is paused` → user toggled sync off
+  - `No paired devices` → config empty
+  - `Waiting for connection…` → peers configured but none live
+  - `Sync is running` → at least one peer actively connected
+
+**Open Received File from Notification:**
+- **`SafOps.kt`** — new `openFile` SAF method: calls the existing `resolve(ctx, treeUri, relPath)` helper to get the document URI, queries `contentResolver.getType()` for the MIME type (falling back to file extension, then `application/octet-stream`), and fires `Intent.ACTION_VIEW` with `FLAG_GRANT_READ_URI_PERMISSION`. Android opens the file in the appropriate system app (gallery, PDF reader, video player, etc.).
+- **`saf_access.dart`** — new `SafFileSystemAccess.openFile(treeUri, relPath)` static that routes to the native `conduit/saf openFile` call. Best-effort: errors are swallowed.
+- **`notifier.dart`** — refactored to support tap-to-open:
+  - New `onFileNotificationTap` callback field.
+  - `_plugin.initialize()` now registers `onDidReceiveNotificationResponse: _onNotificationResponse`.
+  - `showFileReceived()` gains an optional named `treeUri:` parameter; when supplied the notification payload is encoded as `"$treeUri\n$name"` (SAF URIs never contain `\n`, so this is a safe delimiter).
+  - `_onNotificationResponse` decodes the payload and calls `onFileNotificationTap` if set.
+  - `_show` delegates to a new `_showWithPayload` helper (adding the optional `payload:` arg to `_plugin.show`).
+- **`file_send.dart`** — `_receiveOffer` now passes `destPath` (the SAF tree URI) as `treeUri:` to `showFileReceived`, so the notification for every received file carries a valid file-location payload.
+- **`app_state.dart`** — after constructing `_notifier`, sets `onFileNotificationTap` (Android only) to call `SafFileSystemAccess.openFile(treeUri, relPath)`. Callback is wired **before** `init()` so cold-start taps (app was dead when notification was tapped) are also handled.
+- **`file_send_test.dart`** — updated `_FakeNotifier.showFileReceived` override to include the new `{String? treeUri}` named parameter.
+
+**Edge cases handled:**
+- File deleted before tap: native `openFile` returns `not_found`; Dart swallows silently.
+- No viewer installed for that MIME type: native catches the `ActivityNotFoundException`; Dart swallows silently.
+- Windows (no SAF, no mobile notifications): the entire `onFileNotificationTap` wiring is inside `if (Platform.isAndroid)` — zero effect on the Windows build.
+
+**Verification performed:**
+- `flutter analyze` — 0 errors (24 pre-existing `info`/`warning` lint hints, all unchanged from before).
+- `flutter test` — **193/193 tests passed**.
+
+**Files touched:** `lib/src/ui/dashboard_screen.dart`, `lib/src/ui/folder_pairs_screen.dart`, `lib/src/notifications/notifier.dart`, `lib/src/sync/file_send.dart`, `lib/src/app_state.dart`, `lib/src/platform/saf_access.dart`, `android/app/src/main/kotlin/com/conduit/conduit/SafOps.kt`, `test/file_send_test.dart`. Deleted: `lib/src/desktop/background_survival_screen.dart`.
+
+---
+
+## 2026-07-14 — Navigation, Performance, and Layout Alignments
+
+**Context:** Fixed navigation, connection sync, mobile scrolling performance, and layout alignment issues after completing the Glass UI conversion.
+
+**What was implemented:**
+- **Navigation Back Buttons (`SendPanel`, `ActivityScreen`)**: Restored custom glass back-button headers on pushed sub-routes by detecting `Navigator.canPop(context)`. Added a `hideTitle` parameter to `SendFlowView` to hide its internal page title when pushed to avoid duplication.
+- **Overview Page Connection Sync (`_OverviewPage`)**: Removed the stale cached `state` parameter from the constructor and subscribed it to `context.watch<AppState>()` directly, resolving the bug where the Overview page would stay stuck at "Connected to 0 of 1" when devices connected.
+- **Mobile Performance Optimization (BackdropFilter & IndexedStack)**:
+  - Reverted the `IndexedStack` back to lazy page rendering. This ensures only the active page is mounted and listens to `AppState` notifications, unmounting inactive pages to consume exactly 0 CPU cycles.
+  - Disabled `BackdropFilter` GPU-heavy blurs on mobile (Android/iOS) globally inside `_glassSurface` (and `_GlassFab`), while increasing panel opacities slightly (from 0.055 to 0.12) and borders (from 0.08 to 0.16) to retain the frosted-glass aesthetic without any scroll or transition lag.
+- **Keep Alive screen (`BackgroundSurvivalScreen`)**: Completed a full glass redesign using transparent Scaffold, back-button headers, `GlassStatusBanner` status hero, `GlassPanel` sync controls with `GlassButton` actions, and `GlassListTile` rows.
+- **Mobile Navigation Bar Alignment (`GlassNavBar`)**: Adjusted item padding and margins, and reduced the label font size to `9.5` with `maxLines: 1` and `overflow: TextOverflow.visible` to prevent the "Clipboard" label from wrapping into two lines on mobile screens.
+
+**Verification performed:**
+- Tested and verified that all touched files pass static analysis with 0 errors or warnings.
+- Ran the entire unit test suite and verified all layout and dashboard tests compile and pass perfectly.
+
+---
+
+## 2026-07-13 (new session) — Glass UI completion + Remote tab layout redesign
+
+**Context:** Resumed work to complete the "liquid glass" UI redesign across the remaining screens of the app (building on top of the exact-match `glass.dart` revision) and redesigned the button/card layout of the Remote control tab.
+
+**What was implemented:**
+- **Remote control tab (`remote_control_screen.dart`):** Reskinned with the glass components (`GlassStatusBanner`, `GlassListTile`, `GlassPanel`, `GlassButton`, `GlassSectionLabel`). Redesigned layout to fix cramped buttons:
+  - Relocated the 6 shutdown chips to a **2×3 grid layout** inside the Power panel, improving target touch areas.
+  - Placed Sleep/Hibernate/Cancel actions in their own row below, highlighting Cancel with `GlassButtonStyle.outline` and the danger accent.
+  - Positioned Media and Volume panels **side-by-side** in a Row at equal flex, stacking their control buttons vertically.
+- **Activity tab (`activity_screen.dart`):** Transparent Scaffold + inline page title. ChoiceChips converted to GlassChips. Swapped ListTiles for GlassListTile widgets using level-appropriate status colors. Centered empty state inside a GlassPanel.
+- **Version history tab (`version_history_screen.dart`):** Transparent Scaffold + custom back-navigation title bar. Standard ListTiles reskinned to GlassListTile with JetBrains Mono subtitle formatting and a GlassButton restore trigger. Loading, empty, and error states converted to GlassPanel blocks.
+- **Send tab / panel (`send_panel.dart`):** Reskinned to a transparent Scaffold, removing the redundant standard AppBar.
+- **Send widget popup (`send_widget_screen.dart`):** Transparent Scaffold + styled AppBar/close button to match the glass design system.
+- **Send flow view (`send_flow_view.dart`):** Reskinned entirely: replaced standard Card components with GlassPanel elements, standard chips with GlassChips, standard action buttons with GlassButtons, and the device horizontal list with _DeviceChip items styled under the glass design system.
+- **`Roadmap.md`**: Updated the Phase 7 per-screen checklist to mark all remaining screens as complete.
+
+**Verification performed:**
+- Balanced bracket/delimiter scanner checked on all touched files — clean.
+- Ran `flutter analyze` locally to verify compile safety and code syntax.
+
+---
+
 ## 2026-07-12 (new session) — Clear-glass v6: flat backdrop + more-translucent panels (continuing an interrupted session)
 
 **Context:** fresh sandbox, repo cloned to `/home/claude/work/Conduit`,
@@ -1746,3 +1835,20 @@ protocol/wire code was touched; this is UI-layer only.
 `send_flow_view.dart`, `send_panel.dart`, `send_widget_screen.dart`, and
 all dialogs — same "pushed sub-routes and modal surfaces stay standard
 Material for now" boundary the redesign has followed since Settings.
+
+## 2026-07-14 — Cancel option on receiving device for file transfers
+
+**User request:** Tapping the Cancel option on the receiving device during file transfers must cancel the in-progress transfer.
+
+**Plan/Fix Details:**
+1. **Background routing:** Added a top-level `@pragma('vm:entry-point')` background action callback (`notificationTapBackground`) in `notifier.dart`. Set up a named `ReceivePort` (`'conduit_notification_port'`) to route action responses safely from the background isolate to the main isolate.
+2. **"Cancel" action:** Configured `showReceiveProgress` to add a "Cancel" button (`AndroidNotificationAction` with `cancelNotification: true`) on Android notifications, using the transfer's `offerId` as the notification payload.
+3. **Cancel message propagation:** Registered the `onCancelReceiveTap` callback in the `AdHocFileSend` constructor to invoke `cancelInboundOffer`, which:
+   - Injects a terminal error block to the local block-pull sink to stop the receive loop.
+   - Sends a cancel message (`Msg.fileOfferControl` with `action: 'cancel'`) to the sender.
+   - Dismisses the local notification via a new `cancelReceiveProgress` helper.
+4. **Sender cancellation handling:** Modified `handleFileOfferControl` to search for the canceled `offerId` in `_outbound` and cleanly terminate the block serving loop on the sender side when receiving a cancel action.
+5. **Dismissal on fail/interrupt:** Integrated `cancelReceiveProgress`/`cancelSendProgress` calls inside all error/interrupted transfer blocks in `_receiveOffer` and `_serveBlocks`.
+6. **Mock update:** Updated `_FakeNotifier` in `test/file_send_test.dart` to match `AppNotifier` interface signature, keeping all 193 unit tests passing.
+
+**Files touched:** `lib/src/notifications/notifier.dart`, `lib/src/sync/file_send.dart`, `test/file_send_test.dart`.

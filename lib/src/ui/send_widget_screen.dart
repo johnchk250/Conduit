@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../app_state.dart';
 import '../desktop/tray.dart';
+import 'glass.dart';
 import 'send_flow_view.dart';
 
 /// Roadmap Phase 4: the compact, KDE-Connect-style popup a Windows
@@ -116,16 +118,30 @@ class _SendWidgetScreenState extends State<SendWidgetScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
+    final c = GlassColors.of(context);
     return Scaffold(
+      backgroundColor: Colors.transparent,
       appBar: AppBar(
         automaticallyImplyLeading: false,
         toolbarHeight: 46,
-        title: Text('Send to device', style: theme.textTheme.titleSmall),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        title: Text(
+          'Send to device',
+          style: GoogleFonts.manrope(
+            textStyle: TextStyle(
+              color: c.textPrimary,
+              fontSize: 14.5,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
         actions: [
           IconButton(
             tooltip: 'Close',
-            icon: const Icon(Icons.close),
+            icon: const Icon(Icons.close_rounded),
+            color: c.textPrimary,
             onPressed: () => _close(),
           ),
         ],

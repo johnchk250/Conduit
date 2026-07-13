@@ -339,6 +339,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _engine.adHocSend = _adHoc;
 
     // Phase 3b: initialise the notification plugin (channel setup + permission).
+    // Wire up the file-open callback BEFORE init() so any notification that
+    // was tapped while the app was dead (cold-start) fires the handler.
+    if (Platform.isAndroid) {
+      _notifier.onFileNotificationTap = (treeUri, relPath) {
+        // Open the received file in the system viewer (e.g. gallery, PDF app).
+        // Best-effort: if the file was deleted or no viewer is installed the
+        // native side logs and ignores the error.
+        SafFileSystemAccess.openFile(treeUri, relPath);
+      };
+    }
     unawaited(_notifier.init());
 
     // Phase 3d: subscribe to the OS share/send channel so files shared into

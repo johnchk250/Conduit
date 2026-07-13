@@ -119,6 +119,24 @@ class SafFileSystemAccess implements FileSystemAccess {
     });
     return res as String;
   }
+
+  /// Open a received file in the system viewer (used by notification tap).
+  ///
+  /// [treeUri] is the SAF tree root URI (the persisted tree the user picked).
+  /// [relPath] is the file's relative path within that tree (e.g. "photo.jpg").
+  /// The native side resolves the document URI, determines the MIME type, and
+  /// fires an [Intent.ACTION_VIEW] so the OS opens the file in the correct app.
+  /// Best-effort — errors are swallowed so a failed open never crashes the app.
+  static Future<void> openFile(String treeUri, String relPath) async {
+    try {
+      await _chSaf.invokeMethod<void>('openFile', {
+        'treeUri': treeUri,
+        'relPath': relPath,
+      });
+    } catch (_) {
+      // Best-effort: no handler for this MIME type, or the file was deleted.
+    }
+  }
 }
 
 /// Platform-aware factory: returns SAF access on Android, local access elsewhere.

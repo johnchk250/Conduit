@@ -227,7 +227,11 @@ class AdHocFileSend {
     required this.getReceivedFilesPath,
     required this.getPeerName,
     required this.onLog,
-  });
+  }) {
+    notifier.onCancelReceiveTap = (offerId) {
+      cancelInboundOffer(offerId);
+    };
+  }
 
   /// FileSystemAccess for writing received files (SAF on Android, local on PC).
   final FileSystemAccess fs;
@@ -481,11 +485,13 @@ class AdHocFileSend {
         notifier.showFileSent(fileName, session.peer.name);
         onLog('Ad-hoc send complete: $fileName -> ${session.peer.name}');
       } else {
+        await notifier.cancelSendProgress(fileName);
         onLog('Ad-hoc send interrupted for $fileName', isError: true);
       }
     } catch (e) {
       _outbound.remove(offer.offerId);
       onSendComplete?.call(false);
+      await notifier.cancelSendProgress(fileName);
       onLog('Ad-hoc send error for $fileName: $e', isError: true);
     }
   }
@@ -562,7 +568,8 @@ class AdHocFileSend {
           return offer._sink.next();
         },
         onProgress: (received, total) {
-          notifier.showReceiveProgress(offer.name, received, total);
+          notifier.showReceiveProgress(offer.name, received, total,
+              offerId: offer.offerId);
         },
         pipelineDepth: _adHocPipelineDepth,
       );
@@ -570,9 +577,10 @@ class AdHocFileSend {
       onLog(
           'Ad-hoc receive complete: ${offer.name} ← ${offer.session.peer.name}');
       final peerName = offer.session.peer.name;
-      notifier.showFileReceived(offer.name, peerName);
+      notifier.showFileReceived(offer.name, peerName, treeUri: destPath);
     } catch (e) {
       onLog('Ad-hoc receive failed for ${offer.name}: $e', isError: true);
+      await notifier.cancelReceiveProgress(offer.name);
     } finally {
       offer._sink.close();
       _inbound.remove(offer.offerId);
@@ -598,19 +606,55 @@ class AdHocFileSend {
     final offerId = msg['offerId'] as String?;
     final action = msg['action'] as String?;
     if (offerId == null || action == null) return;
-    final offer = _inbound[offerId];
-    if (offer == null) return;
-    if (action == 'cancel') {
-      offer._sink.add({
+
+    // 1. Check if it's an inbound offer we are receiving (sender canceled)
+    final inboundOffer = _inbound[offerId];
+    if (inboundOffer != null && action == 'cancel') {
+      inboundOffer._sink.add({
         't': Msg.fileOfferData,
         'offerId': offerId,
-        'name': offer.name,
+        'name': inboundOffer.name,
         'offset': 0,
         'error': 'transfer cancelled by sender',
       });
-      offer._sink.close();
-      onLog('Ad-hoc receive cancelled: ${offer.name}');
+      inboundOffer._sink.close();
+      onLog('Ad-hoc receive cancelled: ${inboundOffer.name}');
     }
+
+    // 2. Check if it's an outbound offer we are sending (receiver canceled)
+    final outboundOffer = _outbound[offerId];
+    if (outboundOffer != null && action == 'cancel') {
+      outboundOffer.cancel();
+      onLog('Ad-hoc send cancelled by receiver: ${outboundOffer.name}');
+    }
+  }
+
+  /// Cancel an inbound offer locally, notify the sender, and dismiss notification.
+  void cancelInboundOffer(String offerId) {
+    final offer = _inbound[offerId];
+    if (offer == null) return;
+
+    // Unblock the local block-pull loop with an error message
+    offer._sink.add({
+      't': Msg.fileOfferData,
+      'offerId': offerId,
+      'name': offer.name,
+      'offset': 0,
+      'error': 'transfer cancelled by receiver',
+    });
+    offer._sink.close();
+
+    // Send a cancel control message back to the sender
+    try {
+      offer.session.send({
+        't': Msg.fileOfferControl,
+        'offerId': offerId,
+        'action': 'cancel',
+      });
+    } catch (_) {}
+
+    onLog('Ad-hoc receive cancelled locally: ${offer.name}');
+    notifier.cancelReceiveProgress(offer.name);
   }
 
   bool pauseOutboundForPeer(String peerId) {

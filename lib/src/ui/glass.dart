@@ -299,12 +299,32 @@ Widget _glassSurface(
   bool blur = true,
 }) {
   final c = GlassColors.of(context);
+  final platform = Theme.of(context).platform;
+  final isMobile = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
+  final useBlur = blur && !isMobile;
+
+  final Gradient actualFill;
+  if (fillOverride != null) {
+    actualFill = fillOverride;
+  } else {
+    final double fillOpacity = isMobile ? 0.12 : c.glassFill.a;
+    final baseColor = c.glassFill.withValues(alpha: fillOpacity);
+    actualFill = LinearGradient(colors: [baseColor, baseColor]);
+  }
+
+  final Color actualBorderColor;
+  if (borderOverride != null) {
+    actualBorderColor = borderOverride;
+  } else {
+    final double borderOpacity = isMobile ? 0.16 : c.glassBorder.a;
+    actualBorderColor = c.glassBorder.withValues(alpha: borderOpacity);
+  }
+
   final fill = DecoratedBox(
     decoration: BoxDecoration(
-      gradient:
-          fillOverride ?? LinearGradient(colors: [c.glassFill, c.glassFill]),
+      gradient: actualFill,
       border: Border.all(
-        color: borderOverride ?? c.glassBorder,
+        color: actualBorderColor,
         width: 1,
       ),
     ),
@@ -335,7 +355,7 @@ Widget _glassSurface(
           // the standard Flutter frosted-glass recipe. Sigma is a visual
           // approximation of the reference's `blur(24px)`, not a literal
           // unit conversion (see class doc comment). Skipped entirely
-          // when `blur: false` — see the parameter doc above.
+          // when `blur: false` or when on mobile to prevent lagginess.
           //
           // RepaintBoundary added 2026-07-13, perf follow-up: DashboardScreen
           // watches AppState broadly at the shell root (deliberately, for
@@ -348,7 +368,7 @@ Widget _glassSurface(
           // repainting it when nothing about *it* changed, independent of
           // how often its ancestors repaint for unrelated reasons.
           Positioned.fill(
-            child: blur
+            child: useBlur
                 ? RepaintBoundary(
                     child: BackdropFilter(
                       filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
@@ -1170,8 +1190,8 @@ class GlassNavBar extends StatelessWidget {
         borderRadius: BorderRadius.circular(16),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 200),
-          padding: const EdgeInsets.symmetric(vertical: 7),
-          margin: const EdgeInsets.symmetric(horizontal: 3),
+          padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 2),
+          margin: const EdgeInsets.symmetric(horizontal: 1.5),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(16),
             gradient: active
@@ -1202,10 +1222,13 @@ class GlassNavBar extends StatelessWidget {
               const SizedBox(height: 4),
               Text(
                 d.label,
+                maxLines: 1,
+                softWrap: false,
+                overflow: TextOverflow.visible,
                 style: GoogleFonts.manrope(
                   textStyle: TextStyle(
-                    fontSize: 10.5,
-                    fontWeight: FontWeight.w500,
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w600,
                     color: active ? c.textPrimary : c.textTertiary,
                   ),
                 ),

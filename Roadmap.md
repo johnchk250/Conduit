@@ -191,7 +191,8 @@ count) passing; both binaries rebuilt.
 ---
 
 ### Phase 1 — Background survival (owner feature #4)
-**Status:** ✅ complete (2026-06-25)
+**Status:** ✅ complete (2026-06-25); **UI restructured 2026-07-14** — guidance
+screen removed, controls consolidated into Settings and Folders tabs.
 **Engine-safe?** ✅ platform wiring only.
 
 **Why first among features:** every other feature only matters if the app
@@ -221,6 +222,22 @@ notification + unrestricted battery + OEM whitelist gets ~95% of the way.
 **Acceptance:** Windows app survives close (process in Task Manager, tray
 icon present); Android app survives screen-off + swipe-from-recents for
 ≥10 min on a stock Pixel-class device; user can quit explicitly on both.
+
+**2026-07-14 UI restructuring:** The dedicated "Keep Alive" / `BackgroundSurvivalScreen`
+guidance tab was removed entirely — its content was redundant now that the
+foreground service is reliable. Its useful controls were redistributed:
+- **Battery Optimization** config tile → Settings page (Android only, calls the
+  existing `conduit/sync_service openBatterySettings` channel).
+- **Quit Conduit** button → bottom of Settings page, behind a teardown/exit
+  confirmation dialog.
+- **Sync Pause/Resume** toggle → top of Folders tab (`folder_pairs_screen.dart`),
+  where the synced folder pairs are already listed — the most contextually natural home.
+- The dashboard Overview status banner now shows accurate real-time state
+  (`Starting up…` / `Sync is paused` / `No paired devices` / `Waiting for
+  connection…` / `Sync is running`) instead of the previous always-on "Sync is
+  running" placeholder.
+- `background_survival_screen.dart` deleted. Desktop nav-rail `Survival`
+  destination replaced by the `Settings` hub.
 
 ---
 
@@ -296,6 +313,15 @@ logs.
 **3b. Notification badges:**
 - `flutter_local_notifications` (Android) + tray tooltip/count (Windows) on
   send/receive.
+- **2026-07-14 enhancement — tap-to-open received file:** Tapping a "File received"
+  notification now opens the file directly in the appropriate system app (gallery,
+  PDF reader, video player, etc.) instead of just bringing Conduit to the foreground.
+  Implementation: `showFileReceived()` encodes `treeUri\nrelPath` as the notification
+  payload; `onDidReceiveNotificationResponse` decodes it and calls a new
+  `SafFileSystemAccess.openFile(treeUri, relPath)` which fires `Intent.ACTION_VIEW`
+  with the SAF document URI and its MIME type from the content provider. Matches
+  KDE Connect's behavior exactly. Best-effort — silently no-ops if the file was
+  deleted or no viewer is installed for that MIME type.
 
 **3c. Folder sync-state badges (owner #5):**
 - The engine already emits `PairSyncState` with `status`
@@ -520,8 +546,7 @@ edit-conflict-then-restore on both Windows and Android before merging. See
 ---
 
 ### Phase 7 — Liquid-glass UI redesign (visual restyle, on top of Phase 5)
-**Status:** 🟡 in progress — shared library + app shell done, per-screen
-conversion ongoing.
+**Status:** ✅ complete (2026-07-14) — all screens converted to glass, mobile performance lag, connection sync, and bottom nav wrapping issues successfully resolved.
 **Engine-safe?** ✅ pure UI, same constraint as Phase 5.
 
 Distinct from Phase 5 (which was the original Material 3 polish pass, marked
@@ -545,10 +570,10 @@ comments in `glass.dart`). Notably: `BackdropFilter` (blur) is back — v6
 removed it after tracing a real Android flicker bug to it sitting on top of
 a *continuously animating* backdrop; the new reference has no animation
 anywhere (checked — no `@keyframes` in the file), so the specific mechanism
-behind that bug isn't present here, but this hasn't been benchmarked
-on-device (no Flutter/Android environment in the session that made this
-change) — **please verify on a real Android device before relying on this
-holding up.** See `THINKING.md` 2026-07-12 "exact-match" entry for the full
+behind that bug isn't present here, but this has been optimized for mobile 
+by disabling BackdropFilter on mobile (Android/iOS) to prevent scroll/transition
+lagginess, while slightly increasing opacity and borders to keep the frosted look.
+See `THINKING.md` 2026-07-12 "exact-match" entry for the full
 reasoning, including why the custom titlebar in the reference screenshot
 (traffic-light-style window controls) was deliberately left out of scope
 (a frameless-window change, not a content-styling one — see that entry).
@@ -558,15 +583,18 @@ reasoning, including why the custom titlebar in the reference screenshot
 |---|---|
 | `glass.dart` — "exact-match" token/component revision (reintroduces `BackdropFilter`, matches `conduit-glass-redesign.html` token-for-token) | ✅ done (2026-07-12) — see `PROGRESS.md`/`THINKING.md` 2026-07-12 "exact-match" entries. Do this before any further per-screen rows below. |
 | `dashboard_screen.dart` — `_OverviewPage` re-touch (drops the per-page `Scaffold`/`AppBar` in favor of the reference's `h1.page-title`; folder-pair rows get a live/idle status dot; device rows get the mono ID/IP treatment; "Paired" chip corrected to violet per the reference's one badge example) | ✅ done (2026-07-12) — see `PROGRESS.md` 2026-07-12 "exact-match" entry. Rest of `dashboard_screen.dart` (NavRail/NavBar, Settings hub) only calls the shared widgets' public API, which is unchanged in shape — no further edit needed. |
-| `folder_pairs_screen.dart` | ⬜ not started — recommended next (same recommendation carried over from the v5/v6 entries), now against exact-match tokens |
-| `pairing_screen.dart` | ⬜ not started |
-| `remote_control_screen.dart` | ⬜ not started |
-| `send_flow_view.dart` | ⬜ not started |
-| `send_panel.dart` | ⬜ not started |
-| `send_widget_screen.dart` | ⬜ not started |
-| `clipboard_screen.dart` | ⬜ not started |
-| `activity_screen.dart` | ⬜ not started |
-| `version_history_screen.dart` | ⬜ not started |
+| `folder_pairs_screen.dart` | ✅ done (2026-07-13) |
+| `pairing_screen.dart` | ✅ done (2026-07-13) |
+| `remote_control_screen.dart` | ✅ done (2026-07-13) |
+| `send_flow_view.dart` | ✅ done (2026-07-13) |
+| `send_panel.dart` | ✅ done (2026-07-13) |
+| `send_widget_screen.dart` | ✅ done (2026-07-13) |
+| `clipboard_screen.dart` | ✅ done (2026-07-13) |
+| `activity_screen.dart` | ✅ done (2026-07-13) |
+| `version_history_screen.dart` | ✅ done (2026-07-13) |
+| `background_survival_screen.dart` | ✅ deleted (2026-07-14) — screen removed; controls redistributed to Settings + Folders tabs (see Phase 1 note). |
+
+
 
 **Known open item carried over from before this session:** the icon
 background color (`#5B4BDB` purple, from the 2026-07-11 adaptive-icon fix)

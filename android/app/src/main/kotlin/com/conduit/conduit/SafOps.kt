@@ -1,8 +1,11 @@
 package com.conduit.conduit
 
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -388,6 +391,41 @@ object SafOps {
                         }
                     }
                     result.success(name ?: uriStr.substringAfterLast('/'))
+                }
+                // Open a received file in the system viewer (notification tap).
+                // [treeUri] is the SAF tree root; [relPath] is the file's relative
+                // path within that tree. We resolve the document URI, query its
+                // MIME type, and fire ACTION_VIEW. ctx must be an Activity so that
+                // the launched viewer appears in the foreground.
+                "openFile" -> {
+                    val treeUriStr = call.argument<String>("treeUri")!!
+                    val relPath = call.argument<String>("relPath")!!
+                    val docUri = resolve(ctx, treeUriStr, relPath)
+                    if (docUri == null) {
+                        result.error("not_found", "File not found: $relPath", null)
+                    } else {
+                        // Resolve MIME type: first ask the provider, fall back to
+                        // file extension, then use a generic binary stream type.
+                        val mimeType = ctx.contentResolver.getType(docUri)
+                            ?: MimeTypeMap.getSingleton()
+                                .getMimeTypeFromExtension(
+                                    relPath.substringAfterLast('.').lowercase()
+                                )
+                            ?: "application/octet-stream"
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(docUri, mimeType)
+                            addFlags(
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_ACTIVITY_NEW_TASK
+                            )
+                        }
+                        try {
+                            ctx.startActivity(intent)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("no_handler", "No app to open $mimeType: ${e.message}", null)
+                        }
+                    }
                 }
                 else -> result.notImplemented()
             }

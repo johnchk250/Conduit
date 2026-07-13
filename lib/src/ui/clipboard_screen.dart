@@ -42,7 +42,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
       backgroundColor: Colors.transparent,
       body: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.fromLTRB(20, 22, 20, 110),
+          padding: const EdgeInsets.fromLTRB(20, 22, 20, 32),
           children: [
             const GlassPageTitle('Clipboard'),
 

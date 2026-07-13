@@ -62,7 +62,7 @@ void main() {
     final src = File(p.join(root.path, 'report.docx'));
     await src.writeAsString('doc bytes');
 
-    final vaultPath = await fs.moveToVault(root.path, 'report.docx');
+    final vaultPath = (await fs.moveToVault(root.path, 'report.docx')).replaceAll('\\', '/');
 
     expect(vaultPath, startsWith('.syncversions/'));
     expect(vaultPath, endsWith('.docx'));
@@ -74,7 +74,7 @@ void main() {
     final src = File(p.join(root.path, 'a.txt'));
     await src.writeAsString('hello');
 
-    final vaultPath = await fs.moveToVault(root.path, 'a.txt');
+    final vaultPath = (await fs.moveToVault(root.path, 'a.txt')).replaceAll('\\', '/');
 
     expect(vaultPath, equals('.syncversions/${p.basename(vaultPath)}'));
     expect(vaultPath, isNot(contains('/./')));
@@ -88,7 +88,7 @@ void main() {
     final src = File(p.join(dir.path, 'report.docx'));
     await src.writeAsString('doc bytes');
 
-    final vaultPath = await fs.moveToVault(root.path, 'docs/sub/report.docx');
+    final vaultPath = (await fs.moveToVault(root.path, 'docs/sub/report.docx')).replaceAll('\\', '/');
 
     expect(vaultPath, startsWith('.syncversions/docs/sub/'));
   });

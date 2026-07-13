@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -9,9 +10,20 @@ import 'package:uuid/uuid.dart';
 import '../app_state.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
-import '../sync/engine.dart';
 import 'glass.dart';
 import 'version_history_screen.dart';
+
+/// Fast 180 ms fade push — avoids the heavy 300 ms slide of [MaterialPageRoute]
+/// on top of backdrop-blur glass surfaces.
+PageRoute<T> _fadeRoute<T>(WidgetBuilder builder) => PageRouteBuilder<T>(
+      pageBuilder: (ctx, _, secondary) => builder(ctx),
+      transitionDuration: const Duration(milliseconds: 180),
+      reverseTransitionDuration: const Duration(milliseconds: 140),
+      transitionsBuilder: (_, animation, secondary, child) => FadeTransition(
+        opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
+        child: child,
+      ),
+    );
 
 /// Folder pairs list + add/invite/accept flow + per-pair detail view.
 ///
@@ -46,29 +58,51 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
     final c = GlassColors.of(ctx);
     final pairs = state.config.folderPairs;
     // Shell matches _OverviewPage's pattern (GlassPageTitle inline, no own
-    // AppBar) rather than _SettingsHubPage's older AppBar convention — see
-    // THINKING.md, "Design-system choice" for why. FAB stays a real
-    // Material FloatingActionButton (no reference example to translate,
-    // and mixing a custom glass FAB shape into Flutter's built-in
-    // Hero/motion handling for FABs isn't worth it for a single button),
-    // just recolored to the accent family instead of the default M3 color.
+    // AppBar) rather than _SettingsHubPage's older AppBar co    // THINKING.md, "Design-system choice" for why.
     return Scaffold(
       backgroundColor: Colors.transparent,
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _showPairDialog(ctx, state, null),
-        backgroundColor: c.violet,
-        foregroundColor: Colors.white,
-        icon: const Icon(Icons.add),
-        label: const Text('Add synced folder'),
+      floatingActionButton: _GlassFab(
+        label: 'Add synced folder',
+        icon: Icons.add_rounded,
+        accentColor: c.violet,
+        onTap: () => _showPairDialog(ctx, state, null),
       ),
+      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       body: SafeArea(
         child: ListView(
           // Same content padding recipe as _OverviewPage — see that file's
           // comment for the reference source (`.content{padding:26px 20px
           // 100px}`, extra bottom room for the floating GlassNavBar).
-          padding: const EdgeInsets.fromLTRB(20, 22, 20, 110),
+          padding: const EdgeInsets.fromLTRB(20, 22, 20, 100),
           children: [
             const GlassPageTitle('Folders'),
+            GlassListTile(
+              leadingIcon: state.isPaused ? Icons.pause_circle_outline : Icons.sync,
+              accentColor: state.isPaused ? c.amber : c.mint,
+              title: 'Sync enabled',
+              subtitle: state.isPaused
+                  ? 'Sync is paused. Tap to resume.'
+                  : 'Sync is running. Tap to pause.',
+              trailing: Switch(
+                value: !state.isPaused,
+                onChanged: (v) {
+                  if (state.isPaused) {
+                    state.resumeSync();
+                  } else {
+                    state.pauseSync();
+                  }
+                },
+                activeColor: c.mint,
+              ),
+              onTap: () {
+                if (state.isPaused) {
+                  state.resumeSync();
+                } else {
+                  state.pauseSync();
+                }
+              },
+            ),
+            const SizedBox(height: 20),
             if (pairs.isEmpty)
               _emptyState(ctx, c)
             else ...[
@@ -80,9 +114,7 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
                     pair: p,
                     state: state,
                     onDetails: () => Navigator.of(ctx).push(
-                      MaterialPageRoute(
-                        builder: (_) => _PairDetailScreen(pair: p),
-                      ),
+                      _fadeRoute((_) => _PairDetailScreen(pair: p)),
                     ),
                     onSyncNow: () => _syncNow(ctx, state, p),
                     onEdit: () => _showPairDialog(ctx, state, p),
@@ -311,6 +343,123 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
               ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// A glassmorphic floating-action-button pill that matches the design system.
+/// Uses [BackdropFilter] for the frosted-glass blur, a violet gradient fill,
+/// and the same border/radius language as [GlassPanel].
+class _GlassFab extends StatefulWidget {
+  const _GlassFab({
+    required this.label,
+    required this.icon,
+    required this.accentColor,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final Color accentColor;
+  final VoidCallback onTap;
+
+  @override
+  State<_GlassFab> createState() => _GlassFabState();
+}
+
+class _GlassFabState extends State<_GlassFab>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<double> _scale;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 90));
+    _scale = Tween<double>(begin: 1.0, end: 0.95)
+        .animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOut));
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = widget.accentColor;
+    final platform = Theme.of(context).platform;
+    final isMobile = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
+
+    final container = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(50),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            accent.withValues(alpha: isMobile ? 0.85 : 0.22),
+            accent.withValues(alpha: isMobile ? 0.70 : 0.08),
+          ],
+        ),
+        border: Border.all(
+          color: accent.withValues(alpha: isMobile ? 0.95 : 0.38),
+          width: 1.0,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: accent.withValues(alpha: isMobile ? 0.35 : 0.25),
+            blurRadius: 20,
+            spreadRadius: 2,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(widget.icon, color: Colors.white, size: 20),
+          const SizedBox(width: 10),
+          Text(
+            widget.label,
+            style: GoogleFonts.manrope(
+              textStyle: const TextStyle(
+                color: Colors.white,
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+                letterSpacing: -0.2,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    Widget buttonBody = container;
+    if (!isMobile) {
+      buttonBody = ClipRRect(
+        borderRadius: BorderRadius.circular(50),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+          child: container,
+        ),
+      );
+    }
+
+    return GestureDetector(
+      onTapDown: (_) => _ctrl.forward(),
+      onTapUp: (_) {
+        _ctrl.reverse();
+        widget.onTap();
+      },
+      onTapCancel: () => _ctrl.reverse(),
+      child: ScaleTransition(
+        scale: _scale,
+        child: buttonBody,
       ),
     );
   }
@@ -642,10 +791,7 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
                 child: OutlinedButton.icon(
                   onPressed: () => Navigator.push(
                     ctx,
-                    MaterialPageRoute(
-                      builder: (_) =>
-                          VersionHistoryScreen(pair: currentPair),
-                    ),
+                    _fadeRoute((_) => VersionHistoryScreen(pair: currentPair)),
                   ),
                   icon: const Icon(Icons.history),
                   label: const Text('Restore versions'),

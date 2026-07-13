@@ -1,6 +1,17 @@
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:ui';
 
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+/// Background notification response handler. Runs on a background isolate
+/// when showsUserInterface is false, forwarding the response back to the main isolate
+/// via the registered SendPort.
+@pragma('vm:entry-point')
+void notificationTapBackground(NotificationResponse response) {
+  final sendPort = IsolateNameServer.lookupPortByName('conduit_notification_port');
+  sendPort?.send(response);
+}
 
 /// Thin wrapper around [FlutterLocalNotificationsPlugin] for Conduit's
 /// ad-hoc file-send notifications (Roadmap Phase 3b).
@@ -25,6 +36,21 @@ class AppNotifier {
   static const _androidChannelDesc =
       'Notifications for ad-hoc file send and receive';
 
+  // Notification ID range reserved for "file received" completions. The IDs
+  // are derived from `name.hashCode ^ 2` and are never used by any other show.
+  // The payload encodes `treeUri\nrelPath` so [onFileNotificationTap] can open
+  // the file directly. SAF tree URIs are `content://…` strings — no newlines.
+
+  /// Called when the user taps a "File received" notification.
+  ///
+  /// The two arguments are the SAF tree URI (root of the received-files folder)
+  /// and the file's relative path within that tree. Set this before calling
+  /// [init] or at any time before files can be received.
+  void Function(String treeUri, String relPath)? onFileNotificationTap;
+
+  /// Called when the user taps "Cancel" on a file receive progress notification.
+  void Function(String offerId)? onCancelReceiveTap;
+
   /// Initialise the plugin and request permissions on Android.
   ///
   /// Safe to call multiple times — subsequent calls are no-ops once [_ready].
@@ -33,11 +59,26 @@ class AppNotifier {
     if (!Platform.isAndroid) return;
     if (_ready) return;
     try {
+      // Set up the background message channel port
+      const portName = 'conduit_notification_port';
+      IsolateNameServer.removePortNameMapping(portName);
+      final receivePort = ReceivePort();
+      IsolateNameServer.registerPortWithName(receivePort.sendPort, portName);
+      receivePort.listen((dynamic message) {
+        if (message is NotificationResponse) {
+          _onNotificationResponse(message);
+        }
+      });
+
       const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
       const initSettings = InitializationSettings(
         android: androidInit,
       );
-      await _plugin.initialize(initSettings);
+      await _plugin.initialize(
+        initSettings,
+        onDidReceiveNotificationResponse: _onNotificationResponse,
+        onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
+      );
 
       // Android: create the notification channel (idempotent on re-init).
       final android = _plugin.resolvePlatformSpecificImplementation<
@@ -59,8 +100,41 @@ class AppNotifier {
     }
   }
 
+  /// Handles a tap on any notification fired by this plugin.
+  ///
+  /// Only "file received" notifications carry a payload (format: `treeUri\nrelPath`).
+  /// All other notifications have no payload and are ignored — tapping them
+  /// simply brings the app to the foreground as before.
+  void _onNotificationResponse(NotificationResponse response) {
+    if (response.notificationResponseType ==
+        NotificationResponseType.selectedNotificationAction) {
+      if (response.actionId == 'cancel_receive') {
+        final offerId = response.payload;
+        if (offerId != null && offerId.isNotEmpty) {
+          onCancelReceiveTap?.call(offerId);
+        }
+      }
+      return;
+    }
+
+    final payload = response.payload;
+    if (payload == null || payload.isEmpty) return;
+    final sep = payload.indexOf('\n');
+    if (sep < 0) return;
+    final treeUri = payload.substring(0, sep);
+    final relPath = payload.substring(sep + 1);
+    if (treeUri.isNotEmpty && relPath.isNotEmpty) {
+      onFileNotificationTap?.call(treeUri, relPath);
+    }
+  }
+
   /// Show progress for receiving a file.
-  Future<void> showReceiveProgress(String name, int received, int total) async {
+  Future<void> showReceiveProgress(
+    String name,
+    int received,
+    int total, {
+    required String offerId,
+  }) async {
     if (!Platform.isAndroid || !_ready) return;
     try {
       final percent = total > 0 ? (received * 100) ~/ total : 0;
@@ -68,14 +142,20 @@ class AppNotifier {
         _androidChannelId,
         _androidChannelName,
         channelDescription: _androidChannelDesc,
-        importance: Importance
-            .low, // low importance so it doesn't alert/sound on every update
+        importance: Importance.low, // low importance so it doesn't alert/sound on every update
         priority: Priority.low,
         showProgress: true,
         maxProgress: 100,
         progress: percent,
         icon: '@mipmap/ic_launcher',
         onlyAlertOnce: true,
+        actions: const <AndroidNotificationAction>[
+          AndroidNotificationAction(
+            'cancel_receive',
+            'Cancel',
+            cancelNotification: true,
+          ),
+        ],
       );
       final details = NotificationDetails(android: androidDetails);
       await _plugin.show(
@@ -83,7 +163,24 @@ class AppNotifier {
         'Receiving file',
         '$name ($percent%)',
         details,
+        payload: offerId,
       );
+    } catch (_) {}
+  }
+
+  /// Cancel/dismiss the "Receiving file" progress notification for a file.
+  Future<void> cancelReceiveProgress(String name) async {
+    if (!Platform.isAndroid || !_ready) return;
+    try {
+      await _plugin.cancel(name.hashCode ^ 3);
+    } catch (_) {}
+  }
+
+  /// Cancel/dismiss the "Sending file" progress notification for a file.
+  Future<void> cancelSendProgress(String name) async {
+    if (!Platform.isAndroid || !_ready) return;
+    try {
+      await _plugin.cancel(name.hashCode ^ 4);
     } catch (_) {}
   }
 
@@ -134,16 +231,30 @@ class AppNotifier {
 
   /// Show a "File received" system notification. Fires after a successful
   /// receive. [name] is the file name; [peerName] the sender's display name.
-  Future<void> showFileReceived(String name, String peerName) async {
+  ///
+  /// [treeUri] is the SAF tree root URI of the received-files folder.
+  /// When both [treeUri] and [name] are provided, tapping the notification
+  /// opens the file directly in the appropriate system viewer (Phase 3b+).
+  Future<void> showFileReceived(
+    String name,
+    String peerName, {
+    String? treeUri,
+  }) async {
     try {
       if (Platform.isAndroid && _ready) {
         await _plugin.cancel(name.hashCode ^ 3);
       }
     } catch (_) {}
-    await _show(
+    // Encode the file location as the notification payload only when we have
+    // a SAF tree URI — on Windows there's no notification payload mechanism.
+    final payload = (treeUri != null && treeUri.isNotEmpty)
+        ? '$treeUri\n$name'
+        : null;
+    await _showWithPayload(
       id: name.hashCode ^ 2,
       title: 'File received',
       body: '$name ← $peerName',
+      payload: payload,
     );
   }
 
@@ -184,6 +295,13 @@ class AppNotifier {
     required int id,
     required String title,
     required String body,
+  }) => _showWithPayload(id: id, title: title, body: body);
+
+  Future<void> _showWithPayload({
+    required int id,
+    required String title,
+    required String body,
+    String? payload,
   }) async {
     if (!Platform.isAndroid) return;
     if (!_ready) return;
@@ -199,7 +317,7 @@ class AppNotifier {
       const details = NotificationDetails(
         android: androidDetails,
       );
-      await _plugin.show(id, title, body, details);
+      await _plugin.show(id, title, body, details, payload: payload);
     } catch (_) {
       // Swallow — a notification failure must never break a transfer.
     }

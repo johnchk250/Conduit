@@ -1,24 +1,71 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
+import 'glass.dart';
 import 'send_flow_view.dart';
 
 /// Full-shell "Send" tab — the desktop NavigationRail / mobile bottom-nav
 /// destination for the ad-hoc file-send flow (Roadmap Phase 3d).
 ///
-/// This used to hold the entire flow; it now just supplies the AppBar chrome
-/// around [SendFlowView], which is where all the actual logic (file
-/// queueing, peer selection, send progress) and the redesigned UI live. That
-/// split is what let Roadmap Phase 4's compact `SendWidgetScreen` popup
-/// reuse the exact same flow instead of re-implementing it at a smaller
-/// size.
+/// Reskinned to match the transparent Scaffold pattern of other tabs.
+/// Automatically detects if it was pushed as a sub-route (e.g. from the mobile share flow)
+/// and displays a back button if so.
 class SendPanel extends StatelessWidget {
   const SendPanel({super.key});
 
   @override
   Widget build(BuildContext context) {
+    final canPop = Navigator.canPop(context);
+    final c = GlassColors.of(context);
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Send File'), elevation: 0),
-      body: const SafeArea(child: SendFlowView(compact: false)),
+      backgroundColor: Colors.transparent,
+      body: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // ---- Pushed title bar with back button -------------------------
+            if (canPop)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 16, 20, 0),
+                child: Row(
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.arrow_back_ios_new_rounded),
+                      color: c.textPrimary,
+                      iconSize: 20,
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Send',
+                        style: GoogleFonts.manrope(
+                          textStyle: TextStyle(
+                            color: c.textPrimary,
+                            fontSize: 22,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: -0.5,
+                          ),
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+            // ---- Body content ----------------------------------------------
+            Expanded(
+              child: SendFlowView(
+                compact: false,
+                hideTitle: canPop,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
