@@ -336,11 +336,24 @@ Widget _glassSurface(
           // approximation of the reference's `blur(24px)`, not a literal
           // unit conversion (see class doc comment). Skipped entirely
           // when `blur: false` — see the parameter doc above.
+          //
+          // RepaintBoundary added 2026-07-13, perf follow-up: DashboardScreen
+          // watches AppState broadly at the shell root (deliberately, for
+          // reliable invite delivery — see that file's doc comment), so the
+          // active page repaints on every AppState change anywhere in the
+          // app, not just ones it visually depends on. Without a boundary,
+          // an expensive BackdropFilter can get swept into that repaint even
+          // when nothing about the glass surface itself changed. This gives
+          // the blurred layer its own compositing layer so Flutter can skip
+          // repainting it when nothing about *it* changed, independent of
+          // how often its ancestors repaint for unrelated reasons.
           Positioned.fill(
             child: blur
-                ? BackdropFilter(
-                    filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
-                    child: fill,
+                ? RepaintBoundary(
+                    child: BackdropFilter(
+                      filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+                      child: fill,
+                    ),
                   )
                 : fill,
           ),
@@ -411,38 +424,53 @@ class GlassBackground extends StatelessWidget {
     return Stack(
       fit: StackFit.expand,
       children: [
-        DecoratedBox(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: [c.bgTop, c.bgMid, c.bgBottom],
-              stops: const [0.0, 0.45, 1.0],
-            ),
+        // Perf follow-up, 2026-07-13: this whole layer is static (no
+        // animation — see class doc comment), but GlassBackground is
+        // reconstructed as part of the same DashboardScreen.build() that
+        // runs on every AppState change app-wide, so without a boundary
+        // it can get repainted for reasons that have nothing to do with
+        // it. RepaintBoundary lets Flutter cache and reuse this layer
+        // instead of redrawing 3 radial gradients + a linear gradient on
+        // every unrelated rebuild.
+        RepaintBoundary(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [c.bgTop, c.bgMid, c.bgBottom],
+                    stops: const [0.0, 0.45, 1.0],
+                  ),
+                ),
+              ),
+              // Three radial blobs, positioned/sized to approximate the
+              // reference's `radial-gradient(600px 500px at 15% -5%, ...)`
+              // etc. CSS `at X% Y%` maps onto Flutter's Alignment as
+              // `(-1 + 2*X/100, -1 + 2*Y/100)`.
+              _ambientBlob(
+                  color: c.ambientIndigo,
+                  alpha: 0.35,
+                  alignment: const Alignment(-0.7, -1.10),
+                  width: 600,
+                  height: 500),
+              _ambientBlob(
+                  color: c.ambientTeal,
+                  alpha: 0.28,
+                  alignment: const Alignment(1.10, -0.30),
+                  width: 500,
+                  height: 450),
+              _ambientBlob(
+                  color: c.ambientSky,
+                  alpha: 0.14,
+                  alignment: const Alignment(-0.40, 1.30),
+                  width: 700,
+                  height: 600),
+            ],
           ),
         ),
-        // Three radial blobs, positioned/sized to approximate the
-        // reference's `radial-gradient(600px 500px at 15% -5%, ...)` etc.
-        // CSS `at X% Y%` maps onto Flutter's Alignment as
-        // `(-1 + 2*X/100, -1 + 2*Y/100)`.
-        _ambientBlob(
-            color: c.ambientIndigo,
-            alpha: 0.35,
-            alignment: const Alignment(-0.7, -1.10),
-            width: 600,
-            height: 500),
-        _ambientBlob(
-            color: c.ambientTeal,
-            alpha: 0.28,
-            alignment: const Alignment(1.10, -0.30),
-            width: 500,
-            height: 450),
-        _ambientBlob(
-            color: c.ambientSky,
-            alpha: 0.14,
-            alignment: const Alignment(-0.40, 1.30),
-            width: 700,
-            height: 600),
         if (child != null) child!,
       ],
     );

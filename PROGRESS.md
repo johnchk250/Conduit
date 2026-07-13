@@ -1600,3 +1600,69 @@ anywhere.
 **Files touched:** `lib/src/ui/glass.dart` only (`_glassSurface`'s new
 `blur` param, `GlassPanel`'s passthrough, `GlassListTile`'s override) —
 isolated, no other file needed a change for this fix.
+
+---
+
+## 2026-07-13 — Perf follow-up 2: RepaintBoundary + lower blur sigma
+
+**Reported:** the list-tile blur fix (previous entry) helped, but tab
+switching was still "a little" slow. Investigated further rather than just
+tuning numbers blind — found something bigger than blur-instance-count:
+`DashboardScreenState.build()` calls `context.watch<AppState>()` at the
+shell root (line 129), so the *entire* active page repaints on every
+`AppState.notifyListeners()` anywhere in the app (38 call sites — sync
+progress, discovery, clipboard, connection state, ...), not just changes
+relevant to what's currently visible. During any active sync this can fire
+continuously while just sitting on a tab, not only when switching. This
+isn't something introduced by the glass redesign, and — importantly — it's
+not an oversight either: the doc comment right above it explains this
+broad watch is deliberate, there specifically so folder-pair invite
+delivery can't be missed by a listener detaching at the wrong time (see
+that comment for the full "Step 3 of the fix plan" reasoning). So this
+wasn't touched — narrowing it without care could reintroduce the exact bug
+class it exists to prevent, and that's a state-management change, not a
+visual one; flagged it to the person as a bigger, separate option rather
+than just doing it.
+
+**What was safe to do without touching that architecture:** isolate the
+expensive part (the blur) so it doesn't get swept into repaints that have
+nothing to do with it.
+- Wrapped the `BackdropFilter` in `_glassSurface` in a `RepaintBoundary`
+  (only when `blur: true`, i.e. the hero and the dock — the two surfaces
+  that still blur after the previous fix). Standard Flutter guidance for
+  exactly this situation: give an expensive filter its own compositing
+  layer so unrelated ancestor repaints don't force it to redo real GPU
+  work every time.
+- Same treatment for `GlassBackground`'s ambient layer (3 static radial
+  blobs + linear gradient) — it's reconstructed as part of the same
+  `DashboardScreen.build()` that runs on every `AppState` change, so
+  without a boundary it was being asked to repaint alongside page content
+  for reasons that have nothing to do with it, even though the layer
+  itself never actually changes.
+- Also lowered the hero/dock's blur `sigma` from 16 → 12 as a small
+  additional cost reduction, independent of the boundary fix — a modest,
+  low-risk trim on top, not a replacement for it.
+
+**Offered, not done — needs the person's buy-in first:** properly scoping
+`AppState` consumption with `context.select`/`Selector` per-field instead
+of one broad `context.watch` at the root, so unrelated state changes don't
+force a full-page rebuild at all (RepaintBoundary only stops the *paint*
+from cascading, not the *rebuild* itself — build() still re-runs the
+active page's whole widget tree on every notifyListeners() call, it's just
+cheaper now because most of that re-run doesn't also repaint the blur).
+This is the bigger remaining lever, but it's a genuinely different kind of
+change (state-flow architecture, touching how every page reads `AppState`,
+not a visual toggle) and the pendingInvite-delivery reasoning above means
+it needs to be done carefully, screen by screen, not as a blanket
+find-replace. Not started without the person confirming they want that
+scope of change.
+
+**Verification:** balanced-delimiter check clean. Same standing
+limitation — no Flutter/Dart SDK here, so the actual frame-time
+improvement from `RepaintBoundary` (which should be the more meaningful of
+the two changes) hasn't been measured. Suggested checking DevTools'
+"Highlight repaints" overlay to see the hero/dock/background stop
+flashing on unrelated state changes, which would confirm this landed as
+intended.
+
+**Files touched:** `lib/src/ui/glass.dart` only.
