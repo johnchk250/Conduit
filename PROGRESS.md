@@ -1852,3 +1852,66 @@ Material for now" boundary the redesign has followed since Settings.
 6. **Mock update:** Updated `_FakeNotifier` in `test/file_send_test.dart` to match `AppNotifier` interface signature, keeping all 193 unit tests passing.
 
 **Files touched:** `lib/src/notifications/notifier.dart`, `lib/src/sync/file_send.dart`, `test/file_send_test.dart`.
+
+## 2026-07-14 (review session) — Verification of John's local push (`b7a7d8e`)
+
+**Context:** John made substantial changes locally and pushed directly (no Claude
+session involved in authoring). This entry documents an independent review/
+verification pass of that push, per this project's "verify source before
+trusting docs" principle — not new implementation work.
+
+**What was checked:**
+- Diffed `b7a7d8e` against the last Claude-authored commit (`d795eff`) to
+  isolate exactly what John's session changed: 23 files, +1743/-1347.
+- Confirmed John's own `PROGRESS.md`/`ARCHITECTURE.md`/`Roadmap.md` entries
+  for this push (Keep-Alive-tab removal, tap-to-open received file, file-transfer
+  cancel-from-receiver, mobile BackdropFilter/IndexedStack perf pass, nav-bar
+  label wrap fix, Overview connection-sync fix, Phase 7 completion) all
+  independently match the code diff — no doc/code drift found this time.
+- Delimiter-balance scan on all 19 touched source files: 3 flagged
+  (`file_send.dart`, `activity_screen.dart`, `SafOps.kt`), all traced to
+  intentional non-code content (a half-open-range doc comment, a
+  `startsWith('V2 in sync (')` prefix-match string, and a Kotlin string
+  template) — no real structural issues.
+- Hand-traced the new notification-tap and cancel-transfer logic
+  (`notifier.dart`, `file_send.dart`, `app_state.dart`, `SafOps.kt`):
+  notification-ID scheme (`hashCode ^ 2/3/4`) stays internally consistent
+  across show/cancel call sites; `outboundOffer.cancel()` correctly reuses
+  the pre-existing `_OutboundOffer.cancel()` method; background-isolate
+  `ReceivePort`/`IsolateNameServer` wiring for the Cancel action looks
+  correct end to end.
+- Counted `test(`/`testWidgets(` occurrences directly in `test/*.dart`:
+  193 — matches John's stated "193/193 passed" figure exactly (count
+  verified from source per this project's own standing rule; pass/fail
+  itself still unverified — no Flutter SDK in this sandbox).
+
+**Found and flagged (not fixed — out of scope for a review pass):**
+- **Bottom ListView padding is now inconsistent across glass screens**:
+  `activity_screen.dart` uses `0`, `clipboard_screen.dart`/`dashboard_screen.dart`
+  (`_OverviewPage`, `_SettingsHubPage`)/`send_flow_view.dart` use `32`,
+  `pairing_screen.dart` uses `14`, `folder_pairs_screen.dart` still uses the
+  old `100`. Traced to the Home-tab `Scaffold` switching from `extendBody: true`
+  to `false` this session (so pages no longer need to reserve space to avoid
+  sitting under the floating nav bar) — the padding shrink was only applied to
+  some screens, not propagated everywhere. Cosmetic only (nothing is clipped
+  or unreachable), but worth a pass to make bottom spacing consistent.
+- `GlassNavBar` label now uses `overflow: TextOverflow.visible` +
+  `softWrap: false` to stop "Clipboard" wrapping to two lines — correct fix
+  for that specific label, but worth a quick on-device check that no other
+  (longer, or localized) label can visibly overflow into a neighboring tab's
+  tap target now that clipping is disabled.
+- `SafOps.kt`'s new `openFile`'s doc comment says "ctx must be an Activity"
+  but the code also adds `FLAG_ACTIVITY_NEW_TASK` (normally needed when ctx is
+  *not* an Activity). Not a bug — harmless either way — just a comment/code
+  message worth tightening if anyone revisits this method.
+
+**Not independently re-verified this session (no Flutter/Android toolchain in
+this sandbox, same standing limitation as every prior entry):** `flutter analyze`
+0-errors claim, `flutter test` 193/193-passing claim (test *count* confirmed,
+pass/fail not), and all on-device behavior (notification tap-to-open, cancel
+button, mobile scroll/blur performance, Overview connection-status live
+update).
+
+**Verdict:** no structural or logic defects found. Three minor cosmetic/
+consistency items flagged above for a future pass. Safe to keep building on
+top of as-is.

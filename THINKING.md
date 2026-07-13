@@ -811,3 +811,35 @@ dropping it without explanation.
 **Clipboard tab:** the most direct translation — every element (toggle, connected-devices panel, send-now action, last-received) already matches an existing `glass.dart` primitive 1:1 (`GlassListTile` w/ `Switch` trailing, `GlassPanel`, `GlassButton` w/ its existing `selected` "Sent!" state). No new components needed here.
 
 **Verification, same standing caveat as every prior session:** balanced-delimiter check only, no `flutter analyze`/`flutter run` — no SDK in this sandbox. Please run both on Windows and Android before merging, same as every glass-related entry above this one.
+
+---
+
+## 2026-07-14 (review session) — Reviewing John's direct push instead of re-doing the work
+
+**Why a review pass instead of just trusting the push:** John pushed `b7a7d8e`
+directly (not authored in a Claude session), covering Keep-Alive-tab removal,
+tap-to-open-received-file, receiver-side transfer cancel, and a mobile
+BackdropFilter/IndexedStack perf pass — real functional changes, not just
+doc updates. This project's own standing rule is to verify source before
+trusting docs, and that applies just as much to a diff nobody here wrote as
+to inherited documentation. So the review traced the actual new logic
+(notification ID scheme, background-isolate routing for the Cancel action,
+the sender/receiver cancel-message handshake) against what the commit's own
+`PROGRESS.md`/`ARCHITECTURE.md`/`Roadmap.md` entries claimed, rather than
+re-summarizing those entries at face value.
+
+**Why the bottom-padding inconsemsistency was flagged but not fixed:** it's a
+real, verifiable inconsistency (five different bottom-padding values across
+six glass screens, traced to `extendBody` flipping to `false` without a
+matching pass to shrink every screen's own padding) — but it's cosmetic,
+touches no engine or state code, and John didn't ask for a fix, just a
+breakdown. Per this project's "flag but don't fix out-of-scope issues"
+principle, it's called out with the specific file/value list so it's a
+five-minute fix whenever John wants it, rather than silently corrected or
+silently ignored.
+
+**What wasn't attempted:** no `flutter analyze`/`flutter test` run (no SDK in
+this sandbox, same limitation as every prior session) — the 193-test-count
+claim was checked against source (grep count of `test(`/`testWidgets(`
+matches exactly), but pass/fail was not re-run and isn't claimed to be
+verified.
