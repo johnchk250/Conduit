@@ -404,13 +404,23 @@ object SafOps {
                     if (docUri == null) {
                         result.error("not_found", "File not found: $relPath", null)
                     } else {
-                        // Resolve MIME type: first ask the provider, fall back to
-                        // file extension, then use a generic binary stream type.
-                        val mimeType = ctx.contentResolver.getType(docUri)
-                            ?: MimeTypeMap.getSingleton()
-                                .getMimeTypeFromExtension(
-                                    relPath.substringAfterLast('.').lowercase()
-                                )
+                        // Resolve MIME type: extension first, provider type as
+                        // fallback, then a generic binary stream type.
+                        //
+                        // Extension must come first, not last: every file this app
+                        // writes via SAF (see createDocument calls above) is created
+                        // with the literal type "application/octet-stream", so
+                        // ctx.contentResolver.getType(docUri) always returns that
+                        // non-null placeholder and a `providerType ?: extensionType`
+                        // ordering would never reach the extension lookup — every
+                        // received file would open (or fail to open) as a generic
+                        // binary blob regardless of its real type.
+                        val extMime = MimeTypeMap.getSingleton()
+                            .getMimeTypeFromExtension(
+                                relPath.substringAfterLast('.', "").lowercase()
+                            )
+                        val mimeType = extMime
+                            ?: ctx.contentResolver.getType(docUri)
                             ?: "application/octet-stream"
                         val intent = Intent(Intent.ACTION_VIEW).apply {
                             setDataAndType(docUri, mimeType)

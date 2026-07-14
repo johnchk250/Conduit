@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
+import '../diag.dart';
 import '../sync/manifest.dart';
 
 const _chPick = MethodChannel('conduit/saf_pick_tree');
@@ -133,8 +134,18 @@ class SafFileSystemAccess implements FileSystemAccess {
         'treeUri': treeUri,
         'relPath': relPath,
       });
-    } catch (_) {
+    } catch (e) {
       // Best-effort: no handler for this MIME type, or the file was deleted.
+      // TEMP diagnostic logging (2026-07-14): this was a bare `catch (_) {}`,
+      // which is exactly why the MIME-type bug (every file resolving to
+      // application/octet-stream, so no app could open it) was invisible —
+      // the native "no_handler" error was thrown and immediately discarded.
+      // Logging it now so any future failure here is visible instead of silent.
+      Diag.log('open_file_failed', fields: {
+        'treeUri': treeUri,
+        'relPath': relPath,
+        'error': e.toString(),
+      });
     }
   }
 }

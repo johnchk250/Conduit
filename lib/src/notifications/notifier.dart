@@ -4,12 +4,28 @@ import 'dart:ui';
 
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
+import '../diag.dart';
+
 /// Background notification response handler. Runs on a background isolate
 /// when showsUserInterface is false, forwarding the response back to the main isolate
 /// via the registered SendPort.
+///
+/// TEMP diagnostic logging (2026-07-14): the cancel-button report ("nothing
+/// happens") could break at several points — the tap never reaching this
+/// background isolate at all, the port lookup failing, or the main isolate
+/// never getting the forwarded message. These Diag.log calls (always-on,
+/// visible in `flutter run`/logcat as `[Conduit][diag]` lines) make it
+/// possible to tell which. Safe to leave in permanently or strip once the
+/// cause is confirmed — remove this comment block when that happens.
 @pragma('vm:entry-point')
 void notificationTapBackground(NotificationResponse response) {
   final sendPort = IsolateNameServer.lookupPortByName('conduit_notification_port');
+  Diag.log('notif_tap_background', fields: {
+    'actionId': response.actionId,
+    'responseType': response.notificationResponseType.toString(),
+    'hasPayload': response.payload != null,
+    'portFound': sendPort != null,
+  });
   sendPort?.send(response);
 }
 
@@ -106,10 +122,24 @@ class AppNotifier {
   /// All other notifications have no payload and are ignored — tapping them
   /// simply brings the app to the foreground as before.
   void _onNotificationResponse(NotificationResponse response) {
+    // TEMP diagnostic logging (2026-07-14) — see notificationTapBackground's
+    // doc comment. This confirms the response actually reached the main
+    // isolate (whether via the direct foreground callback or the background
+    // bridge) before we look at what it says.
+    Diag.log('notif_tap_main', fields: {
+      'actionId': response.actionId,
+      'responseType': response.notificationResponseType.toString(),
+      'hasPayload': response.payload != null,
+    });
+
     if (response.notificationResponseType ==
         NotificationResponseType.selectedNotificationAction) {
       if (response.actionId == 'cancel_receive') {
         final offerId = response.payload;
+        Diag.log('cancel_action_received', fields: {
+          'offerId': offerId,
+          'callbackSet': onCancelReceiveTap != null,
+        });
         if (offerId != null && offerId.isNotEmpty) {
           onCancelReceiveTap?.call(offerId);
         }

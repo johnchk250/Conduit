@@ -1915,3 +1915,74 @@ update).
 **Verdict:** no structural or logic defects found. Three minor cosmetic/
 consistency items flagged above for a future pass. Safe to keep building on
 top of as-is.
+
+## 2026-07-14 (fix session) — Diagnosed and fixed the tap-to-open bug, added diagnostics for the cancel button
+
+**Context:** John reported that both new receiver-side features from `b7a7d8e`
+(tap a "File received" notification to open the file; tap "Cancel" on a
+receive-progress notification) were not working at all on-device.
+
+**Root cause found and fixed — tap-to-open file:**
+`SafOps.kt`'s `openFile` handler resolved MIME type as
+`ctx.contentResolver.getType(docUri) ?: <extension guess> ?: "application/octet-stream"`.
+Every file this app writes via SAF is created with the literal placeholder
+type `"application/octet-stream"` (see the three `createDocument(...)` calls
+elsewhere in this file) — so `getType()` never returns null, the extension
+guess never runs, and every received file opens (attempts to open) as a
+generic binary blob, which essentially no app on the device registers a
+viewer for. Result: `ActivityNotFoundException` on every single file, caught
+and silently discarded (`result.error("no_handler", ...)` → a bare
+`catch (_) {}` on the Dart side) — total, silent failure, matching exactly
+what John saw.
+
+**Fix applied:** reordered the fallback chain so extension-based lookup runs
+first, with the provider's `getType()` only as a fallback for extensionless
+files:
+```kotlin
+val extMime = MimeTypeMap.getSingleton()
+    .getMimeTypeFromExtension(relPath.substringAfterLast('.', "").lowercase())
+val mimeType = extMime
+    ?: ctx.contentResolver.getType(docUri)
+    ?: "application/octet-stream"
+```
+Also fixed a latent edge case in the same line: the old
+`relPath.substringAfterLast('.')` returns the *whole string* (not empty) when
+there's no `.` in the filename — passed a `missingDelimiterValue` default of
+`""` instead, so extensionless files fall through to the provider/generic
+type cleanly instead of trying to look up a bogus "extension" that's really
+the entire filename.
+
+**Cancel button — not found, so instrumented instead of guessed further:**
+traced the full chain (action wiring → `showsUserInterface: false` routing
+→ `notificationTapBackground`/`IsolateNameServer` bridge for a killed app →
+direct `_onNotificationResponse` for the far more common case where
+Conduit's own foreground service keeps the isolate alive → `cancelInboundOffer`'s
+sink/session handshake) and found no code-level defect — every piece mirrors
+an already-working pattern elsewhere in this codebase. Rather than keep
+guessing blind, added always-on `Diag.log` lines (visible as
+`[Conduit][diag]` in `flutter run`/logcat) at every handoff point:
+- `notificationTapBackground` — logs actionId/responseType/payload-presence/
+  port-lookup-success, so we can tell if the tap ever reaches Dart when the
+  app isn't in the foreground.
+- `_onNotificationResponse` — logs the same, so we can tell if it reaches the
+  main isolate (whichever path it took).
+- `cancel_action_received` — logs the offerId and whether
+  `onCancelReceiveTap` is actually set at that moment.
+- `cancelInboundOffer` — logs the offerId and whether it matched a live
+  entry in `_inbound` (a "not found" here would mean the offer had already
+  finished/errored by the time the tap was processed, not a wiring bug).
+- `SafFileSystemAccess.openFile`'s Dart-side catch — was a bare `catch (_) {}`,
+  now logs the actual native error. This also serves as confirmation the MIME
+  fix above worked (should stop firing entirely once rebuilt).
+
+**Next step for John:** rebuild fully (native Kotlin change — hot reload/
+restart won't pick it up) and re-test both features. For tap-to-open, it
+should just work now. For Cancel, the `[Conduit][diag]` log lines from a
+single test tap will show exactly which handoff point the chain breaks at,
+if it still doesn't work — that's the fastest path to a second fix without
+further blind guessing.
+
+**Not verified this session (no Flutter/Android toolchain in this sandbox,
+standing limitation):** whether the MIME fix actually opens files correctly
+on-device, and whether the diagnostic logs pinpoint the cancel issue as
+predicted. Both need John's device to confirm.

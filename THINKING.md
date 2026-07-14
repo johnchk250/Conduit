@@ -843,3 +843,44 @@ this sandbox, same limitation as every prior session) — the 193-test-count
 claim was checked against source (grep count of `test(`/`testWidgets(`
 matches exactly), but pass/fail was not re-run and isn't claimed to be
 verified.
+
+---
+
+## 2026-07-14 (fix session) — Why extension-first, and why instrument instead of keep guessing on Cancel
+
+**Why the MIME fix reorders instead of just special-casing the placeholder:**
+the obvious quick patch would be `if (providerType == "application/octet-stream") useExtension()`,
+but that's fragile — it silently breaks again if a *real* octet-stream file
+is ever legitimately received (rare, but possible), and it hard-codes
+knowledge of this app's own write-path convention into the read path in a
+brittle way. Extension-first is simpler and correct regardless of what the
+provider says: for a file Conduit itself wrote, the extension in `relPath` is
+always trustworthy (it's literally the filename Conduit chose), so there's no
+real case where checking the provider's type FIRST would ever have been more
+correct — the provider is only useful as a fallback for extensionless files.
+
+**Why the Cancel button got instrumentation instead of a guessed fix:**
+every candidate I traced (background-isolate routing rules, the
+IsolateNameServer bridge, the direct foreground path, the sink/session
+handshake in `cancelInboundOffer`) checked out as correct against both the
+plugin's documented behavior and this codebase's own existing, working
+patterns. Changing code on a hunch when the existing code already looks
+right risks introducing a *new* bug while leaving the real one in place, and
+would burn a lot of John's re-test cycles confirming or ruling out each guess
+one at a time. Diagnostic logging that pinpoints exactly which handoff
+breaks — reachable in ONE test tap — is strictly faster and doesn't touch
+behavior at all, so it carries no risk of making things worse.
+
+**Why `Diag.log` and not a new logging mechanism:** this project already has
+an always-on, structured, grep-friendly diagnostic channel for exactly this
+kind of "trace a message/event across a boundary" problem (originally built
+for wire-message correlation between two devices). Reusing it means John
+doesn't need to change how he looks at logs — the new lines show up
+alongside everything else with the same `[Conduit][diag]` prefix.
+
+**What wasn't attempted:** no on-device test (no Flutter/Android toolchain in
+this sandbox — standing limitation, same as every prior session). The MIME
+fix is verified by static tracing of the exact code path, not by opening a
+file on a real device. The diagnostic logging is a deliberate "can't be
+certain without a device, so build the fastest possible confirmation loop"
+move, not a substitute for actually finding the second bug.

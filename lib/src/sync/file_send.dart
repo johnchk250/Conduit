@@ -632,6 +632,15 @@ class AdHocFileSend {
   /// Cancel an inbound offer locally, notify the sender, and dismiss notification.
   void cancelInboundOffer(String offerId) {
     final offer = _inbound[offerId];
+    // TEMP diagnostic logging (2026-07-14) — see notifier.dart's
+    // notificationTapBackground doc comment. If cancel taps are reaching here
+    // (confirmed by the notif_tap_main/cancel_action_received log lines) but
+    // the transfer doesn't stop, "found: false" here means the offerId from
+    // the notification payload no longer matches a live offer (e.g. it
+    // already finished or errored out before the tap was processed).
+    onLog(
+      'cancelInboundOffer called: offerId=$offerId found=${offer != null}',
+    );
     if (offer == null) return;
 
     // Unblock the local block-pull loop with an error message
