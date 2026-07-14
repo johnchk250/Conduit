@@ -183,6 +183,12 @@ class AppNotifier {
           AndroidNotificationAction(
             'cancel_receive',
             'Cancel',
+            // The live inbound offer exists in the main Flutter engine.
+            // Running this action in the plugin's separate background engine
+            // cannot reach that in-memory state, so the notification merely
+            // reappears on the next progress update. Route it to the main
+            // engine instead, where [_onNotificationResponse] cancels it.
+            showsUserInterface: true,
             cancelNotification: true,
           ),
         ],

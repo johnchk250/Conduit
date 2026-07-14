@@ -99,6 +99,12 @@
             android:enabled="true"
             android:exported="false"/>
 
+        <!-- Required by flutter_local_notifications for notification action
+             buttons. Routes the receiving-transfer "Cancel" action to the
+             Dart notification callback. -->
+        <receiver
+            android:name="com.dexterous.flutterlocalnotifications.ActionBroadcastReceiver"
+            android:exported="false"/>
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

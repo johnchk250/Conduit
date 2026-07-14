@@ -1,6 +1,10 @@
+import 'dart:io';
+
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
@@ -58,6 +62,10 @@ class _SendFlowViewState extends State<SendFlowView> {
   List<_PickedFile>? _pickedFiles;
   bool _autoStartSharedFiles = false;
   bool _autoStartScheduled = false;
+
+  // Drag-and-drop state — true while the user is hovering dragged items over
+  // this widget's drop target area.
+  bool _isDragging = false;
 
   // Which paired-but-offline device (if any) is currently being reconnected
   // via a chip tap, so that one chip alone shows a spinner.
@@ -135,7 +143,10 @@ class _SendFlowViewState extends State<SendFlowView> {
   List<String> get _fileNames {
     final out = <String>[];
     if (_sharedFiles != null) out.addAll(_sharedFiles!.map((f) => f.name));
-    if (_pickedFiles != null) out.addAll(_pickedFiles!.map((f) => f.name));
+    // Use displayName (short label for folder-expanded files) when available.
+    if (_pickedFiles != null) {
+      out.addAll(_pickedFiles!.map((f) => f.displayName ?? f.name));
+    }
     return out;
   }
 
@@ -173,6 +184,66 @@ class _SendFlowViewState extends State<SendFlowView> {
         );
       }
     }
+  }
+
+  // ── Drag-and-drop ────────────────────────────────────────────────────────
+
+  /// Called when the user drops items (files and/or folders) onto the target.
+  /// Folders are expanded recursively; relative paths within each dropped
+  /// folder are preserved in the file name so the receiver gets the directory
+  /// tree intact (e.g. "MyFolder/sub/photo.jpg").
+  Future<void> _onDropItems(DropDoneDetails details) async {
+    final picked = <_PickedFile>[];
+
+    for (final xfile in details.files) {
+      final fsPath = xfile.path;
+      final entity = FileSystemEntity.typeSync(fsPath);
+
+      if (entity == FileSystemEntityType.directory) {
+        // Recursively walk the folder and collect all files, preserving their
+        // path relative to the parent directory (not the folder itself, so the
+        // folder name is included as the first component).
+        final dir = Directory(fsPath);
+        final folderName = p.basename(fsPath);
+        await for (final sub in dir.list(recursive: true, followLinks: false)) {
+          if (sub is File) {
+            // Build a relative path from the parent of the dropped folder.
+            final rel = p.relative(sub.path, from: p.dirname(fsPath));
+            // Normalise Windows back-slashes to forward-slashes for the wire.
+            final relNorm = rel.replaceAll(r'\', '/');
+            final size = await sub.length();
+            picked.add(_PickedFile(
+              name: relNorm,
+              displayName: '$folderName/…/${p.basename(sub.path)}',
+              path: sub.path,
+              size: size,
+            ));
+          }
+        }
+      } else if (entity == FileSystemEntityType.file) {
+        final file = File(fsPath);
+        final size = await file.length();
+        picked.add(_PickedFile(
+          name: p.basename(fsPath),
+          path: fsPath,
+          size: size,
+        ));
+      }
+      // Symlinks and other entity types are silently skipped.
+    }
+
+    if (picked.isEmpty) return;
+    if (!mounted) return;
+
+    setState(() {
+      _sharedFiles = null;
+      _pickedFiles = (_pickedFiles ?? [])..addAll(picked);
+      _autoStartSharedFiles = false;
+      _autoStartScheduled = false;
+      _phase = _SendPhase.idle;
+      _resultMessage = null;
+      _isDragging = false;
+    });
   }
 
   void _resetSpeedTracking() {
@@ -620,58 +691,85 @@ class _SendFlowViewState extends State<SendFlowView> {
   }
 
   Widget _buildPickState(BuildContext context, GlassColors c, bool anyConnected) {
-    final accent = anyConnected ? c.violet : c.textTertiary;
-    return InkWell(
-      onTap: anyConnected ? _pickAndQueueFiles : null,
-      borderRadius: BorderRadius.circular(18),
-      child: GlassPanel(
-        padding: EdgeInsets.all(widget.compact ? 20 : 32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: widget.compact ? 60 : 92,
-              height: widget.compact ? 60 : 92,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: RadialGradient(
-                  colors: [
-                    accent.withValues(alpha: 0.2),
-                    accent.withValues(alpha: 0.05),
-                  ],
+    final accent = _isDragging ? c.violet : (anyConnected ? c.violet : c.textTertiary);
+    return DropTarget(
+      onDragEntered: (_) => setState(() => _isDragging = true),
+      onDragExited: (_) => setState(() => _isDragging = false),
+      onDragDone: anyConnected ? _onDropItems : null,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: _isDragging
+                ? c.violet.withValues(alpha: 0.8)
+                : Colors.transparent,
+            width: 2,
+          ),
+          color: _isDragging
+              ? c.violet.withValues(alpha: 0.07)
+              : Colors.transparent,
+        ),
+        child: InkWell(
+          onTap: anyConnected ? _pickAndQueueFiles : null,
+          borderRadius: BorderRadius.circular(18),
+          child: GlassPanel(
+            padding: EdgeInsets.all(widget.compact ? 20 : 32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: widget.compact ? 60 : 92,
+                  height: widget.compact ? 60 : 92,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: RadialGradient(
+                      colors: [
+                        accent.withValues(alpha: _isDragging ? 0.35 : 0.2),
+                        accent.withValues(alpha: 0.05),
+                      ],
+                    ),
+                    border: Border.all(
+                        color: accent.withValues(
+                            alpha: _isDragging ? 0.7 : 0.3)),
+                  ),
+                  child: Icon(
+                    _isDragging
+                        ? Icons.move_to_inbox_rounded
+                        : Icons.upload_file_rounded,
+                    size: widget.compact ? 28 : 44,
+                    color: accent,
+                  ),
                 ),
-                border: Border.all(color: accent.withValues(alpha: 0.3)),
-              ),
-              child: Icon(
-                Icons.upload_file_rounded,
-                size: widget.compact ? 28 : 44,
-                color: accent,
-              ),
-            ),
-            SizedBox(height: widget.compact ? 14 : 24),
-            Text(
-              'Click to choose files',
-              style: GoogleFonts.manrope(
-                textStyle: TextStyle(
-                  fontWeight: FontWeight.bold,
-                  color: anyConnected ? c.textPrimary : c.textTertiary,
-                  fontSize: widget.compact ? 15 : 17,
+                SizedBox(height: widget.compact ? 14 : 24),
+                Text(
+                  _isDragging
+                      ? 'Drop to add files'
+                      : 'Click to choose files',
+                  style: GoogleFonts.manrope(
+                    textStyle: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: anyConnected ? c.textPrimary : c.textTertiary,
+                      fontSize: widget.compact ? 15 : 17,
+                    ),
+                  ),
+                  textAlign: TextAlign.center,
                 ),
-              ),
-              textAlign: TextAlign.center,
+                const SizedBox(height: 6),
+                Text(
+                  anyConnected
+                      ? 'Drag files or folders here — or share from any app.'
+                      : 'Connect a device first, then pick a file to send.',
+                  style: GoogleFonts.inter(
+                    textStyle:
+                        TextStyle(color: c.textSecondary, fontSize: 12.5),
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ],
             ),
-            const SizedBox(height: 6),
-            Text(
-              anyConnected
-                  ? 'Or share from any app — Conduit shows up in your '
-                      'share sheet automatically.'
-                  : 'Connect a device first, then pick a file to send.',
-              style: GoogleFonts.inter(
-                textStyle: TextStyle(color: c.textSecondary, fontSize: 12.5),
-              ),
-              textAlign: TextAlign.center,
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -679,78 +777,110 @@ class _SendFlowViewState extends State<SendFlowView> {
 
   Widget _buildReadyState(BuildContext context, GlassColors c, AppState state, bool anyConnected) {
     final names = _fileNames;
-    return GlassPanel(
-      padding: EdgeInsets.all(widget.compact ? 16 : 24),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: widget.compact ? 64 : 80,
-            height: widget.compact ? 64 : 80,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: RadialGradient(
-                colors: [
-                  c.violet.withValues(alpha: 0.2),
-                  c.violet.withValues(alpha: 0.05),
-                ],
-              ),
-              border: Border.all(color: c.violet.withValues(alpha: 0.3)),
-            ),
-            child: Icon(Icons.insert_drive_file_rounded,
-                size: widget.compact ? 30 : 40,
-                color: c.violet),
+    return DropTarget(
+      onDragEntered: (_) => setState(() => _isDragging = true),
+      onDragExited: (_) => setState(() => _isDragging = false),
+      onDragDone: anyConnected ? _onDropItems : null,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: _isDragging
+                ? c.violet.withValues(alpha: 0.8)
+                : Colors.transparent,
+            width: 2,
           ),
-          SizedBox(height: widget.compact ? 12 : 20),
-          Text(
-            '$_fileCount file${_fileCount == 1 ? '' : 's'} ready',
-            style: GoogleFonts.manrope(
-              textStyle: TextStyle(
-                color: c.textPrimary,
-                fontWeight: FontWeight.bold,
-                fontSize: 16.5,
-              ),
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            names.take(4).join(', ') +
-                (names.length > 4 ? ', +${names.length - 4} more' : ''),
-            style: GoogleFonts.inter(
-              textStyle: TextStyle(color: c.textSecondary, fontSize: 12.5),
-            ),
-            textAlign: TextAlign.center,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-          SizedBox(height: widget.compact ? 16 : 24),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+          color: _isDragging
+              ? c.violet.withValues(alpha: 0.07)
+              : Colors.transparent,
+        ),
+        child: GlassPanel(
+          padding: EdgeInsets.all(widget.compact ? 16 : 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              GlassButton(
-                icon: Icons.add_rounded,
-                label: 'Add',
-                accentColor: c.violet,
-                style: GlassButtonStyle.outline,
-                enabled: anyConnected,
-                onTap: _pickAndQueueFiles,
-                compact: true,
+              Container(
+                width: widget.compact ? 64 : 80,
+                height: widget.compact ? 64 : 80,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: RadialGradient(
+                    colors: [
+                      c.violet.withValues(alpha: _isDragging ? 0.35 : 0.2),
+                      c.violet.withValues(alpha: 0.05),
+                    ],
+                  ),
+                  border: Border.all(
+                      color:
+                          c.violet.withValues(alpha: _isDragging ? 0.7 : 0.3)),
+                ),
+                child: Icon(
+                  _isDragging
+                      ? Icons.move_to_inbox_rounded
+                      : Icons.insert_drive_file_rounded,
+                  size: widget.compact ? 30 : 40,
+                  color: c.violet,
+                ),
               ),
-              const SizedBox(width: 10),
-              GlassButton(
-                icon: Icons.send_rounded,
-                label: _selectedPeer != null
-                    ? 'Send to ${_selectedPeer!.name}'
-                    : 'Send',
-                accentColor: c.violet,
-                style: GlassButtonStyle.primary,
-                enabled: anyConnected && _selectedPeer != null,
-                onTap: () => _sendFiles(state),
-                compact: true,
+              SizedBox(height: widget.compact ? 12 : 20),
+              Text(
+                _isDragging
+                    ? 'Drop to add more'
+                    : '$_fileCount file${_fileCount == 1 ? '' : 's'} ready',
+                style: GoogleFonts.manrope(
+                  textStyle: TextStyle(
+                    color: c.textPrimary,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16.5,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _isDragging
+                    ? 'Files & folders will be added to the queue'
+                    : names.take(4).join(', ') +
+                        (names.length > 4 ? ', +${names.length - 4} more' : ''),
+                style: GoogleFonts.inter(
+                  textStyle:
+                      TextStyle(color: c.textSecondary, fontSize: 12.5),
+                ),
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              SizedBox(height: widget.compact ? 16 : 24),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  GlassButton(
+                    icon: Icons.add_rounded,
+                    label: 'Add',
+                    accentColor: c.violet,
+                    style: GlassButtonStyle.outline,
+                    enabled: anyConnected,
+                    onTap: _pickAndQueueFiles,
+                    compact: true,
+                  ),
+                  const SizedBox(width: 10),
+                  GlassButton(
+                    icon: Icons.send_rounded,
+                    label: _selectedPeer != null
+                        ? 'Send to ${_selectedPeer!.name}'
+                        : 'Send',
+                    accentColor: c.violet,
+                    style: GlassButtonStyle.primary,
+                    enabled: anyConnected && _selectedPeer != null,
+                    onTap: () => _sendFiles(state),
+                    compact: true,
+                  ),
+                ],
               ),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -966,15 +1096,23 @@ class _QueuedFile {
       );
 }
 
-// A file loaded by the in-app file picker (not from the OS share sheet).
+// A file loaded by the in-app file picker or drag-and-drop (not from the OS
+// share sheet).
+//
+// [name] is the on-wire / receiver-visible name. For files inside a dragged
+// folder this includes the folder-relative path, e.g. "Photos/2024/pic.jpg".
+// [displayName] is an optional short label shown in the UI instead of [name]
+// when [name] is a long relative path.
 class _PickedFile {
   final String name;
+  final String? displayName;
   final List<int>? bytes;
   final String? path;
   final int size;
 
   const _PickedFile({
     required this.name,
+    this.displayName,
     this.bytes,
     this.path,
     required this.size,
