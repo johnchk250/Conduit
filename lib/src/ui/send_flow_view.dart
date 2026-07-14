@@ -31,6 +31,7 @@ class SendFlowView extends StatefulWidget {
     this.compact = false,
     this.onRequestClose,
     this.hideTitle = false,
+    this.initialPeerId,
   });
 
   /// True for the small send-widget popup; false for the full "Send" tab.
@@ -45,6 +46,8 @@ class SendFlowView extends StatefulWidget {
   /// If true, suppresses rendering the default 'Send' page title inside the layout.
   final bool hideTitle;
 
+  final String? initialPeerId;
+
   @override
   State<SendFlowView> createState() => _SendFlowViewState();
 }
@@ -53,6 +56,20 @@ enum _SendPhase { idle, sending, done, error }
 
 class _SendFlowViewState extends State<SendFlowView> {
   PairedPeer? _selectedPeer;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.initialPeerId != null) {
+      final state = context.read<AppState>();
+      for (final p in state.config.pairedPeers) {
+        if (p.deviceId == widget.initialPeerId) {
+          _selectedPeer = p;
+          break;
+        }
+      }
+    }
+  }
   _SendPhase _phase = _SendPhase.idle;
 
   // Files loaded from the OS share/send mechanism (Phase 3d). These come in

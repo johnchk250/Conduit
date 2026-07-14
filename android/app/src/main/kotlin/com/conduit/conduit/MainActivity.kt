@@ -20,6 +20,16 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import android.content.IntentFilter
+import android.os.BatteryManager
+import android.os.StatFs
+import android.os.Vibrator
+import android.os.VibrationEffect
+import android.os.VibratorManager
+import android.media.RingtoneManager
+import android.media.Ringtone
+import android.os.Handler
+import android.os.Looper
 
 class MainActivity : FlutterActivity() {
 
@@ -59,6 +69,13 @@ class MainActivity : FlutterActivity() {
     private lateinit var shareChannel: MethodChannel
     private var shareHandlerReady = false
     private val pendingShareUris = mutableListOf<String>()
+
+    private var activeRingtone: Ringtone? = null
+    private var activeVibrator: Vibrator? = null
+    private var alertHandler: Handler? = null
+    private val alertStopRunnable = Runnable {
+        stopAlertSoundAndVibration()
+    }
 
     // Keep the Dart isolate alive when the Android activity is removed from
     // recents. The foreground service keeps the process foreground; this keeps
@@ -258,6 +275,77 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // Channel for Phone Dashboard status & alert actions (Roadmap P1 & P2)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "conduit/phone_dashboard")
+            .setMethodCallHandler { call, result ->
+                val context = applicationContext
+                when (call.method) {
+                    "getDeviceStatus" -> {
+                        try {
+                            val statusMap = mutableMapOf<String, Any>()
+                            
+                            // 1. Battery Status
+                            val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                            val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                            val scale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+                            val pct = if (level >= 0 && scale > 0) (level * 100 / scale) else -1
+                            statusMap["batteryPct"] = pct
+                            
+                            val bStatus = batteryIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                            val powerState = when (bStatus) {
+                                BatteryManager.BATTERY_STATUS_CHARGING -> "charging"
+                                BatteryManager.BATTERY_STATUS_FULL -> "full"
+                                BatteryManager.BATTERY_STATUS_DISCHARGING -> "discharging"
+                                BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "discharging"
+                                else -> "unknown"
+                            }
+                            statusMap["power"] = powerState
+                            
+                            // 2. Storage Status
+                            val filesDir = context.filesDir
+                            val stat = StatFs(filesDir.path)
+                            statusMap["storageAvailableBytes"] = stat.availableBytes
+                            statusMap["storageTotalBytes"] = stat.totalBytes
+                            
+                            // 3. Power Manager States
+                            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                            statusMap["powerSaverMode"] = pm.isPowerSaveMode
+                            statusMap["batteryOptimizationWarning"] = !pm.isIgnoringBatteryOptimizations(context.packageName)
+                            
+                            result.success(statusMap)
+                        } catch (e: Exception) {
+                            result.error("DEVICE_STATUS_ERROR", e.message, null)
+                        }
+                    }
+                    "setPhoneAlertEnabled" -> {
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        val prefs = context.getSharedPreferences("conduit_phone_dashboard", Context.MODE_PRIVATE)
+                        prefs.edit().putBoolean("allow_phone_alert", enabled).apply()
+                        result.success(null)
+                    }
+                    "playPhoneAlert" -> {
+                        val prefs = context.getSharedPreferences("conduit_phone_dashboard", Context.MODE_PRIVATE)
+                        val allowed = prefs.getBoolean("allow_phone_alert", true)
+                        if (!allowed) {
+                            result.success("disabled")
+                            return@setMethodCallHandler
+                        }
+                        
+                        val started = playAlertSoundAndVibration(context)
+                        if (started) {
+                            result.success("started")
+                        } else {
+                            result.success("failed")
+                        }
+                    }
+                    "stopPhoneAlert" -> {
+                        stopAlertSoundAndVibration()
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
     }
 
     // -------------------------------------------------------------------------
@@ -404,7 +492,64 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun playAlertSoundAndVibration(context: Context): Boolean {
+        stopAlertSoundAndVibration()
+
+        try {
+            val alertUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            
+            if (alertUri != null) {
+                activeRingtone = RingtoneManager.getRingtone(context, alertUri)
+                activeRingtone?.play()
+            }
+
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                vm.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            }
+            activeVibrator = vibrator
+
+            val pattern = longArrayOf(0, 500, 500)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(pattern, 0)
+            }
+
+            alertHandler = Handler(Looper.getMainLooper())
+            alertHandler?.postDelayed(alertStopRunnable, 25000)
+
+            return true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            stopAlertSoundAndVibration()
+            return false
+        }
+    }
+
+    private fun stopAlertSoundAndVibration() {
+        try {
+            activeRingtone?.stop()
+        } catch (_: Exception) {}
+        activeRingtone = null
+
+        try {
+            activeVibrator?.cancel()
+        } catch (_: Exception) {}
+        activeVibrator = null
+
+        alertHandler?.removeCallbacks(alertStopRunnable)
+        alertHandler = null
+    }
+
     override fun onDestroy() {
+        stopAlertSoundAndVibration()
         // Save the running engine to cache BEFORE releasing anything.
         // shouldDestroyEngineWithHost()=false means Flutter will not call
         // engine.destroy() — but without this cache entry the engine object

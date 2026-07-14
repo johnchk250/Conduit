@@ -92,6 +92,19 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   final _discoveredPeers = _DiscoveredPeerCache();
   final List<SyncEvent> _events = [];
   final Map<String, PairSyncState> _pairStates = {};
+
+  final Map<String, DeviceDashboardState> _dashboardStates = {};
+  Map<String, DeviceDashboardState> get dashboardStates => _dashboardStates;
+
+  DeviceDashboardState getOrCreateDashboardState(String deviceId) {
+    return _dashboardStates.putIfAbsent(deviceId, () => DeviceDashboardState(deviceId: deviceId));
+  }
+
+  Timer? _androidStatusTimer;
+  Map<String, dynamic>? _lastSentStatus;
+  DateTime? _lastFullRefreshTime;
+  final Map<String, Completer<String>> _pendingAlertCompleters = {};
+  int _alertIdCounter = 0;
   // In-flight outbound connects (guard against parallel dials for one peer).
   final _connectingPeerIds = <String>{};
 
@@ -185,6 +198,33 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
     _identity = await DeviceIdentity.loadOrCreate(platform: platform);
     _config = await ConfigStore.load();
+
+    // Load persisted dashboard states
+    final snapshots = _config.deviceStatusSnapshots;
+    snapshots.forEach((deviceId, data) {
+      if (data is Map<String, dynamic>) {
+        final state = getOrCreateDashboardState(deviceId);
+        state.batteryPct = data['batteryPct'] as int?;
+        state.powerState = data['powerState'] as String?;
+        state.storageAvailableBytes = data['storageAvailableBytes'] as int?;
+        state.storageTotalBytes = data['storageTotalBytes'] as int?;
+        state.conduitHealth = data['conduitHealth'] as Map<String, dynamic>?;
+        state.pairHealth = data['pairHealth'] as Map<String, dynamic>?;
+        if (data['statusReceivedAt'] != null) {
+          state.statusReceivedAt = DateTime.tryParse(data['statusReceivedAt'] as String);
+        }
+        if (data['lastSeenAt'] != null) {
+          state.lastSeenAt = DateTime.tryParse(data['lastSeenAt'] as String);
+        }
+        if (data['lastDisconnectedAt'] != null) {
+          state.lastDisconnectedAt = DateTime.tryParse(data['lastDisconnectedAt'] as String);
+        }
+        if (data['connectedAt'] != null) {
+          state.connectedAt = DateTime.tryParse(data['connectedAt'] as String);
+        }
+      }
+    });
+
     _fs = platform == 'android'
         ? const SafFileSystemAccess()
         : const LocalFileSystemAccess();
@@ -210,6 +250,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       onClipboardPush: _onClipboardPushReceived,
       // Phase 4: route an inbound remote command to the PC executor.
       onRunCommand: _onRunCommandReceived,
+      onDeviceStatus: _onDeviceStatusReceived,
+      onPhoneAction: _onPhoneActionReceived,
+      onPhoneActionResult: _onPhoneActionResultReceived,
       // Phase 0.6: on Android, give the watcher/scanner the batched SAF
       // lister instead of the per-file stat loop. Null (unchanged behaviour)
       // on every other platform.
@@ -535,9 +578,24 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     session.onLinkReady = () {
       if (_registry.generationOf(id) != session.generation) return;
+      final dstate = getOrCreateDashboardState(id);
+      dstate.connectedAt = DateTime.now();
+      dstate.lastSeenAt = DateTime.now();
+      _persistDashboardState(id);
+
       _supervisor.noteConnected(id);
       _applyBeaconMode();
       _clipboard?.onPeerConnectivityChanged();
+      notifyListeners();
+    };
+
+    session.onHeartbeat = () {
+      if (_registry.generationOf(id) != session.generation) return;
+      final dstate = getOrCreateDashboardState(id);
+      dstate.latestRttMs = session.latestRttMs;
+      dstate.recentRttMs = List<int>.from(session.recentRttMs);
+      dstate.missedHeartbeats = session.missedHeartbeats;
+      dstate.lastSeenAt = DateTime.now();
       notifyListeners();
     };
 
@@ -575,6 +633,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         _engine.onPeerSessionLost(id); // cancel in-flight work for this session
         if (wasReady) {
           _engine.onPeerDisconnected(id);
+          final dstate = getOrCreateDashboardState(id);
+          dstate.lastDisconnectedAt = DateTime.now();
+          _persistDashboardState(id);
         }
         _supervisor.noteDisconnected(id); // schedule a reconnect
         _applyBeaconMode(); // Phase 0.3: last ready session gone -> fast beacon
@@ -621,6 +682,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // actually do something useful (no session live, so a new or returning
     // peer still needs to be discovered).
     _setDiscoveryLockEnabled(!anyLive);
+
+    if (anyLive) {
+      _startAndroidStatusSampling();
+    } else {
+      _stopAndroidStatusSampling();
+    }
   }
 
   /// Roadmap Phase 0.6 — battery: toggles the Android SyncService's
@@ -1038,6 +1105,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     _suppressedPeerIds.add(deviceId);
     _discoveredPeers.remove(deviceId);
+    _dashboardStates.remove(deviceId);
+    await _config.removeDeviceStatusSnapshot(deviceId);
     await _config.forgetPeer(deviceId);
     _applyBeaconMode();
     notifyListeners();
@@ -1060,6 +1129,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   static const _chSync = MethodChannel('conduit/sync_service');
   static const _chWakelock = MethodChannel('conduit/wakelock');
+  static const _chPhoneDashboard = MethodChannel('conduit/phone_dashboard');
   // Phase 3d: share channel — native pushes content:// or file-path URIs when
   // the user shares into Conduit from another app (Android share sheet) or
   // the Windows "Send to" context menu.
@@ -1075,6 +1145,222 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   // Phase 3d ---------------------------------------------------------------
+
+  bool isPairAcceptedByPeer(String pairId) => _engine.isPairAcceptedByPeer(pairId);
+
+  bool peerHasFeature(String peerId, String feature) {
+    final session = _registry.openSessionFor(peerId);
+    return session?.features.contains(feature) == true;
+  }
+
+  bool get allowPlayPhoneAlert => _config.allowPlayPhoneAlert;
+
+  Future<void> setAllowPlayPhoneAlert(bool value) async {
+    await _config.setAllowPlayPhoneAlert(value);
+    if (Platform.isAndroid) {
+      await _chPhoneDashboard.invokeMethod<void>('setPhoneAlertEnabled', {'enabled': value});
+    }
+    notifyListeners();
+  }
+
+  Future<void> _persistDashboardState(String deviceId) async {
+    final dstate = _dashboardStates[deviceId];
+    if (dstate == null) return;
+    final map = <String, dynamic>{
+      if (dstate.batteryPct != null) 'batteryPct': dstate.batteryPct,
+      if (dstate.powerState != null) 'powerState': dstate.powerState,
+      if (dstate.storageAvailableBytes != null) 'storageAvailableBytes': dstate.storageAvailableBytes,
+      if (dstate.storageTotalBytes != null) 'storageTotalBytes': dstate.storageTotalBytes,
+      if (dstate.conduitHealth != null) 'conduitHealth': dstate.conduitHealth,
+      if (dstate.pairHealth != null) 'pairHealth': dstate.pairHealth,
+      if (dstate.statusReceivedAt != null) 'statusReceivedAt': dstate.statusReceivedAt!.toIso8601String(),
+      if (dstate.lastSeenAt != null) 'lastSeenAt': dstate.lastSeenAt!.toIso8601String(),
+      if (dstate.lastDisconnectedAt != null) 'lastDisconnectedAt': dstate.lastDisconnectedAt!.toIso8601String(),
+      if (dstate.connectedAt != null) 'connectedAt': dstate.connectedAt!.toIso8601String(),
+    };
+    await _config.saveDeviceStatusSnapshot(deviceId, map);
+  }
+
+  void _onDeviceStatusReceived(String peerId, Map<String, dynamic> msg) {
+    final schema = msg['schema'] as int?;
+    if (schema != 1) {
+      Diag.log('device_status_ignored', fields: {'reason': 'unknown schema $schema', 'peer': peerId});
+      return;
+    }
+    final dstate = getOrCreateDashboardState(peerId);
+    dstate.batteryPct = msg['batteryPct'] as int?;
+    dstate.powerState = msg['power'] as String?;
+    dstate.storageAvailableBytes = msg['storageAvailableBytes'] as int?;
+    dstate.storageTotalBytes = msg['storageTotalBytes'] as int?;
+    dstate.conduitHealth = msg['conduitHealth'] as Map<String, dynamic>?;
+    dstate.pairHealth = msg['pairHealth'] as Map<String, dynamic>?;
+    dstate.statusReceivedAt = DateTime.now();
+    dstate.lastSeenAt = DateTime.now();
+
+    _persistDashboardState(peerId);
+    notifyListeners();
+  }
+
+  Future<void> _onPhoneActionReceived(String peerId, String requestId, String action) async {
+    if (action == 'play_alert') {
+      final session = _registry.openSessionFor(peerId);
+      if (session == null || !session.isLinkReady) return;
+
+      String result = 'failed';
+      try {
+        final bool allowed = _config.allowPlayPhoneAlert;
+        if (!allowed) {
+          result = 'disabled';
+        } else {
+          final res = await _chPhoneDashboard.invokeMethod<String>('playPhoneAlert');
+          result = res ?? 'failed';
+        }
+      } catch (e) {
+        result = 'failed';
+      }
+
+      try {
+        session.send({
+          't': Msg.phoneActionResult,
+          'requestId': requestId,
+          'action': 'play_alert',
+          'result': result,
+        });
+      } catch (e) {
+        Diag.log('phone_action_result_send_error', fields: {'peer': peerId, 'error': e.toString()});
+      }
+    }
+  }
+
+  void _onPhoneActionResultReceived(String peerId, String requestId, String action, String result) {
+    final completer = _pendingAlertCompleters.remove(requestId);
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(result);
+    }
+  }
+
+  void _startAndroidStatusSampling() {
+    if (Platform.isAndroid) {
+      _androidStatusTimer?.cancel();
+      _androidStatusTimer = Timer.periodic(const Duration(seconds: 60), (_) => _sampleAndSendStatusIfNeeded());
+      _sampleAndSendStatusIfNeeded(forceFull: true);
+    }
+  }
+
+  void _stopAndroidStatusSampling() {
+    _androidStatusTimer?.cancel();
+    _androidStatusTimer = null;
+    _lastSentStatus = null;
+    _lastFullRefreshTime = null;
+  }
+
+  Future<void> _sampleAndSendStatusIfNeeded({bool forceFull = false}) async {
+    if (!Platform.isAndroid) return;
+    if (_registry.readyPeerIds.isEmpty) return;
+
+    try {
+      final res = await _chPhoneDashboard.invokeMethod<Map<dynamic, dynamic>>('getDeviceStatus');
+      if (res == null) return;
+
+      final current = Map<String, dynamic>.from(res);
+      bool shouldSend = false;
+      final now = DateTime.now();
+
+      if (forceFull || _lastSentStatus == null || _lastFullRefreshTime == null) {
+        shouldSend = true;
+      } else {
+        final lastBatteryPct = _lastSentStatus!['batteryPct'] as int?;
+        final currentBatteryPct = current['batteryPct'] as int?;
+        final lastPower = _lastSentStatus!['power'] as String?;
+        final currentPower = current['power'] as String?;
+
+        if (lastBatteryPct != currentBatteryPct || lastPower != currentPower) {
+          shouldSend = true;
+        }
+
+        if (now.difference(_lastFullRefreshTime!) >= const Duration(minutes: 10)) {
+          shouldSend = true;
+        }
+      }
+
+      if (shouldSend) {
+        final isFullRefresh = _lastFullRefreshTime == null || now.difference(_lastFullRefreshTime!) >= const Duration(minutes: 10) || forceFull;
+        if (isFullRefresh) {
+          _lastFullRefreshTime = now;
+        }
+
+        final msg = <String, dynamic>{
+          't': Msg.deviceStatus,
+          'schema': 1,
+          'batteryPct': current['batteryPct'],
+          'power': current['power'],
+        };
+
+        if (isFullRefresh) {
+          msg['storageAvailableBytes'] = current['storageAvailableBytes'];
+          msg['storageTotalBytes'] = current['storageTotalBytes'];
+          msg['conduitHealth'] = <String, dynamic>{
+            'powerSaverMode': current['powerSaverMode'],
+            'batteryOptimizationWarning': current['batteryOptimizationWarning'],
+            'isServiceRunning': true,
+          };
+          msg['pairHealth'] = <String, dynamic>{};
+        } else {
+          if (_lastSentStatus != null) {
+            msg['storageAvailableBytes'] = _lastSentStatus!['storageAvailableBytes'];
+            msg['storageTotalBytes'] = _lastSentStatus!['storageTotalBytes'];
+            msg['conduitHealth'] = _lastSentStatus!['conduitHealth'];
+            msg['pairHealth'] = _lastSentStatus!['pairHealth'];
+          }
+        }
+
+        _lastSentStatus = msg;
+
+        for (final peerId in _registry.readyPeerIds) {
+          final session = _registry.openSessionFor(peerId);
+          if (session != null && session.isLinkReady && session.features.contains('device_status_v1')) {
+            try {
+              session.send(msg);
+            } catch (e) {
+              Diag.log('device_status_send_error', fields: {'peer': peerId, 'error': e.toString()});
+            }
+          }
+        }
+      }
+    } catch (e) {
+      Diag.log('device_status_sample_error', fields: {'error': e.toString()});
+    }
+  }
+
+  Future<String> playPhoneAlert(String peerId) async {
+    final session = _registry.openSessionFor(peerId);
+    if (session == null || !session.isLinkReady) {
+      return 'offline';
+    }
+    if (!session.features.contains('phone_alert_v1')) {
+      return 'unsupported';
+    }
+
+    final requestId = '${DateTime.now().millisecondsSinceEpoch}-${_alertIdCounter++}';
+    final completer = Completer<String>();
+    _pendingAlertCompleters[requestId] = completer;
+
+    try {
+      session.send({
+        't': Msg.phoneAction,
+        'requestId': requestId,
+        'action': 'play_alert',
+      });
+    } catch (e) {
+      _pendingAlertCompleters.remove(requestId);
+      return 'failed';
+    }
+
+    return completer.future.timeout(const Duration(seconds: 10), onTimeout: () {
+      _pendingAlertCompleters.remove(requestId);
+      return 'timeout';
+    });
+  }
 
   /// Subscribe to the native→Dart share channel. Called once in [start].
   /// On Android: the method channel receives content:// URIs from the share
@@ -1245,8 +1531,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   /// UI → host: manual "send my clipboard now".
-  Future<bool> sendClipboard() =>
-      _clipboard?.sendCurrentClipboard() ?? Future.value(false);
+  Future<bool> sendClipboard({String? targetPeerId}) =>
+      _clipboard?.sendCurrentClipboard(targetPeerId: targetPeerId) ?? Future.value(false);
 
   // ---- Phase 4: remote command -----------------------------------------------
 
@@ -1699,5 +1985,39 @@ class PendingSharedFile {
     this.safUri,
     this.filePath,
     required this.size,
+  });
+}
+
+class DeviceDashboardState {
+  final String deviceId;
+  DateTime? connectedAt;
+  DateTime? lastSeenAt;
+  DateTime? lastDisconnectedAt;
+  int? latestRttMs;
+  List<int> recentRttMs = [];
+  int missedHeartbeats = 0;
+
+  // Status Snapshot fields
+  int? batteryPct;
+  String? powerState; // charging, full, discharging, unknown
+  int? storageAvailableBytes;
+  int? storageTotalBytes;
+  Map<String, dynamic>? conduitHealth;
+  Map<String, dynamic>? pairHealth;
+  DateTime? statusReceivedAt;
+
+  DeviceDashboardState({
+    required this.deviceId,
+    this.connectedAt,
+    this.lastSeenAt,
+    this.lastDisconnectedAt,
+    this.latestRttMs,
+    this.batteryPct,
+    this.powerState,
+    this.storageAvailableBytes,
+    this.storageTotalBytes,
+    this.conduitHealth,
+    this.pairHealth,
+    this.statusReceivedAt,
   });
 }

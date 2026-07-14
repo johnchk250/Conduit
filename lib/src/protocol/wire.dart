@@ -71,6 +71,11 @@ class Msg {
   //   volume_mute                — toggle mute
   static const runCommand = 'run_command'; // {name<String>}
 
+  // ---- Phone dashboard (2026-07-14 proposal) ------------------------------
+  static const deviceStatus = 'device_status';
+  static const phoneAction = 'phone_action';
+  static const phoneActionResult = 'phone_action_result';
+
   // ---- Ad-hoc file send (Roadmap Phase 3a) --------------------------------
   //
   // Sender announces a file; the receiver auto-fetches it block-by-block using
@@ -107,6 +112,7 @@ class Msg {
   static const folderAccept = 'folder_accept'; // {pairId}
 
   // Control
+  // (Control messages ping/pong bypass the dedup guard)
   static const ack = 'ack'; // {of}
   static const error = 'error'; // {message}
   static const ping = 'ping';

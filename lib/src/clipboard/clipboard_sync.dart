@@ -247,13 +247,14 @@ class ClipboardSync {
   }
 
   /// Manual send: read the CURRENT clipboard (legal because the app is
-  /// foreground when the user taps this) and push to all connected peers.
+  /// foreground when the user taps this) and push to all connected peers,
+  /// or to a single [targetPeerId] if specified.
   /// Returns true if at least one peer received it.
-  Future<bool> sendCurrentClipboard() async {
+  Future<bool> sendCurrentClipboard({String? targetPeerId}) async {
     final text = await readClipboard();
     if (text == null || text.isEmpty) return false;
     if (!hasConnectedPeer()) return false;
-    final success = _broadcast(text);
+    final success = _broadcast(text, targetPeerId: targetPeerId);
     if (success) {
       _controller.markOutboundPushed(hashOf(text));
     }
@@ -335,10 +336,13 @@ class ClipboardSync {
 
   /// Send [text] to every open session whose peer is paired. Returns true if
   /// at least one send succeeded.
-  bool _broadcast(String text) {
+  bool _broadcast(String text, {String? targetPeerId}) {
     var sent = false;
     final paired = pairedPeerIds();
-    for (final id in registry.readyPeerIds.toList()) {
+    final peerIds = targetPeerId != null
+        ? registry.readyPeerIds.where((id) => id == targetPeerId).toList()
+        : registry.readyPeerIds.toList();
+    for (final id in peerIds) {
       if (!paired.contains(id)) continue;
       final session = registry.openSessionFor(id);
       if (session == null) continue;

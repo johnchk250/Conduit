@@ -109,6 +109,9 @@ class SyncEngine {
     this.onTransferState,
     this.onClipboardPush,
     this.onRunCommand,
+    this.onDeviceStatus,
+    this.onPhoneAction,
+    this.onPhoneActionResult,
     this.batchListWithStat,
   });
 
@@ -157,6 +160,15 @@ class SyncEngine {
   /// branch of `_handlePeerMessage`, never touches the Index DB, version
   /// vectors, or the needs-queue. Silently ignored on Android.
   final void Function(String peerId, String name)? onRunCommand;
+
+  /// Notifies the host when a peer reports its device status (Roadmap P1).
+  final void Function(String peerId, Map<String, dynamic> msg)? onDeviceStatus;
+
+  /// Notifies the host when a peer requests a phone action (Roadmap P2).
+  final void Function(String peerId, String requestId, String action)? onPhoneAction;
+
+  /// Notifies the host of a phone action result (Roadmap P2).
+  final void Function(String peerId, String requestId, String action, String result)? onPhoneActionResult;
 
   /// Optional fast-path metadata lister (Roadmap Phase 0.6 — battery). Passed
   /// straight through to every [FolderWatcher] this engine starts and to
@@ -1434,21 +1446,16 @@ class SyncEngine {
       // reply) and is exempt from the generation guard at the top of this method.
       case Msg.index:
       case Msg.indexUpdate:
-        // Peer advertised (full Index or delta Update) its rows for this pair.
-        // Apply each into our Index DB (applyRemote drops stale/dup by
-        // sequence), merge the live ones into _peerLive, and advance our
-        // peer-watermark so the next indexRequest we send is honest.
+        final pairId = msg['pairId'] as String?;
+        if (pairId != null) _markPeerAccepted(pairId);
         await _handleIndexFrame(session, msg);
         break;
       case Msg.indexRequest:
-        // Peer wants everything past its watermark. Reply with the delta from
-        // our Index DB and advance our sent-watermark for this peer so we
-        // don't re-send it. (This is the symmetric half of _advertiseDelta.)
+        final pairId = msg['pairId'] as String?;
+        if (pairId != null) _markPeerAccepted(pairId);
         await _handleIndexRequest(session, msg);
         break;
       case Msg.request:
-        // Peer requests one block of a file we have. Feed it to the per-file
-        // serve loop (spawns one on first request, responds in order).
         final pairId = msg['pairId'] as String?;
         final pair = pairId == null ? null : _pairById(pairId);
         if (pair == null) {
@@ -1463,14 +1470,13 @@ class SyncEngine {
           });
           break;
         }
+        if (pairId != null) _markPeerAccepted(pairId);
         await _routeServeRequest(session, pair, msg);
         break;
       case Msg.response:
-        // A block reply to OUR _sendBlockRequest. Route to the per-file
-        // _BlockSink the fetcher is pulling from. No sink = the fetch already
-        // ended (terminal error / completion / cancel) → drop the late reply.
         final respPairId = msg['pairId'] as String?;
         final respName = msg['name'] as String?;
+        if (respPairId != null) _markPeerAccepted(respPairId);
         if (respPairId != null && respName != null) {
           final sink = _blockSinks[_blockKey(respPairId, respName)];
           if (sink != null && !sink.isClosed) {
@@ -1499,6 +1505,20 @@ class SyncEngine {
       case Msg.runCommand:
         final name = msg['name'] as String? ?? '';
         if (name.isNotEmpty) onRunCommand?.call(session.peer.deviceId, name);
+        break;
+      case Msg.deviceStatus:
+        onDeviceStatus?.call(session.peer.deviceId, msg);
+        break;
+      case Msg.phoneAction:
+        final requestId = msg['requestId'] as String? ?? '';
+        final action = msg['action'] as String? ?? '';
+        onPhoneAction?.call(session.peer.deviceId, requestId, action);
+        break;
+      case Msg.phoneActionResult:
+        final requestId = msg['requestId'] as String? ?? '';
+        final action = msg['action'] as String? ?? '';
+        final result = msg['result'] as String? ?? '';
+        onPhoneActionResult?.call(session.peer.deviceId, requestId, action, result);
         break;
       // ---- Ad-hoc file send (Roadmap Phase 3a) -----------------------------
       //
@@ -1764,6 +1784,15 @@ class SyncEngine {
         log(pair.id, 'Orphan delete failed for ${t.relPath}: $e',
             SyncEventLevel.warn);
       }
+    }
+  }
+
+  bool isPairAcceptedByPeer(String pairId) => _peerAcceptedPairs.contains(pairId);
+
+  void _markPeerAccepted(String pairId) {
+    if (_peerAcceptedPairs.add(pairId)) {
+      final st = _states[pairId] ??= PairSyncState(pairId: pairId);
+      if (!_disposed) _stateController.add(st);
     }
   }
 

@@ -14,6 +14,9 @@
     <!-- Wake lock so sync can finish during doze -->
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
+    <!-- Vibration permission for device alerts -->
+    <uses-permission android:name="android.permission.VIBRATE"/>
+
     <!-- Phase 1 background survival: prompt the user to ignore battery
          optimizations for Conduit (the stock-Android whitelist path; OEM
          ROMs still need their own autostart/battery settings). -->

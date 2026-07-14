@@ -55,12 +55,18 @@ class PeerSession {
     required this.socket,
     required this.codec,
     required this.initiatedByUs,
+    this.features = const [],
   }) : generation = _nextGeneration();
 
   final PairedPeer peer;
   final Socket socket;
   final FrameCodec codec;
   final bool initiatedByUs;
+  final List<String> features;
+
+  int? latestRttMs;
+  final List<int> recentRttMs = [];
+  VoidCallback? onHeartbeat;
 
   /// Monotonically-increasing per-connection number (process-global, so a NEW
   /// session for the same peer is always strictly greater than the OLD one it
@@ -185,6 +191,7 @@ class PeerSession {
       return;
     }
     _missed++;
+    onHeartbeat?.call();
     if (_missed >= _hbMissedThreshold) {
       _heartbeat?.cancel();
       Diag.heartbeat('hb_dead',
@@ -219,6 +226,13 @@ class PeerSession {
       final rttMs = sentAt == null
           ? null
           : DateTime.now().difference(sentAt).inMilliseconds;
+      if (rttMs != null) {
+        latestRttMs = rttMs;
+        recentRttMs.add(rttMs);
+        if (recentRttMs.length > 10) {
+          recentRttMs.removeAt(0);
+        }
+      }
       Diag.heartbeat('hb_pong',
           peer: peer.deviceId,
           session: generation,
@@ -226,6 +240,7 @@ class PeerSession {
           rttMs: rttMs);
       _pendingPingId = null;
       _pendingPingSentAt = null;
+      onHeartbeat?.call();
     }
   }
 
@@ -236,10 +251,14 @@ class PeerSession {
   // SILENCE for [_hbMissedThreshold] × [_hbInterval] triggers the dead path.
   void restartHeartbeat() {
     if (_onHeartbeatDead == null) return; // heartbeat never started
+    final wasMissed = _missed > 0;
     lastActivityAt = DateTime.now(); // proof of life for the dup-hello guard
     _missed = 0;
     _heartbeat?.cancel();
     _heartbeat = Timer.periodic(_hbInterval, (_) => _tick());
+    if (wasMissed) {
+      onHeartbeat?.call();
+    }
   }
 
   void stopHeartbeat() {
@@ -485,12 +504,14 @@ class PeerConnectionManager {
             'missed': existing.missedHeartbeats,
           });
     }
+    final features = (hello['features'] as List?)?.cast<String>().toList() ?? const <String>[];
     codec.send({
       't': Msg.welcome,
       'deviceId': identity.deviceId,
       'name': identity.name,
       'platform': identity.platform,
       'pubKey': identity.publicKeyB64,
+      'features': ['device_status_v1', 'phone_alert_v1'],
     });
 
     final peer = PairedPeer(
@@ -502,7 +523,7 @@ class PeerConnectionManager {
     if (!isAlreadyPaired) {
       await config.rememberPeer(peer);
     }
-    _publishSession(peer, socket, codec, initiatedByUs: false);
+    _publishSession(peer, socket, codec, initiatedByUs: false, features: features);
   }
 
   bool _publishSession(
@@ -510,12 +531,14 @@ class PeerConnectionManager {
     Socket socket,
     FrameCodec codec, {
     required bool initiatedByUs,
+    List<String> features = const [],
   }) {
     final session = PeerSession(
       peer: peer,
       socket: socket,
       codec: codec,
       initiatedByUs: initiatedByUs,
+      features: features,
     );
     // The codec is ALREADY being pumped (started in _handleIncoming /
     // _handshake). Its onMessage currently points at the temp handshake
@@ -671,6 +694,7 @@ class PeerConnectionManager {
       'name': identity.name,
       'platform': identity.platform,
       'pubKey': identity.publicKeyB64,
+      'features': ['device_status_v1', 'phone_alert_v1'],
     };
     if (pairCode != null) hello['pairCode'] = pairCode;
     if (forceTakeover && isPaired) hello['takeover'] = true;
@@ -687,6 +711,7 @@ class PeerConnectionManager {
     codec.send(hello);
 
     final welcome = await waitForMessage(codec, Msg.welcome, timeout: timeout);
+    final features = (welcome['features'] as List?)?.cast<String>().toList() ?? const <String>[];
     final peer = PairedPeer(
       deviceId: welcome['deviceId'] as String,
       name: welcome['name'] as String,
@@ -698,7 +723,7 @@ class PeerConnectionManager {
       await config.rememberPeer(peer);
     }
 
-    final accepted = _publishSession(peer, socket, codec, initiatedByUs: true);
+    final accepted = _publishSession(peer, socket, codec, initiatedByUs: true, features: features);
     if (!accepted) {
       throw StateError('connection superseded by existing session');
     }

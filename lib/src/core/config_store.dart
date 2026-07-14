@@ -298,4 +298,35 @@ class ConfigStore {
     _data['batterySaverMode'] = value;
     await _persist();
   }
+
+  /// Whether the user allows the peer to locate/alert this phone (Roadmap Phase P2).
+  /// Default true — alerts are enabled out-of-the-box; the user can disable
+  /// them in Android Settings → "Allow phone alerts" if they don't want this.
+  bool get allowPlayPhoneAlert => _data['allowPlayPhoneAlert'] != false;
+
+  Future<void> setAllowPlayPhoneAlert(bool value) async {
+    _data['allowPlayPhoneAlert'] = value;
+    await _persist();
+  }
+
+  /// Stored device status snapshots for offline staleness reference.
+  Map<String, dynamic> get deviceStatusSnapshots {
+    final snapshots = _data['deviceStatusSnapshots'];
+    if (snapshots is! Map) return <String, dynamic>{};
+    return Map<String, dynamic>.from(snapshots);
+  }
+
+  Future<void> saveDeviceStatusSnapshot(String deviceId, Map<String, dynamic> snapshot) async {
+    final snapshots = Map<String, dynamic>.from(deviceStatusSnapshots);
+    snapshots[deviceId] = snapshot;
+    _data['deviceStatusSnapshots'] = snapshots;
+    await _persist();
+  }
+
+  Future<void> removeDeviceStatusSnapshot(String deviceId) async {
+    final snapshots = Map<String, dynamic>.from(deviceStatusSnapshots);
+    snapshots.remove(deviceId);
+    _data['deviceStatusSnapshots'] = snapshots;
+    await _persist();
+  }
 }

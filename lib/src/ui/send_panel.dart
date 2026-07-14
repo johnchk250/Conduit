@@ -11,7 +11,8 @@ import 'send_flow_view.dart';
 /// Automatically detects if it was pushed as a sub-route (e.g. from the mobile share flow)
 /// and displays a back button if so.
 class SendPanel extends StatelessWidget {
-  const SendPanel({super.key});
+  const SendPanel({super.key, this.initialPeerId});
+  final String? initialPeerId;
 
   @override
   Widget build(BuildContext context) {
@@ -61,6 +62,7 @@ class SendPanel extends StatelessWidget {
               child: SendFlowView(
                 compact: false,
                 hideTitle: canPop,
+                initialPeerId: initialPeerId,
               ),
             ),
           ],

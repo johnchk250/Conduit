@@ -2,9 +2,11 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
+import '../core/config_store.dart';
 import '../desktop/tray.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
@@ -546,6 +548,14 @@ class _OverviewPage extends StatelessWidget {
             );
           }(),
           const SizedBox(height: 26),
+          if (Platform.isWindows) ...[
+            ...state.pairedPeers
+                .where((p) => p.platform == 'android')
+                .map((peer) => Padding(
+                      padding: const EdgeInsets.only(bottom: 26),
+                      child: PhoneSummaryCard(peer: peer),
+                    )),
+          ],
           const GlassSectionLabel('Folder pairs'),
           if (pairs.isEmpty)
             GlassListTile(
@@ -889,6 +899,20 @@ class _SettingsHubPage extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 10),
+              GlassListTile(
+                leadingIcon: Icons.volume_up_outlined,
+                accentColor: c.amber,
+                title: 'Allow phone alerts',
+                subtitle:
+                    'Let your Windows PC play a sound and vibrate this phone '
+                    'to help you locate it. Disable to block all remote alerts.',
+                trailing: Switch(
+                  value: state.allowPlayPhoneAlert,
+                  onChanged: (v) => state.setAllowPlayPhoneAlert(v),
+                  activeColor: c.amber,
+                ),
+              ),
+              const SizedBox(height: 10),
             ],
 
             // Battery-saver mode: 1-hour watcher cadence.
@@ -974,5 +998,457 @@ class _SettingsHubPage extends StatelessWidget {
       await state.quit();
       exit(0);
     }
+  }
+}
+
+class PhoneSummaryCard extends StatefulWidget {
+  const PhoneSummaryCard({super.key, required this.peer});
+  final PairedPeer peer;
+
+  @override
+  State<PhoneSummaryCard> createState() => _PhoneSummaryCardState();
+}
+
+class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
+  bool _alerting = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final c = GlassColors.of(context);
+    final isConnected = state.isPeerConnected(widget.peer.deviceId);
+    final dstate = state.getOrCreateDashboardState(widget.peer.deviceId);
+
+    String updateTimeStr = 'Never connected';
+    if (isConnected) {
+      updateTimeStr = 'Last updated now';
+    } else if (dstate.statusReceivedAt != null) {
+      final diff = DateTime.now().difference(dstate.statusReceivedAt!);
+      if (diff.inSeconds < 60) {
+        updateTimeStr = 'Last updated moments ago';
+      } else if (diff.inMinutes < 60) {
+        updateTimeStr = 'Last updated ${diff.inMinutes}m ago';
+      } else if (diff.inHours < 24) {
+        updateTimeStr = 'Last updated ${diff.inHours}h ago';
+      } else {
+        updateTimeStr = 'Last updated ${diff.inDays}d ago';
+      }
+    } else if (dstate.lastDisconnectedAt != null) {
+      final diff = DateTime.now().difference(dstate.lastDisconnectedAt!);
+      if (diff.inMinutes < 60) {
+        updateTimeStr = 'Disconnected ${diff.inMinutes}m ago';
+      } else {
+        updateTimeStr = 'Disconnected ${diff.inHours}h ago';
+      }
+    }
+
+    String connQuality = 'Offline';
+    Color qualityColor = c.textTertiary;
+    if (isConnected) {
+      if (dstate.missedHeartbeats >= 4) {
+        connQuality = 'Reconnecting';
+        qualityColor = c.danger;
+      } else if (dstate.missedHeartbeats >= 2) {
+        connQuality = 'Spotty';
+        qualityColor = c.amber;
+      } else {
+        final rtt = dstate.latestRttMs;
+        if (rtt != null) {
+          if (rtt < 30) {
+            connQuality = 'Excellent ($rtt ms)';
+            qualityColor = c.mint;
+          } else if (rtt < 100) {
+            connQuality = 'Good ($rtt ms)';
+            qualityColor = c.blue;
+          } else {
+            connQuality = 'Spotty ($rtt ms)';
+            qualityColor = c.amber;
+          }
+        } else {
+          connQuality = 'Connected';
+          qualityColor = c.mint;
+        }
+      }
+    }
+
+    Widget batteryWidget = const SizedBox.shrink();
+    if (dstate.batteryPct != null) {
+      final pct = dstate.batteryPct!;
+      final power = dstate.powerState;
+      final isCharging = power == 'charging' || power == 'full';
+      final icon = isCharging
+          ? Icons.battery_charging_full_rounded
+          : pct > 80
+              ? Icons.battery_full_rounded
+              : pct > 20
+                  ? Icons.battery_3_bar_rounded
+                  : Icons.battery_alert_rounded;
+      final batteryColor = isCharging
+          ? c.mint
+          : pct > 20
+              ? c.textSecondary
+              : c.danger;
+
+      batteryWidget = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: batteryColor),
+          const SizedBox(width: 4),
+          Text(
+            '$pct% · ${power ?? 'Unknown'}',
+            style: TextStyle(color: c.textSecondary, fontSize: 13),
+          ),
+        ],
+      );
+    }
+
+    Widget storageWidget = const SizedBox.shrink();
+    if (dstate.storageTotalBytes != null && dstate.storageTotalBytes! > 0) {
+      final total = dstate.storageTotalBytes!;
+      final avail = dstate.storageAvailableBytes ?? 0;
+      final used = total - avail;
+      final ratio = used / total;
+      final totalGB = (total / (1024 * 1024 * 1024)).toStringAsFixed(1);
+      final freeGB = (avail / (1024 * 1024 * 1024)).toStringAsFixed(1);
+
+      storageWidget = Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Device storage',
+                style: TextStyle(color: c.textSecondary, fontSize: 12),
+              ),
+              Text(
+                '$freeGB GB free of $totalGB GB total',
+                style: TextStyle(color: c.textTertiary, fontSize: 12),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: ratio,
+              color: ratio > 0.9 ? c.danger : c.blue,
+              backgroundColor: c.glassBorder,
+              minHeight: 6,
+            ),
+          ),
+        ],
+      );
+    }
+
+    Widget warningWidget = const SizedBox.shrink();
+    if (isConnected && dstate.conduitHealth != null) {
+      final health = dstate.conduitHealth!;
+      final warning = health['batteryOptimizationWarning'] == true;
+      final powerSaver = health['powerSaverMode'] == true;
+      if (warning || powerSaver) {
+        warningWidget = Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Row(
+            children: [
+              Icon(Icons.warning_amber_rounded, size: 14, color: c.amber),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  warning
+                      ? 'Conduit health: Battery optimization warning (background sync may be throttled).'
+                      : 'Conduit health: Battery saver active on phone.',
+                  style: TextStyle(color: c.amber, fontSize: 11.5, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+        );
+      }
+    }
+
+    final peerFolders = state.config.folderPairs
+        .where((p) => p.peerDeviceId == widget.peer.deviceId)
+        .toList();
+
+    Widget folderRollupWidget = const SizedBox.shrink();
+    if (peerFolders.isNotEmpty) {
+      folderRollupWidget = Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SizedBox(height: 14),
+          Text(
+            'Sync health',
+            style: GoogleFonts.manrope(
+              textStyle: TextStyle(
+                color: c.textPrimary,
+                fontSize: 13.5,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          ...peerFolders.map((p) {
+            final isAccepted = state.isPairAcceptedByPeer(p.id);
+            final st = state.stateFor(p.id);
+            String folderStatus = st?.status ?? 'Idle';
+            Color dotColor = c.textTertiary;
+
+            if (!isConnected) {
+              folderStatus = 'Peer offline';
+              dotColor = c.textTertiary;
+            } else if (!isAccepted) {
+              folderStatus = 'Waiting for peer accept';
+              dotColor = c.amber;
+            } else if (state.isPaused) {
+              folderStatus = 'Paused';
+              dotColor = c.amber;
+            } else if (folderStatus == 'Error') {
+              dotColor = c.danger;
+            } else if (folderStatus.startsWith('Idle')) {
+              dotColor = c.mint;
+            } else {
+              dotColor = c.blue;
+            }
+
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                children: [
+                  Icon(Icons.folder, size: 15, color: c.violet.withValues(alpha: 0.8)),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      p.name,
+                      style: TextStyle(color: c.textPrimary, fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  Text(
+                    p.direction.label.split(' ').first,
+                    style: TextStyle(color: c.textTertiary, fontSize: 11.5),
+                  ),
+                  const SizedBox(width: 10),
+                  _PhoneCardStatusDot(color: dotColor),
+                  const SizedBox(width: 6),
+                  Text(
+                    folderStatus,
+                    style: TextStyle(color: c.textSecondary, fontSize: 12.5),
+                  ),
+                ],
+              ),
+            );
+          }),
+        ],
+      );
+    }
+
+    return GlassPanel(
+      ringColor: isConnected ? c.violet : null,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.phone_android, size: 22, color: isConnected ? c.violet : c.textSecondary),
+                  const SizedBox(width: 8),
+                  Text(
+                    widget.peer.name,
+                    style: GoogleFonts.manrope(
+                      textStyle: TextStyle(
+                        color: c.textPrimary,
+                        fontSize: 16.5,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              GlassChip(
+                label: isConnected ? 'Connected' : 'Offline',
+                icon: isConnected ? Icons.link : Icons.link_off,
+                accentColor: isConnected ? c.mint : c.textSecondary,
+                filled: isConnected,
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Text(
+                updateTimeStr,
+                style: TextStyle(color: c.textTertiary, fontSize: 12.5),
+              ),
+              const SizedBox(width: 8),
+              Text('·', style: TextStyle(color: c.textTertiary)),
+              const SizedBox(width: 8),
+              Text(
+                'Connection: ',
+                style: TextStyle(color: c.textTertiary, fontSize: 12.5),
+              ),
+              Text(
+                connQuality,
+                style: TextStyle(color: qualityColor, fontSize: 12.5, fontWeight: FontWeight.w700),
+              ),
+            ],
+          ),
+          if (isConnected && (dstate.batteryPct != null || dstate.storageTotalBytes != null)) ...[
+            const SizedBox(height: 12),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                batteryWidget,
+                const SizedBox(width: 10),
+              ],
+            ),
+            if (dstate.storageTotalBytes != null) ...[
+              const SizedBox(height: 10),
+              storageWidget,
+            ],
+          ],
+          warningWidget,
+          folderRollupWidget,
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              GlassButton(
+                icon: Icons.send_outlined,
+                label: 'Send files',
+                accentColor: c.violet,
+                enabled: isConnected,
+                compact: true,
+                style: GlassButtonStyle.tint,
+                onTap: () {
+                  Navigator.of(context).push(
+                    PageRouteBuilder<void>(
+                      pageBuilder: (ctx, _, secondary) => SendPanel(initialPeerId: widget.peer.deviceId),
+                      transitionDuration: const Duration(milliseconds: 180),
+                      reverseTransitionDuration: const Duration(milliseconds: 140),
+                      transitionsBuilder: (_, animation, secondary, child) => FadeTransition(
+                        opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
+                        child: child,
+                      ),
+                    ),
+                  );
+                },
+              ),
+              GlassButton(
+                icon: Icons.content_copy_outlined,
+                label: 'Send clipboard',
+                accentColor: c.violet,
+                enabled: isConnected,
+                compact: true,
+                style: GlassButtonStyle.tint,
+                onTap: () async {
+                  final ok = await state.sendClipboard(targetPeerId: widget.peer.deviceId);
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(ok
+                            ? 'Clipboard sent to ${widget.peer.name}'
+                            : 'Failed to send clipboard (is it empty?)'),
+                      ),
+                    );
+                  }
+                },
+              ),
+              if (!isConnected)
+                GlassButton(
+                  icon: Icons.sync,
+                  label: 'Reconnect',
+                  accentColor: c.blue,
+                  compact: true,
+                  style: GlassButtonStyle.outline,
+                  onTap: () async {
+                    try {
+                      await state.reconnectPeer(widget.peer);
+                    } catch (e) {
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text(e.toString())),
+                        );
+                      }
+                    }
+                  },
+                ),
+              if (isConnected) ...[
+                () {
+                  final hasFeature = state.peerHasFeature(widget.peer.deviceId, 'phone_alert_v1');
+                  return GlassButton(
+                    icon: _alerting ? Icons.hourglass_top : Icons.volume_up,
+                    label: _alerting ? 'Alerting...' : 'Play alert',
+                    accentColor: c.amber,
+                    enabled: isConnected && hasFeature && !_alerting,
+                    compact: true,
+                    style: GlassButtonStyle.outline,
+                    onTap: () => _triggerPhoneAlert(context, state),
+                  );
+                }(),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _triggerPhoneAlert(BuildContext ctx, AppState state) async {
+    setState(() {
+      _alerting = true;
+    });
+
+    final res = await state.playPhoneAlert(widget.peer.deviceId);
+
+    if (mounted) {
+      setState(() {
+        _alerting = false;
+      });
+
+      String msg = '';
+      switch (res) {
+        case 'started':
+          msg = 'Alert played successfully on ${widget.peer.name}.';
+          break;
+        case 'disabled':
+          msg = '${widget.peer.name} has locating/play alerts disabled in settings.';
+          break;
+        case 'unsupported':
+          msg = 'Locate alerts are not supported by the peer.';
+          break;
+        case 'offline':
+          msg = 'Locate failed: Peer went offline.';
+          break;
+        case 'timeout':
+          msg = 'Alert request timed out.';
+          break;
+        default:
+          msg = 'Locate failed.';
+      }
+
+      ScaffoldMessenger.of(ctx).showSnackBar(
+        SnackBar(content: Text(msg)),
+      );
+    }
+  }
+}
+
+class _PhoneCardStatusDot extends StatelessWidget {
+  const _PhoneCardStatusDot({required this.color});
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 7,
+      height: 7,
+      decoration: BoxDecoration(
+        color: color,
+        shape: BoxShape.circle,
+      ),
+    );
   }
 }

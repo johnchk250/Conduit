@@ -9,6 +9,17 @@ re-derive it.
 
 ---
 
+## 2026-07-14 (session 3) — Phone Dashboard Design Choices
+
+**Opt-out (default true) vs. Opt-in for Locate Alerts:**
+Initially, `allowPlayPhoneAlert` was designed as `false` by default. However, since the locating alarm triggers sounds and vibration, and there was no Android settings switch initially visible to users, attempting to trigger it from Windows would fail silently with a "disabled in settings" warning. Changing the default to `true` (opt-out) preserves the out-of-the-box locate usefulness, while adding a clear toggle switch under "Allow phone alerts" in the Android Settings panel gives privacy-conscious users an explicit way to disable it.
+
+**Resolving "Waiting for peer accept" memory staleness:**
+`_peerAcceptedPairs` tracks folders accepted by the peer. Since it is stored only in memory in the `SyncEngine`, restarts of either application clear it. While the engine safely bypasses the acceptance check for configured peers to continue syncing on connection, the UI layer would permanently show "Waiting for peer accept" because the initiator side forgot that acceptance.
+By automatically marking the pair as accepted in `_markPeerAccepted(pairId)` whenever *any* inbound index frame, request, or response is handled for that pair, we make the state self-healing. Any sync activity proves the peer has accepted and configured the folder, restoring the correct UI status dot color.
+
+---
+
 ## 2026-07-12 (new session) — Clear-glass v6: interpreting "continue from there" and the BackdropFilter-removal call
 
 **Reading the request.** The instruction was terse and referenced two

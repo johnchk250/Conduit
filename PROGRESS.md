@@ -5,6 +5,33 @@
 
 ---
 
+## 2026-07-14 (session 3) — Phone Dashboard Implementation
+
+**Context:** Implement the Phone Dashboard for paired Android devices (from `docs/2026-07-14-phone-dashboard-plan.md`). This allows Windows users to monitor connected Android peers (battery status, storage metrics, connection quality via RTT, and sync health rollup) and trigger locating alerts (alarm sound + vibration) on the phone.
+
+**What was implemented:**
+- **Wire Protocol & Capabilities:** Added `deviceStatus`, `phoneAction`, and `phoneActionResult` message constants in `wire.dart`. Modified `PeerSession` and handshake logic to exchange a lists of negotiated `features` (advertising `['device_status_v1', 'phone_alert_v1']`).
+- **RTT & Heartbeat Callback:** Added RTT latency tracking (rolling 10-sample buffer) and `onHeartbeat` callback to `PeerSession` so the UI reacts instantly to heartbeat replies and missed heartbeats.
+- **Config Persistence:** Added `allowPlayPhoneAlert` (defaulting to true/opt-out) and status snapshot persistence (`saveDeviceStatusSnapshot`/`removeDeviceStatusSnapshot`) in `ConfigStore` to cache battery/storage stats across restarts.
+- **Sync Engine Integration:** Routed new dashboard messages (`deviceStatus`, `phoneAction`, `phoneActionResult`) in `_handlePeerMessage`. Added `isPairAcceptedByPeer` and auto-mark accepted logic where receiving any sync/index traffic automatically marks a pair as accepted by the peer (fixes "Waiting for peer accept" staleness across app restarts).
+- **Android Native Platform Channel:** Created `conduit/phone_dashboard` MethodChannel in `MainActivity.kt` with:
+  - `getDeviceStatus`: Queries battery level, power source, file storage space via `StatFs`, battery optimizations settings, and power-saver status.
+  - `setPhoneAlertEnabled`: Saves permission to `SharedPreferences` to natively enforce locate restrictions.
+  - `playPhoneAlert` / `stopPhoneAlert`: Plays default alarm sound and triggers vibration patterns (requires `VIBRATE` permission in manifest). Auto-terminates after 25s or when the app is destroyed.
+- **Android Status Sampling:** Created `_startAndroidStatusSampling()` in `app_state.dart` to periodically query native status (every 60s) while a peer is connected. Uses diff-based logic to only send changes (or full refresh every 10 min) to conserve battery.
+- **UI Dashboard Screen & Phone Summary Card:**
+  - Added `PhoneSummaryCard` in `dashboard_screen.dart` (Windows-only, on the Overview tab).
+  - Displays device name, connection status, human-readable update staleness, RTT quality indicators, battery % and charging status, storage space progress bar, and health optimization warnings.
+  - Sync health rollup lists all folder pairs synced with the peer along with their real-time status dots.
+  - **Quick Actions:** "Send files" (preselects peer in `SendPanel` / `SendFlowView`), "Send clipboard" (routes manual clipboard sync to the specific peer), "Reconnect", and "Play alert" (checks peer features and plays locating alarm with feedback).
+  - Added **"Allow phone alerts"** toggle switch in the System Settings tab on Android for easy opt-out.
+
+**Verification:**
+- `flutter analyze` — 0 errors, 0 new warnings.
+- `flutter test` — **193/193 tests passed**.
+
+---
+
 ## 2026-07-14 (session 2) — UI Cleanup + Open Received File from Notification
 
 **Context:** Two related requests landed in one session:
