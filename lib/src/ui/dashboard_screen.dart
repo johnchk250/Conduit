@@ -129,9 +129,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
         // so that the SendPanel is pushed directly on top of the DashboardScreen
         // and doesn't get obscured or make the back stack confusing.
         Navigator.of(context).popUntil((route) => route.isFirst);
-        Navigator.of(context).push(
+        Navigator.of(context)
+            .push(
           _fadeRoute((_) => const SendPanel()),
-        ).then((_) {
+        )
+            .then((_) {
           _sendPanelPushed = false;
         });
       });
@@ -454,9 +456,7 @@ class _NavRail extends StatelessWidget {
             selectedIcon: Icons.devices,
             label: 'Devices'),
         GlassNavDestination(
-            icon: Icons.send_outlined,
-            selectedIcon: Icons.send,
-            label: 'Send'),
+            icon: Icons.send_outlined, selectedIcon: Icons.send, label: 'Send'),
         GlassNavDestination(
             icon: Icons.history_outlined,
             selectedIcon: Icons.history,
@@ -491,6 +491,7 @@ class _OverviewPage extends StatelessWidget {
         .where((p) => state.isPeerConnected(p.deviceId))
         .length;
     final discovered = state.discoveredPeers;
+    final isCompact = MediaQuery.sizeOf(ctx).width < 900;
 
     // Reference has no separate app-bar row — the "Overview" heading is
     // just the first thing in the scrollable content
@@ -530,12 +531,14 @@ class _OverviewPage extends StatelessWidget {
               accentColor = c.blue;
             } else if (connectedCount == 0) {
               title = 'Waiting for connection';
-              subtitle = 'Searching for ${state.pairedPeers.length} paired device(s) on local network';
+              subtitle =
+                  'Searching for ${state.pairedPeers.length} paired device(s) on local network';
               icon = Icons.sync;
               accentColor = c.blue;
             } else {
               title = 'Sync is running';
-              subtitle = 'Connected to $connectedCount of ${state.pairedPeers.length} paired device(s)';
+              subtitle =
+                  'Connected to $connectedCount of ${state.pairedPeers.length} paired device(s)';
               icon = Icons.check_circle;
               accentColor = c.mint;
             }
@@ -548,6 +551,28 @@ class _OverviewPage extends StatelessWidget {
             );
           }(),
           const SizedBox(height: 26),
+          // Compact layouts do not have the desktop Send destination in their
+          // bottom navigation. Keep this global entry point available even
+          // while every paired device is offline; SendFlowView can then show
+          // those devices and offer reconnection.
+          if (isCompact) ...[
+            const GlassSectionLabel('Quick actions'),
+            GlassListTile(
+              leadingIcon: Icons.send_outlined,
+              accentColor: c.amber,
+              title: 'Send files',
+              subtitle: connectedCount > 0
+                  ? 'Choose files and a destination device'
+                  : 'Open Send to reconnect a paired device',
+              trailing: Icon(Icons.chevron_right, color: c.textTertiary),
+              onTap: () {
+                Navigator.of(ctx).push(
+                  _fadeRoute((_) => const SendPanel()),
+                );
+              },
+            ),
+            const SizedBox(height: 26),
+          ],
           if (Platform.isWindows) ...[
             ...state.pairedPeers
                 .where((p) => p.platform == 'android')
@@ -643,8 +668,7 @@ class _OverviewPage extends StatelessWidget {
                             accentColor: c.mint,
                             filled: true,
                           )
-                        : state.pairedPeers
-                                .any((p) => p.deviceId == d.deviceId)
+                        : state.pairedPeers.any((p) => p.deviceId == d.deviceId)
                             ? GlassChip(
                                 // Reference's one `.badge` example is
                                 // exactly this: "Paired", accent-violet.
@@ -659,20 +683,6 @@ class _OverviewPage extends StatelessWidget {
                     onTap: () => _goToDevices(ctx),
                   ),
                 )),
-          const SizedBox(height: 26),
-          const GlassSectionLabel('Quick actions'),
-          GlassListTile(
-            leadingIcon: Icons.send_outlined,
-            accentColor: c.amber,
-            title: 'Send files',
-            subtitle: 'Share ad-hoc files directly to paired devices',
-            trailing: Icon(Icons.chevron_right, color: c.textTertiary),
-            onTap: () {
-              Navigator.of(ctx).push(
-                _fadeRoute((_) => const SendPanel()),
-              );
-            },
-          ),
         ],
       ),
     );
@@ -1158,7 +1168,10 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
                   warning
                       ? 'Conduit health: Battery optimization warning (background sync may be throttled).'
                       : 'Conduit health: Battery saver active on phone.',
-                  style: TextStyle(color: c.amber, fontSize: 11.5, fontWeight: FontWeight.w600),
+                  style: TextStyle(
+                      color: c.amber,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600),
                 ),
               ),
             ],
@@ -1173,6 +1186,47 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
 
     Widget folderRollupWidget = const SizedBox.shrink();
     if (peerFolders.isNotEmpty) {
+      final pairCount = peerFolders.length;
+      final pairNoun = pairCount == 1 ? 'folder pair' : 'folder pairs';
+      final waitingCount =
+          peerFolders.where((p) => !state.isPairAcceptedByPeer(p.id)).length;
+      final errorCount = peerFolders
+          .where((p) => state.stateFor(p.id)?.status == 'Error')
+          .length;
+      final activeCount = peerFolders.where((p) {
+        final status = state.stateFor(p.id)?.status ?? 'Idle';
+        return status != 'Error' && !status.startsWith('Idle');
+      }).length;
+
+      final String healthSummary;
+      final Color healthColor;
+      final IconData healthIcon;
+      if (!isConnected) {
+        healthSummary = '$pairCount $pairNoun waiting for this device';
+        healthColor = c.textTertiary;
+        healthIcon = Icons.cloud_off_outlined;
+      } else if (waitingCount > 0) {
+        healthSummary = '$waitingCount of $pairCount waiting for approval';
+        healthColor = c.amber;
+        healthIcon = Icons.hourglass_top_rounded;
+      } else if (state.isPaused) {
+        healthSummary = '$pairCount $pairNoun paused';
+        healthColor = c.amber;
+        healthIcon = Icons.pause_circle_outline_rounded;
+      } else if (errorCount > 0) {
+        healthSummary = '$errorCount of $pairCount need attention';
+        healthColor = c.danger;
+        healthIcon = Icons.error_outline_rounded;
+      } else if (activeCount > 0) {
+        healthSummary = 'Syncing $activeCount of $pairCount $pairNoun';
+        healthColor = c.blue;
+        healthIcon = Icons.sync_rounded;
+      } else {
+        healthSummary = 'All $pairCount $pairNoun up to date';
+        healthColor = c.mint;
+        healthIcon = Icons.check_circle_outline_rounded;
+      }
+
       folderRollupWidget = Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1188,56 +1242,22 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
             ),
           ),
           const SizedBox(height: 8),
-          ...peerFolders.map((p) {
-            final isAccepted = state.isPairAcceptedByPeer(p.id);
-            final st = state.stateFor(p.id);
-            String folderStatus = st?.status ?? 'Idle';
-            Color dotColor = c.textTertiary;
-
-            if (!isConnected) {
-              folderStatus = 'Peer offline';
-              dotColor = c.textTertiary;
-            } else if (!isAccepted) {
-              folderStatus = 'Waiting for peer accept';
-              dotColor = c.amber;
-            } else if (state.isPaused) {
-              folderStatus = 'Paused';
-              dotColor = c.amber;
-            } else if (folderStatus == 'Error') {
-              dotColor = c.danger;
-            } else if (folderStatus.startsWith('Idle')) {
-              dotColor = c.mint;
-            } else {
-              dotColor = c.blue;
-            }
-
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 6),
-              child: Row(
-                children: [
-                  Icon(Icons.folder, size: 15, color: c.violet.withValues(alpha: 0.8)),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      p.name,
-                      style: TextStyle(color: c.textPrimary, fontSize: 13, fontWeight: FontWeight.w600),
-                    ),
+          Row(
+            children: [
+              Icon(healthIcon, size: 16, color: healthColor),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  healthSummary,
+                  style: TextStyle(
+                    color: c.textSecondary,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
                   ),
-                  Text(
-                    p.direction.label.split(' ').first,
-                    style: TextStyle(color: c.textTertiary, fontSize: 11.5),
-                  ),
-                  const SizedBox(width: 10),
-                  _PhoneCardStatusDot(color: dotColor),
-                  const SizedBox(width: 6),
-                  Text(
-                    folderStatus,
-                    style: TextStyle(color: c.textSecondary, fontSize: 12.5),
-                  ),
-                ],
+                ),
               ),
-            );
-          }),
+            ],
+          ),
         ],
       );
     }
@@ -1252,7 +1272,9 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
             children: [
               Row(
                 children: [
-                  Icon(Icons.phone_android, size: 22, color: isConnected ? c.violet : c.textSecondary),
+                  Icon(Icons.phone_android,
+                      size: 22,
+                      color: isConnected ? c.violet : c.textSecondary),
                   const SizedBox(width: 8),
                   Text(
                     widget.peer.name,
@@ -1290,11 +1312,16 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
               ),
               Text(
                 connQuality,
-                style: TextStyle(color: qualityColor, fontSize: 12.5, fontWeight: FontWeight.w700),
+                style: TextStyle(
+                    color: qualityColor,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700),
               ),
             ],
           ),
-          if (isConnected && (dstate.batteryPct != null || dstate.storageTotalBytes != null)) ...[
+          if (isConnected &&
+              (dstate.batteryPct != null ||
+                  dstate.storageTotalBytes != null)) ...[
             const SizedBox(height: 12),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -1316,27 +1343,6 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
             runSpacing: 8,
             children: [
               GlassButton(
-                icon: Icons.send_outlined,
-                label: 'Send files',
-                accentColor: c.violet,
-                enabled: isConnected,
-                compact: true,
-                style: GlassButtonStyle.tint,
-                onTap: () {
-                  Navigator.of(context).push(
-                    PageRouteBuilder<void>(
-                      pageBuilder: (ctx, _, secondary) => SendPanel(initialPeerId: widget.peer.deviceId),
-                      transitionDuration: const Duration(milliseconds: 180),
-                      reverseTransitionDuration: const Duration(milliseconds: 140),
-                      transitionsBuilder: (_, animation, secondary, child) => FadeTransition(
-                        opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
-                        child: child,
-                      ),
-                    ),
-                  );
-                },
-              ),
-              GlassButton(
                 icon: Icons.content_copy_outlined,
                 label: 'Send clipboard',
                 accentColor: c.violet,
@@ -1344,7 +1350,8 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
                 compact: true,
                 style: GlassButtonStyle.tint,
                 onTap: () async {
-                  final ok = await state.sendClipboard(targetPeerId: widget.peer.deviceId);
+                  final ok = await state.sendClipboard(
+                      targetPeerId: widget.peer.deviceId);
                   if (mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
@@ -1377,7 +1384,8 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
                 ),
               if (isConnected) ...[
                 () {
-                  final hasFeature = state.peerHasFeature(widget.peer.deviceId, 'phone_alert_v1');
+                  final hasFeature = state.peerHasFeature(
+                      widget.peer.deviceId, 'phone_alert_v1');
                   return GlassButton(
                     icon: _alerting ? Icons.hourglass_top : Icons.volume_up,
                     label: _alerting ? 'Alerting...' : 'Play alert',
@@ -1414,7 +1422,8 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
           msg = 'Alert played successfully on ${widget.peer.name}.';
           break;
         case 'disabled':
-          msg = '${widget.peer.name} has locating/play alerts disabled in settings.';
+          msg =
+              '${widget.peer.name} has locating/play alerts disabled in settings.';
           break;
         case 'unsupported':
           msg = 'Locate alerts are not supported by the peer.';
@@ -1433,22 +1442,5 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
         SnackBar(content: Text(msg)),
       );
     }
-  }
-}
-
-class _PhoneCardStatusDot extends StatelessWidget {
-  const _PhoneCardStatusDot({required this.color});
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 7,
-      height: 7,
-      decoration: BoxDecoration(
-        color: color,
-        shape: BoxShape.circle,
-      ),
-    );
   }
 }

@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Conduit: bootstrap dependencies",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\toolchain.ps1", "pub-get"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Conduit: analyze",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\toolchain.ps1", "analyze"],
+      "problemMatcher": "$dart-analysis",
+      "group": "test"
+    },
+    {
+      "label": "Conduit: test",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\toolchain.ps1", "test"],
+      "problemMatcher": "$dart-analysis",
+      "group": "test"
+    },
+    {
+      "label": "Conduit: build Windows",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\toolchain.ps1", "build-windows", "--debug"],
+      "problemMatcher": "$dart-analysis",
+      "group": "build"
+    },
+    {
+      "label": "Conduit: build Android APK",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\toolchain.ps1", "build-apk", "--debug"],
+      "problemMatcher": "$dart-analysis",
+      "group": "build"
+    }
+  ]
+}

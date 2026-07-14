@@ -8,7 +8,7 @@
 
     <!-- Foreground sync service (keeps sync alive in background) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
     <!-- Wake lock so sync can finish during doze -->
@@ -76,7 +76,7 @@
         <service
             android:name=".SyncService"
             android:exported="false"
-            android:foregroundServiceType="dataSync"
+            android:foregroundServiceType="connectedDevice"
             android:stopWithTask="false"/>
 
         <!-- Phase 1 background survival: restart the service after boot. -->

@@ -8,21 +8,24 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
+import io.flutter.embedding.engine.FlutterEngine
 import androidx.core.app.NotificationCompat
 
 /**
  * Foreground service that keeps the sync engine alive while the app is in the
  * background, plus a transfer-tied partial wake lock.
  *
- * The actual sync logic lives in the Flutter/Dart isolate (the engine); this
- * service exists purely to satisfy Android's background-execution rules and
- * surface a persistent "Conduit is running" notification.
+ * The service owns the process-level Flutter engine as well as its foreground
+ * notification and locks. A cold service restart therefore recreates Dart and
+ * restores synchronization without requiring MainActivity.
  *
  * ## Wake locks (Roadmap Phase 0.4 + 0.6, ownership fixed post-audit)
  *
@@ -253,6 +256,29 @@ class SyncService : Service() {
     }
 
     private var baseWakeLock: PowerManager.WakeLock? = null
+    /** Strong owner of the Dart isolate while the foreground service lives. */
+    private var flutterEngine: FlutterEngine? = null
+
+    /**
+     * Network changes are system callbacks, so they still arrive when Dart
+     * timers are deferred by Doze. Give the reconnect supervisor a short CPU
+     * window whenever connectivity returns.
+     */
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            wakeForReconnect()
+        }
+    }
+
+    private fun wakeForReconnect() {
+        try {
+            if (baseWakeLock?.isHeld == true) baseWakeLock?.release()
+            baseWakeLock?.acquire(30_000L)
+        } catch (_: Throwable) {
+            // Best-effort; the foreground service still protects the process.
+        }
+    }
+
     private var intentionalStop = false
 
     /**
@@ -313,7 +339,7 @@ class SyncService : Service() {
         ensureChannels()
         val notif = buildNotification("Conduit is running", notifVisible)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         } else {
             startForeground(NOTIF_ID, notif)
         }
@@ -327,6 +353,19 @@ class SyncService : Service() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         baseWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Conduit::Base")
         baseWakeLock?.setReferenceCounted(false)
+
+        // Hold the engine itself, not merely a notification. If Android created
+        // this service after process death or boot, ensureEngine executes Dart's
+        // entrypoint and AppState restores the listener, watchers, and peers.
+        flutterEngine = ConduitEngineHost.ensureEngine(this)
+
+        // A multicast lock does not keep the CPU awake. NetworkCallback gives
+        // reconnection a bounded wake window after Wi-Fi/network transitions.
+        try {
+            val connectivity = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            connectivity.registerDefaultNetworkCallback(networkCallback)
+        } catch (_: Throwable) {}
+        wakeForReconnect()
 
         acquireMulticastLock()
     }
@@ -480,6 +519,11 @@ class SyncService : Service() {
     }
 
     override fun onDestroy() {
+        try {
+            val connectivity = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            connectivity.unregisterNetworkCallback(networkCallback)
+        } catch (_: Throwable) {}
+        flutterEngine = null
         // Cancel the watchdog only for an intentional Quit. If OxygenOS or the
         // system destroys the service, leaving the watchdog armed is what lets
         // Conduit come back instead of silently disappearing.

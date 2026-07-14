@@ -58,7 +58,7 @@ class MainActivity : FlutterActivity() {
         // the Activity is destroyed (swipe from recents, config change, etc.).
         // This is the Flutter-idiomatic equivalent of KDE Connect keeping its
         // connection manager in a long-lived Service rather than an Activity.
-        private const val ENGINE_ID = "conduit_main_engine"
+        const val ENGINE_ID = "conduit_main_engine"
     }
 
     private var pendingTreeResult: MethodChannel.Result? = null
@@ -120,6 +120,11 @@ class MainActivity : FlutterActivity() {
     private var _pendingShareIntent: Intent? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        // Cache immediately, not only from onDestroy. SyncService starts while
+        // this Activity is still alive and must be able to retain the exact
+        // engine that owns AppState, its sockets, and its folder watchers.
+        FlutterEngineCache.getInstance().put(ENGINE_ID, flutterEngine)
+
         super.configureFlutterEngine(flutterEngine)
         acquireMulticastLock()
 
@@ -154,9 +159,8 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "start" -> {
                         try {
-                            if (ensurePostNotificationsPermissionForService()) {
-                                SyncService.start(this)
-                            }
+                            SyncService.start(this)
+                            ensurePostNotificationsPermissionForService()
                             result.success(null)
                         } catch (e: Exception) {
                             result.error("SYNC_SERVICE", e.message, null)
@@ -559,6 +563,15 @@ class MainActivity : FlutterActivity() {
         // calls provideFlutterEngine(), retrieves it, and re-attaches without
         // restarting Dart or losing any sessions.
         flutterEngine?.let { FlutterEngineCache.getInstance().put(ENGINE_ID, it) }
+
+
+        // Activity method-channel handlers capture this Activity. Replace the
+        // background-critical handlers with application-context versions before
+        // detaching, so the retained engine can keep using SAF and service
+        // controls without leaking or calling a destroyed Activity.
+        flutterEngine?.let {
+            ConduitEngineHost.installBackgroundChannels(applicationContext, it)
+        }
 
         // Note: the transfer/connection wake locks are no longer released
         // here. They now live in SyncService (see its class doc for why),

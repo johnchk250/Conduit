@@ -14,10 +14,8 @@ import android.os.Build
  * up. The actual sync work lives in the Flutter engine; this only ensures the
  * process is alive.
  *
- * NOTE: on Android 14+ a BOOT_COMPLETED-launched FGS of type dataSync is
- * subject to the same daily-budget rules as any background dataSync work; the
- * in-app Survival screen documents this. The engine is idle-mostly, so the
- * budget rarely bites.
+ * The connectedDevice foreground-service type matches continuous LAN peer
+ * connectivity and remains eligible for boot restoration.
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {

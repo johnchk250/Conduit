@@ -97,7 +97,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Map<String, DeviceDashboardState> get dashboardStates => _dashboardStates;
 
   DeviceDashboardState getOrCreateDashboardState(String deviceId) {
-    return _dashboardStates.putIfAbsent(deviceId, () => DeviceDashboardState(deviceId: deviceId));
+    return _dashboardStates.putIfAbsent(
+        deviceId, () => DeviceDashboardState(deviceId: deviceId));
   }
 
   Timer? _androidStatusTimer;
@@ -186,7 +187,29 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       .where((p) => _registry.openSessionFor(p.deviceId)?.isLinkReady == true)
       .toList(growable: false);
 
-  Future<void> start() async {
+  Future<void>? _startOperation;
+
+  /// Start once and let concurrent callers join the same initialization.
+  /// Android's headless service entry and DashboardScreen can legitimately
+  /// request startup at nearly the same time.
+  Future<void> start() {
+    if (_started) return Future<void>.value();
+    final active = _startOperation;
+    if (active != null) return active;
+    final operation = _start();
+    _startOperation = operation;
+    void clearOperation() {
+      if (identical(_startOperation, operation)) _startOperation = null;
+    }
+
+    operation.then<void>(
+      (_) => clearOperation(),
+      onError: (Object _, StackTrace __) => clearOperation(),
+    );
+    return operation;
+  }
+
+  Future<void> _start() async {
     if (_started) return;
     // Observe app lifecycle so we can recover from suspend/resume (Priority 8).
     WidgetsBinding.instance.addObserver(this);
@@ -211,13 +234,15 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         state.conduitHealth = data['conduitHealth'] as Map<String, dynamic>?;
         state.pairHealth = data['pairHealth'] as Map<String, dynamic>?;
         if (data['statusReceivedAt'] != null) {
-          state.statusReceivedAt = DateTime.tryParse(data['statusReceivedAt'] as String);
+          state.statusReceivedAt =
+              DateTime.tryParse(data['statusReceivedAt'] as String);
         }
         if (data['lastSeenAt'] != null) {
           state.lastSeenAt = DateTime.tryParse(data['lastSeenAt'] as String);
         }
         if (data['lastDisconnectedAt'] != null) {
-          state.lastDisconnectedAt = DateTime.tryParse(data['lastDisconnectedAt'] as String);
+          state.lastDisconnectedAt =
+              DateTime.tryParse(data['lastDisconnectedAt'] as String);
         }
         if (data['connectedAt'] != null) {
           state.connectedAt = DateTime.tryParse(data['connectedAt'] as String);
@@ -969,16 +994,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// and propagates it to the peer as a normal sync.
   Future<void> restoreVersion(FolderPair pair, VaultLogEntry entry) async {
     final oldBytes = <int>[];
-    await for (final chunk
-        in _fs.openRead(pair.localPath, entry.vaultPath)) {
+    await for (final chunk in _fs.openRead(pair.localPath, entry.vaultPath)) {
       oldBytes.addAll(chunk);
     }
 
     final currentStat = await _fs.stat(pair.localPath, entry.relPath);
     if (currentStat != null) {
       try {
-        final vaultPath =
-            await _fs.moveToVault(pair.localPath, entry.relPath);
+        final vaultPath = await _fs.moveToVault(pair.localPath, entry.relPath);
         await _engine.recordVaultEvent(
           pair,
           VaultLogEntry(
@@ -1146,7 +1169,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   // Phase 3d ---------------------------------------------------------------
 
-  bool isPairAcceptedByPeer(String pairId) => _engine.isPairAcceptedByPeer(pairId);
+  bool isPairAcceptedByPeer(String pairId) =>
+      _engine.isPairAcceptedByPeer(pairId);
 
   bool peerHasFeature(String peerId, String feature) {
     final session = _registry.openSessionFor(peerId);
@@ -1158,7 +1182,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> setAllowPlayPhoneAlert(bool value) async {
     await _config.setAllowPlayPhoneAlert(value);
     if (Platform.isAndroid) {
-      await _chPhoneDashboard.invokeMethod<void>('setPhoneAlertEnabled', {'enabled': value});
+      await _chPhoneDashboard
+          .invokeMethod<void>('setPhoneAlertEnabled', {'enabled': value});
     }
     notifyListeners();
   }
@@ -1169,14 +1194,20 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     final map = <String, dynamic>{
       if (dstate.batteryPct != null) 'batteryPct': dstate.batteryPct,
       if (dstate.powerState != null) 'powerState': dstate.powerState,
-      if (dstate.storageAvailableBytes != null) 'storageAvailableBytes': dstate.storageAvailableBytes,
-      if (dstate.storageTotalBytes != null) 'storageTotalBytes': dstate.storageTotalBytes,
+      if (dstate.storageAvailableBytes != null)
+        'storageAvailableBytes': dstate.storageAvailableBytes,
+      if (dstate.storageTotalBytes != null)
+        'storageTotalBytes': dstate.storageTotalBytes,
       if (dstate.conduitHealth != null) 'conduitHealth': dstate.conduitHealth,
       if (dstate.pairHealth != null) 'pairHealth': dstate.pairHealth,
-      if (dstate.statusReceivedAt != null) 'statusReceivedAt': dstate.statusReceivedAt!.toIso8601String(),
-      if (dstate.lastSeenAt != null) 'lastSeenAt': dstate.lastSeenAt!.toIso8601String(),
-      if (dstate.lastDisconnectedAt != null) 'lastDisconnectedAt': dstate.lastDisconnectedAt!.toIso8601String(),
-      if (dstate.connectedAt != null) 'connectedAt': dstate.connectedAt!.toIso8601String(),
+      if (dstate.statusReceivedAt != null)
+        'statusReceivedAt': dstate.statusReceivedAt!.toIso8601String(),
+      if (dstate.lastSeenAt != null)
+        'lastSeenAt': dstate.lastSeenAt!.toIso8601String(),
+      if (dstate.lastDisconnectedAt != null)
+        'lastDisconnectedAt': dstate.lastDisconnectedAt!.toIso8601String(),
+      if (dstate.connectedAt != null)
+        'connectedAt': dstate.connectedAt!.toIso8601String(),
     };
     await _config.saveDeviceStatusSnapshot(deviceId, map);
   }
@@ -1184,7 +1215,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   void _onDeviceStatusReceived(String peerId, Map<String, dynamic> msg) {
     final schema = msg['schema'] as int?;
     if (schema != 1) {
-      Diag.log('device_status_ignored', fields: {'reason': 'unknown schema $schema', 'peer': peerId});
+      Diag.log('device_status_ignored',
+          fields: {'reason': 'unknown schema $schema', 'peer': peerId});
       return;
     }
     final dstate = getOrCreateDashboardState(peerId);
@@ -1201,7 +1233,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  Future<void> _onPhoneActionReceived(String peerId, String requestId, String action) async {
+  Future<void> _onPhoneActionReceived(
+      String peerId, String requestId, String action) async {
     if (action == 'play_alert') {
       final session = _registry.openSessionFor(peerId);
       if (session == null || !session.isLinkReady) return;
@@ -1212,7 +1245,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         if (!allowed) {
           result = 'disabled';
         } else {
-          final res = await _chPhoneDashboard.invokeMethod<String>('playPhoneAlert');
+          final res =
+              await _chPhoneDashboard.invokeMethod<String>('playPhoneAlert');
           result = res ?? 'failed';
         }
       } catch (e) {
@@ -1227,12 +1261,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           'result': result,
         });
       } catch (e) {
-        Diag.log('phone_action_result_send_error', fields: {'peer': peerId, 'error': e.toString()});
+        Diag.log('phone_action_result_send_error',
+            fields: {'peer': peerId, 'error': e.toString()});
       }
     }
   }
 
-  void _onPhoneActionResultReceived(String peerId, String requestId, String action, String result) {
+  void _onPhoneActionResultReceived(
+      String peerId, String requestId, String action, String result) {
     final completer = _pendingAlertCompleters.remove(requestId);
     if (completer != null && !completer.isCompleted) {
       completer.complete(result);
@@ -1242,7 +1278,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   void _startAndroidStatusSampling() {
     if (Platform.isAndroid) {
       _androidStatusTimer?.cancel();
-      _androidStatusTimer = Timer.periodic(const Duration(seconds: 60), (_) => _sampleAndSendStatusIfNeeded());
+      _androidStatusTimer = Timer.periodic(
+          const Duration(seconds: 60), (_) => _sampleAndSendStatusIfNeeded());
       _sampleAndSendStatusIfNeeded(forceFull: true);
     }
   }
@@ -1259,14 +1296,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (_registry.readyPeerIds.isEmpty) return;
 
     try {
-      final res = await _chPhoneDashboard.invokeMethod<Map<dynamic, dynamic>>('getDeviceStatus');
+      final res = await _chPhoneDashboard
+          .invokeMethod<Map<dynamic, dynamic>>('getDeviceStatus');
       if (res == null) return;
 
       final current = Map<String, dynamic>.from(res);
       bool shouldSend = false;
       final now = DateTime.now();
 
-      if (forceFull || _lastSentStatus == null || _lastFullRefreshTime == null) {
+      if (forceFull ||
+          _lastSentStatus == null ||
+          _lastFullRefreshTime == null) {
         shouldSend = true;
       } else {
         final lastBatteryPct = _lastSentStatus!['batteryPct'] as int?;
@@ -1278,13 +1318,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           shouldSend = true;
         }
 
-        if (now.difference(_lastFullRefreshTime!) >= const Duration(minutes: 10)) {
+        if (now.difference(_lastFullRefreshTime!) >=
+            const Duration(minutes: 10)) {
           shouldSend = true;
         }
       }
 
       if (shouldSend) {
-        final isFullRefresh = _lastFullRefreshTime == null || now.difference(_lastFullRefreshTime!) >= const Duration(minutes: 10) || forceFull;
+        final isFullRefresh = _lastFullRefreshTime == null ||
+            now.difference(_lastFullRefreshTime!) >=
+                const Duration(minutes: 10) ||
+            forceFull;
         if (isFullRefresh) {
           _lastFullRefreshTime = now;
         }
@@ -1307,7 +1351,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           msg['pairHealth'] = <String, dynamic>{};
         } else {
           if (_lastSentStatus != null) {
-            msg['storageAvailableBytes'] = _lastSentStatus!['storageAvailableBytes'];
+            msg['storageAvailableBytes'] =
+                _lastSentStatus!['storageAvailableBytes'];
             msg['storageTotalBytes'] = _lastSentStatus!['storageTotalBytes'];
             msg['conduitHealth'] = _lastSentStatus!['conduitHealth'];
             msg['pairHealth'] = _lastSentStatus!['pairHealth'];
@@ -1318,11 +1363,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
         for (final peerId in _registry.readyPeerIds) {
           final session = _registry.openSessionFor(peerId);
-          if (session != null && session.isLinkReady && session.features.contains('device_status_v1')) {
+          if (session != null &&
+              session.isLinkReady &&
+              session.features.contains('device_status_v1')) {
             try {
               session.send(msg);
             } catch (e) {
-              Diag.log('device_status_send_error', fields: {'peer': peerId, 'error': e.toString()});
+              Diag.log('device_status_send_error',
+                  fields: {'peer': peerId, 'error': e.toString()});
             }
           }
         }
@@ -1341,7 +1389,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       return 'unsupported';
     }
 
-    final requestId = '${DateTime.now().millisecondsSinceEpoch}-${_alertIdCounter++}';
+    final requestId =
+        '${DateTime.now().millisecondsSinceEpoch}-${_alertIdCounter++}';
     final completer = Completer<String>();
     _pendingAlertCompleters[requestId] = completer;
 
@@ -1532,7 +1581,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// UI → host: manual "send my clipboard now".
   Future<bool> sendClipboard({String? targetPeerId}) =>
-      _clipboard?.sendCurrentClipboard(targetPeerId: targetPeerId) ?? Future.value(false);
+      _clipboard?.sendCurrentClipboard(targetPeerId: targetPeerId) ??
+      Future.value(false);
 
   // ---- Phase 4: remote command -----------------------------------------------
 

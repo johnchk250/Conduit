@@ -1,0 +1,13 @@
+{
+  "dart.flutterSdkPath": "C:\\Users\\Administrator\\flutter",
+  "dart.lineLength": 100,
+  "dart.previewFlutterUiGuides": true,
+  "files.exclude": {
+    "**/.dart_tool": true,
+    "**/build": true
+  },
+  "search.exclude": {
+    "**/.dart_tool": true,
+    "**/build": true
+  }
+}

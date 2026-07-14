@@ -97,7 +97,16 @@ void main() {
     // path doesn't use SQLite, so this is a pure no-op for the old engine.
     DbFactory.init();
 
-    runApp(const ConduitApp());
+    // Start AppState independently of DashboardScreen. Android can launch the
+    // cached Flutter engine from SyncService without an Activity/surface after
+    // process death or boot; synchronization must not depend on a widget's
+    // initState being reached. DashboardScreen.start() remains as an idempotent
+    // fallback and joins this same startup operation.
+    final appState = AppState();
+    runApp(ConduitApp(appState: appState));
+    unawaited(appState.start().catchError((Object error, StackTrace stack) {
+      _logCrash(error, stack, source: 'app_start');
+    }));
   }, (error, stack) {
     // Catches anything that escapes the above — including a synchronous
     // throw inside a raw Socket.listen data callback (e.g. a malformed
@@ -108,12 +117,14 @@ void main() {
 }
 
 class ConduitApp extends StatelessWidget {
-  const ConduitApp({super.key});
+  const ConduitApp({super.key, this.appState});
+
+  final AppState? appState;
 
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider(
-      create: (_) => AppState(),
+      create: (_) => appState ?? AppState(),
       child: MaterialApp(
         title: 'Conduit',
         debugShowCheckedModeBanner: false,
