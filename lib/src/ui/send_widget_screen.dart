@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -51,8 +51,7 @@ class _SendWidgetScreenState extends State<SendWidgetScreen> {
   void initState() {
     super.initState();
     _epoch = beginSendWidgetEpoch();
-    WidgetsBinding.instance
-        .addPostFrameCallback((_) => _enterWidgetGeometry());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _enterWidgetGeometry());
   }
 
   Future<void> _enterWidgetGeometry() async {
@@ -129,7 +128,7 @@ class _SendWidgetScreenState extends State<SendWidgetScreen> {
         scrolledUnderElevation: 0,
         title: Text(
           'Send to device',
-          style: GoogleFonts.manrope(
+          style: AppTypography.manrope(
             textStyle: TextStyle(
               color: c.textPrimary,
               fontSize: 14.5,

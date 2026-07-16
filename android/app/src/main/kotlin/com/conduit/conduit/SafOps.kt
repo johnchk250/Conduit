@@ -273,6 +273,91 @@ object SafOps {
                     }
                     result.success(true)
                 }
+                "replaceFromTemporary" -> {
+                    val tree = call.argument<String>("treeUri")!!
+                    val temporaryRel =
+                        call.argument<String>("temporaryRelPath")!!
+                    val destinationRel =
+                        call.argument<String>("destinationRelPath")!!
+                    ioExecutor.execute {
+                        try {
+                            val sourceUri = resolveFile(ctx, tree, temporaryRel)
+                                ?: throw IllegalArgumentException(
+                                    "no such temporary file: $temporaryRel"
+                                )
+                            val destinationName =
+                                destinationRel.substringAfterLast('/')
+                            val parentUri =
+                                ensureParents(ctx, tree, destinationRel)
+                            val existing =
+                                findChildUri(ctx, parentUri, destinationName)
+                            if (existing != null && existing != sourceUri) {
+                                DocumentsContract.deleteDocument(
+                                    ctx.contentResolver,
+                                    existing
+                                )
+                            }
+
+                            // ExternalStorageProvider can finalize this as a
+                            // metadata-only rename. Providers without rename
+                            // support use a native stream copy, avoiding a
+                            // whole-file round trip through Dart.
+                            val renamed = try {
+                                DocumentsContract.renameDocument(
+                                    ctx.contentResolver,
+                                    sourceUri,
+                                    destinationName
+                                )
+                            } catch (_: Exception) {
+                                null
+                            }
+                            if (renamed == null) {
+                                val destinationUri =
+                                    findChildUri(
+                                        ctx,
+                                        parentUri,
+                                        destinationName
+                                    ) ?: DocumentsContract.createDocument(
+                                        ctx.contentResolver,
+                                        parentUri,
+                                        "application/octet-stream",
+                                        destinationName
+                                    ) ?: throw IllegalStateException(
+                                        "SAF createDocument returned null " +
+                                            "for '$destinationName'"
+                                    )
+                                ctx.contentResolver
+                                    .openInputStream(sourceUri).use { input ->
+                                        ctx.contentResolver
+                                            .openOutputStream(
+                                                destinationUri,
+                                                "wt"
+                                            ).use { output ->
+                                                if (input == null ||
+                                                    output == null) {
+                                                    throw IllegalStateException(
+                                                        "cannot finalize " +
+                                                            destinationRel
+                                                    )
+                                                }
+                                                input.copyTo(
+                                                    output,
+                                                    256 * 1024
+                                                )
+                                                output.flush()
+                                            }
+                                    }
+                                DocumentsContract.deleteDocument(
+                                    ctx.contentResolver,
+                                    sourceUri
+                                )
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("finalize_error", e.message, null)
+                        }
+                    }
+                }
                 "delete" -> {
                     val tree = call.argument<String>("treeUri")!!
                     val rel = call.argument<String>("relPath")!!

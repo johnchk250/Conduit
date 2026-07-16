@@ -279,6 +279,51 @@ void main() {
       await db.close();
     });
 
+    test(
+        'a dominating remote resurrection is staged until local bytes are fetched',
+        () async {
+      final db = await IndexDb.open('p', stateDir);
+      await db.upsertLocal(
+          relPath: 'restored.txt',
+          size: 10,
+          mtime: 1,
+          sha256: 'old',
+          deviceId: 'Peer');
+      await db.markDeletedLocal(relPath: 'restored.txt', deviceId: 'Peer');
+      final tombstone = (await db.get('restored.txt'))!;
+      expect(tombstone.deleted, isTrue);
+      expect(tombstone.sequence, 2);
+
+      await db.applyRemote(IndexEntry(
+        relPath: 'restored.txt',
+        size: 12,
+        mtime: 2,
+        sha256: 'restored',
+        version: tombstone.version.bump('Restorer'),
+        sequence: 1,
+      ));
+
+      final staged = (await db.get('restored.txt'))!;
+      expect(staged.deleted, isFalse);
+      expect(staged.sha256, 'restored');
+      expect(staged.sequence, tombstone.sequence,
+          reason: 'per-device sequences must not block the resurrection');
+      expect(staged.localSize, -1);
+      expect(await db.localSnapshot('Peer'), isEmpty,
+          reason: 'metadata alone is not proof that local bytes exist');
+      expect(await db.localLivePaths('Peer'), isEmpty,
+          reason: 'the scanner must not re-tombstone before the fetch');
+
+      await db.confirmLocalObservation(
+          relPath: 'restored.txt', sha: 'restored');
+      expect(
+        (await db.localSnapshot('Peer')).single.relPath,
+        'restored.txt',
+      );
+      expect(await db.localLivePaths('Peer'), {'restored.txt'});
+      await db.close();
+    });
+
     test('a LOWER-sequence remote does not overwrite a higher one', () async {
       final db = await IndexDb.open('p', stateDir);
       await db.applyRemote(IndexEntry(
@@ -308,7 +353,8 @@ void main() {
     // remain concurrent and LWW can fire. The transport fields (our sha/size)
     // are protected by the sequence guard as before. The LWW outcome is decided
     // by mtime in indexDiff — our edit (newer mtime) wins there.
-    test('a LOWER-sequence remote with DIFFERENT sha keeps vectors concurrent '
+    test(
+        'a LOWER-sequence remote with DIFFERENT sha keeps vectors concurrent '
         '(no merge; LWW in indexDiff decides)', () async {
       final db = await IndexDb.open('p', stateDir);
       // This device's own authored row, version {Me:2}.
@@ -351,7 +397,8 @@ void main() {
     // SAME sha case: peer re-advertises a file we authored with the SAME content
     // but carrying their origin counter. The merge MUST run so our vector absorbs
     // their counter and we keep dominance (original smoke #3 fix).
-    test('a LOWER-sequence remote with SAME sha still merges its origin counter',
+    test(
+        'a LOWER-sequence remote with SAME sha still merges its origin counter',
         () async {
       final db = await IndexDb.open('p', stateDir);
       await db.upsertLocal(

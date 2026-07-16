@@ -13,7 +13,7 @@ $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 # newer Flutter installation. Nothing here is persisted outside this process.
 $flutterHomeCandidates = @(
     $env:FLUTTER_ROOT,
-    'C:\Users\Administrator\flutter'
+    'E:\Developer\flutter'
 ) | Where-Object { $_ -and (Test-Path (Join-Path $_ 'bin\flutter.bat')) }
 
 if ($flutterHomeCandidates.Count -gt 0) {
@@ -25,7 +25,7 @@ if ($flutterHomeCandidates.Count -gt 0) {
 $androidSdkCandidates = @(
     $env:ANDROID_SDK_ROOT,
     $env:ANDROID_HOME,
-    'C:\Users\Administrator\AppData\Local\Android\Sdk'
+    'E:\Developer\Android\SDK'
 ) | Where-Object { $_ -and (Test-Path $_) }
 
 if ($androidSdkCandidates.Count -gt 0) {
@@ -33,6 +33,8 @@ if ($androidSdkCandidates.Count -gt 0) {
     $env:ANDROID_HOME = $androidSdkCandidates[0]
     $env:Path = "$env:ANDROID_SDK_ROOT\platform-tools;$env:ANDROID_SDK_ROOT\cmdline-tools\latest\bin;$env:Path"
 }
+
+$env:GRADLE_USER_HOME = 'E:\Developer\Gradle'
 
 $jbr = 'C:\Program Files\Android\Android Studio\jbr'
 if (-not $env:JAVA_HOME -and (Test-Path (Join-Path $jbr 'bin\java.exe'))) {

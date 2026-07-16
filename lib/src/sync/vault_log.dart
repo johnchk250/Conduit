@@ -37,6 +37,43 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+import '../storage/index_db.dart';
+import 'version_vector.dart';
+
+const vaultRetention = Duration(days: 14);
+
+enum VaultReason {
+  incomingOverwrite,
+  conflictReplacement,
+  peerDelete,
+  restoreReplacement,
+}
+
+enum VaultOutcomeStatus { moved, absent, failed, invalidPath }
+
+class VaultOutcome {
+  const VaultOutcome(this.status, {this.entry});
+  final VaultOutcomeStatus status;
+  final VaultLogEntry? entry;
+}
+
+enum RestoreResult {
+  restoredAndQueued,
+  restoredOffline,
+  restoredLocalOnlyByDirection,
+  sourceMissing,
+  permissionLost,
+  invalidPath,
+  failed,
+}
+
+class VaultLogReadException implements Exception {
+  VaultLogReadException(this.cause);
+  final Object cause;
+  @override
+  String toString() => 'VaultLogReadException: $cause';
+}
+
 class VaultLogEntry {
   /// The live path this was a version of, e.g. `docs/report.docx`.
   final String relPath;
@@ -53,26 +90,86 @@ class VaultLogEntry {
 
   /// Size of the OLD file that was vaulted (not any incoming/new size).
   final int sizeBytes;
+  final VaultReason reason;
+  final String? sourcePeerId;
+  final String? originalSha256;
+  final VersionVector? originalVersion;
+  final DateTime? restoredAt;
 
   VaultLogEntry({
     required this.relPath,
     required this.vaultPath,
     required this.timestamp,
     required this.sizeBytes,
+    this.reason = VaultReason.incomingOverwrite,
+    this.sourcePeerId,
+    this.originalSha256,
+    this.originalVersion,
+    this.restoredAt,
   });
+
+  String get entryId =>
+      '${timestamp.toUtc().microsecondsSinceEpoch}|$vaultPath';
 
   Map<String, dynamic> toJson() => {
         'relPath': relPath,
         'vaultPath': vaultPath,
-        'timestamp': timestamp.toIso8601String(),
+        'timestamp': timestamp.toUtc().toIso8601String(),
         'sizeBytes': sizeBytes,
+        'reason': reason.name,
+        if (sourcePeerId != null) 'sourcePeerId': sourcePeerId,
+        if (originalSha256 != null) 'originalSha256': originalSha256,
+        if (originalVersion != null)
+          'originalVersion': originalVersion!.toJson(),
+        if (restoredAt != null)
+          'restoredAt': restoredAt!.toUtc().toIso8601String(),
       };
 
-  factory VaultLogEntry.fromJson(Map<String, dynamic> j) => VaultLogEntry(
-        relPath: j['relPath'] as String,
-        vaultPath: j['vaultPath'] as String,
-        timestamp: DateTime.parse(j['timestamp'] as String),
-        sizeBytes: j['sizeBytes'] as int,
+  factory VaultLogEntry.fromJson(Map<String, dynamic> j) {
+    VaultReason reason = VaultReason.incomingOverwrite;
+    final rawReason = j['reason'];
+    if (rawReason is String) {
+      reason = VaultReason.values
+              .where((candidate) => candidate.name == rawReason)
+              .firstOrNull ??
+          VaultReason.incomingOverwrite;
+    }
+    VersionVector? originalVersion;
+    final rawVersion = j['originalVersion'];
+    if (rawVersion is Map) {
+      try {
+        originalVersion =
+            VersionVector.fromJson(rawVersion.cast<String, dynamic>());
+      } catch (_) {}
+    }
+    DateTime? restoredAt;
+    final rawRestoredAt = j['restoredAt'];
+    if (rawRestoredAt is String) {
+      restoredAt = DateTime.tryParse(rawRestoredAt)?.toUtc();
+    }
+    return VaultLogEntry(
+      relPath: j['relPath'] as String,
+      vaultPath: j['vaultPath'] as String,
+      timestamp: DateTime.parse(j['timestamp'] as String).toUtc(),
+      sizeBytes: (j['sizeBytes'] as num).toInt(),
+      reason: reason,
+      sourcePeerId: j['sourcePeerId'] as String?,
+      originalSha256: j['originalSha256'] as String?,
+      originalVersion: originalVersion,
+      restoredAt: restoredAt,
+    );
+  }
+
+  VaultLogEntry markRestored(DateTime value) => VaultLogEntry(
+        relPath: relPath,
+        vaultPath: vaultPath,
+        timestamp: timestamp,
+        sizeBytes: sizeBytes,
+        reason: reason,
+        sourcePeerId: sourcePeerId,
+        originalSha256: originalSha256,
+        originalVersion: originalVersion,
+        restoredAt: value,
       );
 }
 
@@ -107,17 +204,26 @@ class VaultLog {
     }
   }
 
-  /// Appends one entry. Read-modify-write of a small JSON file — fine for
-  /// this log's expected size (one entry per overwritten file, and only
-  /// on devices that actually edit synced files locally); no pruning yet,
-  /// matching the plan's own "retention policy out of scope for the first
-  /// cut" call for the vault directory itself.
+  Future<List<VaultLogEntry>> allForMaintenance() async {
+    if (!await _file.exists()) return [];
+    try {
+      final raw = await _file.readAsString();
+      final list = jsonDecode(raw) as List;
+      final entries = list
+          .map((e) => VaultLogEntry.fromJson(e as Map<String, dynamic>))
+          .toList();
+      entries.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+      return entries;
+    } catch (e) {
+      throw VaultLogReadException(e);
+    }
+  }
+
+  /// Appends one entry before the engine applies the retention policy.
   Future<void> record(VaultLogEntry entry) async {
     final entries = await all();
     entries.add(entry);
-    await _file.writeAsString(
-      jsonEncode(entries.map((e) => e.toJson()).toList()),
-    );
+    await replaceAll(entries);
   }
 
   /// Removes one entry (used after a successful restore, or if the
@@ -130,8 +236,29 @@ class VaultLog {
         e.relPath == entry.relPath &&
         e.vaultPath == entry.vaultPath &&
         e.timestamp == entry.timestamp);
-    await _file.writeAsString(
-      jsonEncode(entries.map((e) => e.toJson()).toList()),
-    );
+    await replaceAll(entries);
+  }
+
+  Future<void> markRestored(String entryId, DateTime restoredAt) async {
+    final entries = await all();
+    final updated = [
+      for (final entry in entries)
+        if (entry.entryId == entryId) entry.markRestored(restoredAt) else entry,
+    ];
+    await replaceAll(updated);
+  }
+
+  Future<void> replaceAll(List<VaultLogEntry> entries) async {
+    final tmp = File('${_file.path}.tmp');
+    final sink = tmp.openWrite();
+    sink.write(jsonEncode(entries.map((e) => e.toJson()).toList()));
+    await sink.flush();
+    await sink.close();
+    try {
+      await tmp.rename(_file.path);
+    } on FileSystemException {
+      if (await _file.exists()) await _file.delete();
+      await tmp.rename(_file.path);
+    }
   }
 }

@@ -89,6 +89,16 @@ abstract class FileSystemAccess {
   }
 }
 
+/// Optional filesystem capability for materializing a completed temporary
+/// file without copying all of its bytes through Dart.
+abstract interface class TemporaryFileFinalizer {
+  Future<void> replaceFromTemporary(
+    String rootPath,
+    String temporaryRelPath,
+    String destinationRelPath,
+  );
+}
+
 /// Standard filesystem access for Windows (and any platform with real File I/O).
 class LocalFileSystemAccess implements FileSystemAccess {
   const LocalFileSystemAccess();
@@ -105,8 +115,9 @@ class LocalFileSystemAccess implements FileSystemAccess {
       if (entity is! File) continue;
       final rel = p.relative(entity.path, from: rootPath);
       // Skip our own state dir and hidden versioning vault.
-      if (rel.startsWith('.syncstate') || rel.startsWith('.syncversions'))
+      if (rel.startsWith('.syncstate') || rel.startsWith('.syncversions')) {
         continue;
+      }
       result.add(rel.replaceAll('\\', '/'));
     }
     return result;

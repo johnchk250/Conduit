@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 
@@ -634,7 +634,7 @@ class _SendFlowViewState extends State<SendFlowView> {
             child: Text(
               'No paired devices yet. Pair a device first, then come back '
               'here to send.',
-              style: GoogleFonts.inter(
+              style: AppTypography.inter(
                 textStyle: TextStyle(color: c.danger, fontSize: 12.5),
               ),
             ),
@@ -663,7 +663,7 @@ class _SendFlowViewState extends State<SendFlowView> {
               const SizedBox(width: 8),
               Text(
                 'Ready to send',
-                style: GoogleFonts.manrope(
+                style: AppTypography.manrope(
                   textStyle: TextStyle(
                     fontWeight: FontWeight.bold,
                     color: c.violet,
@@ -768,7 +768,7 @@ class _SendFlowViewState extends State<SendFlowView> {
                 SizedBox(height: widget.compact ? 14 : 24),
                 Text(
                   _isDragging ? 'Drop to add files' : 'Click to choose files',
-                  style: GoogleFonts.manrope(
+                  style: AppTypography.manrope(
                     textStyle: TextStyle(
                       fontWeight: FontWeight.bold,
                       color: anyConnected ? c.textPrimary : c.textTertiary,
@@ -782,7 +782,7 @@ class _SendFlowViewState extends State<SendFlowView> {
                   anyConnected
                       ? 'Drag files or folders here — or share from any app.'
                       : 'Connect a device first, then pick a file to send.',
-                  style: GoogleFonts.inter(
+                  style: AppTypography.inter(
                     textStyle:
                         TextStyle(color: c.textSecondary, fontSize: 12.5),
                   ),
@@ -851,7 +851,7 @@ class _SendFlowViewState extends State<SendFlowView> {
                 _isDragging
                     ? 'Drop to add more'
                     : '$_fileCount file${_fileCount == 1 ? '' : 's'} ready',
-                style: GoogleFonts.manrope(
+                style: AppTypography.manrope(
                   textStyle: TextStyle(
                     color: c.textPrimary,
                     fontWeight: FontWeight.bold,
@@ -865,7 +865,7 @@ class _SendFlowViewState extends State<SendFlowView> {
                     ? 'Files & folders will be added to the queue'
                     : names.take(4).join(', ') +
                         (names.length > 4 ? ', +${names.length - 4} more' : ''),
-                style: GoogleFonts.inter(
+                style: AppTypography.inter(
                   textStyle: TextStyle(color: c.textSecondary, fontSize: 12.5),
                 ),
                 textAlign: TextAlign.center,
@@ -918,7 +918,7 @@ class _SendFlowViewState extends State<SendFlowView> {
           SizedBox(height: widget.compact ? 14 : 22),
           Text(
             _currentFileName ?? 'Sending…',
-            style: GoogleFonts.manrope(
+            style: AppTypography.manrope(
               textStyle: TextStyle(
                 color: c.textPrimary,
                 fontWeight: FontWeight.bold,
@@ -1032,7 +1032,7 @@ class _SendFlowViewState extends State<SendFlowView> {
           const SizedBox(height: 18),
           Text(
             _resultMessage ?? (isSuccess ? 'Sent!' : 'Send failed'),
-            style: GoogleFonts.manrope(
+            style: AppTypography.manrope(
               textStyle: TextStyle(
                 color: c.textPrimary,
                 fontWeight: FontWeight.bold,
@@ -1231,7 +1231,7 @@ class _DeviceChip extends StatelessWidget {
               width: 72,
               child: Text(
                 peer.name,
-                style: GoogleFonts.manrope(
+                style: AppTypography.manrope(
                   textStyle: TextStyle(
                     fontWeight: selected ? FontWeight.bold : FontWeight.normal,
                     color: connected ? c.textPrimary : c.textTertiary,

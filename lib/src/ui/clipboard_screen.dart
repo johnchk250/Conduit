@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
@@ -62,7 +62,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
               trailing: Switch(
                 value: enabled,
                 onChanged: (v) => state.setClipboardSyncEnabled(v),
-                activeColor: c.violet,
+                activeThumbColor: c.violet,
               ),
             ),
             const SizedBox(height: 12),
@@ -79,7 +79,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                       const SizedBox(width: 8),
                       Text(
                         'Connected devices',
-                        style: GoogleFonts.manrope(
+                        style: AppTypography.manrope(
                           textStyle: TextStyle(
                             color: c.textPrimary,
                             fontWeight: FontWeight.w700,
@@ -113,7 +113,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                             const SizedBox(width: 8),
                             Text(
                               peer.name,
-                              style: GoogleFonts.inter(
+                              style: AppTypography.inter(
                                 textStyle: TextStyle(
                                   color: c.textPrimary,
                                   fontSize: 13,
@@ -129,7 +129,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                           ? 'No peer connected — clipboard will sync when a '
                               'peer connects'
                           : 'Enable clipboard sync to start',
-                      style: GoogleFonts.inter(
+                      style: AppTypography.inter(
                         textStyle:
                             TextStyle(color: c.textSecondary, fontSize: 12.5),
                       ),
@@ -151,7 +151,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                   children: [
                     Text(
                       'Send clipboard now',
-                      style: GoogleFonts.manrope(
+                      style: AppTypography.manrope(
                         textStyle: TextStyle(
                           color: c.textPrimary,
                           fontWeight: FontWeight.w700,
@@ -163,7 +163,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                     Text(
                       'Reads your current clipboard and sends it to all '
                       'connected devices.',
-                      style: GoogleFonts.inter(
+                      style: AppTypography.inter(
                         textStyle:
                             TextStyle(color: c.textSecondary, fontSize: 12),
                       ),
@@ -201,7 +201,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                   children: [
                     Text(
                       'Last received',
-                      style: GoogleFonts.manrope(
+                      style: AppTypography.manrope(
                         textStyle: TextStyle(
                           color: c.textPrimary,
                           fontWeight: FontWeight.w700,
@@ -214,14 +214,14 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                         ? Text(
                             'From ${_lastReceivedFrom ?? "a device"} at '
                             '${_formatTime(_lastReceivedAt!)}',
-                            style: GoogleFonts.inter(
+                            style: AppTypography.inter(
                               textStyle: TextStyle(
                                   color: c.textPrimary, fontSize: 12.5),
                             ),
                           )
                         : Text(
                             'Nothing received yet',
-                            style: GoogleFonts.inter(
+                            style: AppTypography.inter(
                               textStyle: TextStyle(
                                   color: c.textSecondary, fontSize: 12.5),
                             ),

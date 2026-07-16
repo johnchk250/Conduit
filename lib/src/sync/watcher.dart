@@ -83,8 +83,9 @@ class FolderWatcher {
     if (newInterval == _currentInterval) return;
     _currentInterval = newInterval;
     final running = _timer;
-    if (running == null)
+    if (running == null) {
       return; // not started — start() will pick up the new value
+    }
     running.cancel();
     _timer = Timer.periodic(newInterval, (_) => _scan());
     _scan(); // Trigger immediate scan to capture pending changes instantly

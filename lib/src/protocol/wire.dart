@@ -1,11 +1,14 @@
 /// Conduit — wire protocol constants shared by both peers.
 ///
 /// Every connection carries length-prefixed JSON envelopes of the shape:
-///   { "t": <type>, ...payload }
+///   { "t": type, ...payload }
 /// where `t` is one of the [Msg] constants below.
+library;
 
 class Msg {
   Msg._();
+
+  static const protocolVersion = 2;
 
   // Handshake / pairing
   static const hello =
@@ -101,6 +104,8 @@ class Msg {
       'file_offer_data'; // sender responds with block (or error)
   static const fileOfferControl =
       'file_offer_control'; // {offerId, action: pause|resume|cancel}
+  static const fileOfferReceipt =
+      'file_offer_receipt'; // {offerId, status, receivedBytes, failureCode?}
 
   // Folder-pair contract negotiation. Establishes a SHARED pairId across two
   // devices so index/request messages can be matched. Without this, each device
@@ -234,4 +239,68 @@ class FolderPair {
         ignoreExtensions: ignoreExtensions,
         maxFileSizeBytes: maxFileSizeBytes,
       );
+}
+
+/// Validated user intent for creating or replacing a folder-pair
+/// configuration. A destination peer is deliberately required so callers
+/// cannot silently choose whichever connection happens to be first.
+class FolderPairDraft {
+  FolderPairDraft({
+    required this.name,
+    required this.localPath,
+    required this.direction,
+    required this.peerDeviceId,
+    this.ignoreGlobs = const [],
+    this.ignoreExtensions = const [],
+    this.maxFileSizeBytes,
+  }) {
+    if (name.trim().isEmpty) {
+      throw ArgumentError.value(name, 'name', 'must not be empty');
+    }
+    if (localPath.trim().isEmpty) {
+      throw ArgumentError.value(localPath, 'localPath', 'must not be empty');
+    }
+    if (peerDeviceId.trim().isEmpty) {
+      throw ArgumentError.value(
+        peerDeviceId,
+        'peerDeviceId',
+        'an explicit destination peer is required',
+      );
+    }
+  }
+
+  final String name;
+  final String localPath;
+  final SyncDirection direction;
+  final String peerDeviceId;
+  final List<String> ignoreGlobs;
+  final List<String> ignoreExtensions;
+  final int? maxFileSizeBytes;
+
+  FolderPair materialize(String id) => FolderPair(
+        id: id,
+        name: name.trim(),
+        localPath: localPath.trim(),
+        direction: direction,
+        peerDeviceId: peerDeviceId,
+        ignoreGlobs: List<String>.unmodifiable(ignoreGlobs),
+        ignoreExtensions: List<String>.unmodifiable(ignoreExtensions),
+        maxFileSizeBytes: maxFileSizeBytes,
+      );
+
+  factory FolderPairDraft.fromPair(FolderPair pair) {
+    final peerId = pair.peerDeviceId;
+    if (peerId == null || peerId.isEmpty) {
+      throw ArgumentError('The folder pair has no destination peer.');
+    }
+    return FolderPairDraft(
+      name: pair.name,
+      localPath: pair.localPath,
+      direction: pair.direction,
+      peerDeviceId: peerId,
+      ignoreGlobs: pair.ignoreGlobs,
+      ignoreExtensions: pair.ignoreExtensions,
+      maxFileSizeBytes: pair.maxFileSizeBytes,
+    );
+  }
 }

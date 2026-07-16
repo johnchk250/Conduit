@@ -3,15 +3,17 @@ import 'dart:ui';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 import 'package:provider/provider.dart';
-import 'package:uuid/uuid.dart';
 
 import '../app_state.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
 import 'glass.dart';
 import 'version_history_screen.dart';
+import 'sync_preview_screen.dart';
+import 'folder_setup/folder_setup_flow.dart';
+import 'transfer_history_screen.dart';
 
 /// Fast 180 ms fade push — avoids the heavy 300 ms slide of [MaterialPageRoute]
 /// on top of backdrop-blur glass surfaces.
@@ -65,7 +67,10 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
         label: 'Add synced folder',
         icon: Icons.add_rounded,
         accentColor: c.violet,
-        onTap: () => _showPairDialog(ctx, state, null),
+        onTap: () => runFolderSetupFlow(
+          ctx,
+          onCustom: () => _showPairDialog(ctx, state, null),
+        ),
       ),
       floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       body: SafeArea(
@@ -93,7 +98,7 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
                     state.pauseSync();
                   }
                 },
-                activeColor: c.mint,
+                activeThumbColor: c.mint,
               ),
               onTap: () {
                 if (state.isPaused) {
@@ -141,7 +146,7 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
             const SizedBox(height: 16),
             Text(
               'No folders yet',
-              style: GoogleFonts.manrope(
+              style: AppTypography.manrope(
                 textStyle: TextStyle(
                   color: c.textPrimary,
                   fontSize: 17,
@@ -155,7 +160,7 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
               'send it to a paired device. The other device picks where the '
               'files should go, and syncing starts.',
               textAlign: TextAlign.center,
-              style: GoogleFonts.inter(
+              style: AppTypography.inter(
                 textStyle: TextStyle(color: c.textSecondary, fontSize: 13),
               ),
             ),
@@ -205,7 +210,8 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
     FolderPair? existing,
   ) async {
     final isAndroid = state.identity.platform == 'android';
-    final hasPeer = state.connectedPeers.isNotEmpty;
+    final availablePeers = state.pairedPeers;
+    String? peerId = existing?.peerDeviceId;
     final nameCtl = TextEditingController(text: existing?.name ?? '');
     final pathCtl = TextEditingController(text: existing?.localPath ?? '');
     var direction = existing?.direction ?? SyncDirection.twoWay;
@@ -268,7 +274,7 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
                 ),
                 const SizedBox(height: 12),
                 DropdownButtonFormField<SyncDirection>(
-                  value: direction,
+                  initialValue: direction,
                   decoration: const InputDecoration(labelText: 'Direction'),
                   items: SyncDirection.values
                       .map((d) =>
@@ -276,6 +282,26 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
                       .toList(),
                   onChanged: (v) =>
                       setState(() => direction = v ?? SyncDirection.twoWay),
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  initialValue:
+                      availablePeers.any((peer) => peer.deviceId == peerId)
+                          ? peerId
+                          : null,
+                  decoration: const InputDecoration(
+                    labelText: 'Destination device',
+                    helperText: 'Choose the device explicitly for this folder.',
+                  ),
+                  items: availablePeers
+                      .map(
+                        (peer) => DropdownMenuItem(
+                          value: peer.deviceId,
+                          child: Text(peer.name),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) => setState(() => peerId = value),
                 ),
               ],
             ),
@@ -289,44 +315,56 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
                 onPressed: () async {
                   final name = nameCtl.text.trim();
                   final path = pathCtl.text.trim();
-                  if (name.isEmpty || path.isEmpty) {
+                  if (name.isEmpty || path.isEmpty || peerId == null) {
                     ScaffoldMessenger.of(ctx).showSnackBar(
                       const SnackBar(
-                          content:
-                              Text('Please provide both name and folder.')),
+                        content: Text(
+                          'Please provide a name, folder, and destination.',
+                        ),
+                      ),
                     );
                     return;
                   }
-                  final updated = existing.copyWith(
-                      name: name, localPath: path, direction: direction);
-                  await state.addFolderPair(updated);
+                  await state.updateFolderPair(
+                    existing.id,
+                    FolderPairDraft(
+                      name: name,
+                      localPath: path,
+                      direction: direction,
+                      peerDeviceId: peerId!,
+                      ignoreGlobs: existing.ignoreGlobs,
+                      ignoreExtensions: existing.ignoreExtensions,
+                      maxFileSizeBytes: existing.maxFileSizeBytes,
+                    ),
+                  );
                   if (sctx.mounted) Navigator.pop(sctx);
                 },
                 child: const Text('Save'),
               )
             else
               FilledButton.icon(
-                onPressed: hasPeer
+                onPressed: availablePeers.isNotEmpty
                     ? () async {
                         final name = nameCtl.text.trim();
                         final path = pathCtl.text.trim();
-                        if (name.isEmpty || path.isEmpty) {
+                        if (name.isEmpty || path.isEmpty || peerId == null) {
                           ScaffoldMessenger.of(ctx).showSnackBar(
                             const SnackBar(
-                                content: Text(
-                                    'Please provide both name and folder.')),
+                              content: Text(
+                                'Please provide a name, folder, and destination.',
+                              ),
+                            ),
                           );
                           return;
                         }
-                        final peerId = state.connectedPeers.first.deviceId;
-                        final pair = FolderPair(
-                          id: const Uuid().v4(),
-                          name: name,
-                          localPath: path,
-                          direction: direction,
-                          peerDeviceId: peerId,
+                        final pair = await state.createFolderPair(
+                          FolderPairDraft(
+                            name: name,
+                            localPath: path,
+                            direction: direction,
+                            peerDeviceId: peerId!,
+                          ),
                         );
-                        await state.addFolderPair(pair);
                         // Send the invite so the peer can pick its own folder.
                         state.invitePeerToFolder(pair.id);
                         if (sctx.mounted) {
@@ -428,7 +466,7 @@ class _GlassFabState extends State<_GlassFab>
           const SizedBox(width: 10),
           Text(
             widget.label,
-            style: GoogleFonts.manrope(
+            style: AppTypography.manrope(
               textStyle: const TextStyle(
                 color: Colors.white,
                 fontSize: 15,
@@ -559,7 +597,7 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                     p.localPath,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: GoogleFonts.jetBrainsMono(
+                    style: AppTypography.jetBrainsMono(
                       textStyle: TextStyle(
                         color: c.textSecondary,
                         fontSize: 11,
@@ -584,7 +622,7 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                         const SizedBox(width: 12),
                         Text(
                           status,
-                          style: GoogleFonts.inter(
+                          style: AppTypography.inter(
                             textStyle: TextStyle(
                               color: c.textSecondary,
                               fontSize: 11.5,
@@ -597,7 +635,7 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                       const SizedBox(height: 6),
                       Text(
                         'Last synced: ${_fmtDateTime(st.lastSyncedAt!)}',
-                        style: GoogleFonts.inter(
+                        style: AppTypography.inter(
                           textStyle: TextStyle(
                             color: c.textTertiary,
                             fontSize: 11,
@@ -616,7 +654,7 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                           child: Text(
                             'Invite sent — waiting for the other device to '
                             'accept.',
-                            style: GoogleFonts.inter(
+                            style: AppTypography.inter(
                               textStyle: TextStyle(
                                 color: c.textSecondary,
                                 fontSize: 11.5,
@@ -761,44 +799,83 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          _kv('Direction', widget.pair.direction.label),
-          _kv('Local path', widget.pair.localPath),
-          _kv('Status', st?.status ?? 'Idle'),
-          _kv(
-            'Last synced',
-            st?.lastSyncedAt != null
-                ? _fmtDateTime(st!.lastSyncedAt!)
-                : 'never',
-          ),
-          if (widget.pair.peerDeviceId != null)
-            _kv('Paired with', widget.pair.peerDeviceId!),
-          if (currentPair.ignoreGlobs.isNotEmpty ||
-              currentPair.ignoreExtensions.isNotEmpty ||
-              currentPair.maxFileSizeBytes != null)
-            _kv('Ignore rules', _ignoreRulesSummary(currentPair)),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: () =>
-                      _showIgnoreRulesDialog(ctx, state, currentPair),
-                  icon: const Icon(Icons.rule_folder_outlined),
-                  label: const Text('Ignore rules'),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: () => Navigator.push(
-                    ctx,
-                    _fadeRoute((_) => VersionHistoryScreen(pair: currentPair)),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  _kv('Direction', currentPair.direction.label),
+                  _kv('Local folder',
+                      _friendlyLocalPath(currentPair.localPath)),
+                  _kv('Status', st?.status ?? 'Idle'),
+                  _kv(
+                    'Last synced',
+                    st?.lastSyncedAt != null
+                        ? _fmtDateTime(st!.lastSyncedAt!)
+                        : 'Never',
                   ),
-                  icon: const Icon(Icons.history),
-                  label: const Text('Restore versions'),
-                ),
+                  if (currentPair.peerDeviceId != null)
+                    _kv('Paired with', currentPair.peerDeviceId!),
+                  if (currentPair.ignoreGlobs.isNotEmpty ||
+                      currentPair.ignoreExtensions.isNotEmpty ||
+                      currentPair.maxFileSizeBytes != null)
+                    _kv('Ignore rules', _ignoreRulesSummary(currentPair)),
+                ],
               ),
-            ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final oneColumn = constraints.maxWidth < 330 ||
+                  MediaQuery.textScalerOf(context).scale(1) > 1.3;
+              final width = oneColumn
+                  ? constraints.maxWidth
+                  : (constraints.maxWidth - 12) / 2;
+              return Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  _detailAction(
+                    width: width,
+                    onPressed: () => Navigator.push(
+                      ctx,
+                      _fadeRoute((_) => SyncPreviewScreen(pair: currentPair)),
+                    ),
+                    icon: Icons.preview_outlined,
+                    label: 'Preview',
+                  ),
+                  _detailAction(
+                    width: width,
+                    onPressed: () =>
+                        _showIgnoreRulesDialog(ctx, state, currentPair),
+                    icon: Icons.rule_folder_outlined,
+                    label: 'Ignore rules',
+                  ),
+                  _detailAction(
+                    width: width,
+                    onPressed: () => Navigator.push(
+                      ctx,
+                      _fadeRoute(
+                          (_) => VersionHistoryScreen(pair: currentPair)),
+                    ),
+                    icon: Icons.history,
+                    label: 'Version history',
+                  ),
+                  _detailAction(
+                    width: width,
+                    onPressed: () => Navigator.push(
+                      ctx,
+                      _fadeRoute(
+                        (_) => TransferHistoryScreen(pairId: currentPair.id),
+                      ),
+                    ),
+                    icon: Icons.receipt_long_outlined,
+                    label: 'Transfer history',
+                  ),
+                ],
+              );
+            },
           ),
           const SizedBox(height: 24),
           Row(
@@ -860,21 +937,64 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
 
   Widget _kv(String k, String v) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 100,
-            child: Text(k, style: const TextStyle(fontWeight: FontWeight.w600)),
-          ),
-          Expanded(
-              child: Text(v,
-                  style:
-                      const TextStyle(fontFamily: 'monospace', fontSize: 12))),
-        ],
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final value = SelectableText(v);
+          if (constraints.maxWidth < 360) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(k, style: const TextStyle(fontWeight: FontWeight.w600)),
+                const SizedBox(height: 3),
+                value,
+              ],
+            );
+          }
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: 112,
+                child: Text(k,
+                    style: const TextStyle(fontWeight: FontWeight.w600)),
+              ),
+              Expanded(child: value),
+            ],
+          );
+        },
       ),
     );
+  }
+
+  Widget _detailAction({
+    required double width,
+    required VoidCallback onPressed,
+    required IconData icon,
+    required String label,
+  }) {
+    return SizedBox(
+      width: width,
+      height: 52,
+      child: OutlinedButton.icon(
+        onPressed: onPressed,
+        icon: Icon(icon),
+        label: Text(label, textAlign: TextAlign.center),
+      ),
+    );
+  }
+
+  String _friendlyLocalPath(String path) {
+    if (!path.startsWith('content://')) return path;
+    final decoded = Uri.decodeComponent(path);
+    final treeIndex = decoded.indexOf('/tree/');
+    if (treeIndex < 0) return 'Android folder';
+    final documentId = decoded.substring(treeIndex + 6);
+    if (documentId == 'primary:') return 'Internal storage';
+    if (documentId.startsWith('primary:')) {
+      return 'Internal storage / ${documentId.substring(8)}';
+    }
+    return documentId.replaceAll(':', ' / ');
   }
 
   String _ignoreRulesSummary(FolderPair pair) {

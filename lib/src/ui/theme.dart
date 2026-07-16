@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 
 /// App-wide theme. Conduit uses a calm slate/indigo palette that reads
 /// well on both Windows desktop and Android.
@@ -17,7 +17,7 @@ class AppTheme {
     return ThemeData(
       colorScheme: scheme,
       useMaterial3: true,
-      textTheme: GoogleFonts.outfitTextTheme(baseTheme.textTheme),
+      textTheme: AppTypography.outfitTextTheme(baseTheme.textTheme),
       visualDensity: VisualDensity.adaptivePlatformDensity,
       appBarTheme: AppBarTheme(
         backgroundColor: scheme.surface,
@@ -64,7 +64,7 @@ class AppTheme {
     return ThemeData(
       colorScheme: scheme,
       useMaterial3: true,
-      textTheme: GoogleFonts.outfitTextTheme(baseTheme.textTheme),
+      textTheme: AppTypography.outfitTextTheme(baseTheme.textTheme),
       visualDensity: VisualDensity.adaptivePlatformDensity,
       appBarTheme: AppBarTheme(
         backgroundColor: scheme.surface,
@@ -107,11 +107,14 @@ class AppTheme {
 Color statusColor(BuildContext ctx, String? status) {
   final scheme = Theme.of(ctx).colorScheme;
   if (status == null) return scheme.outline;
-  if (status.startsWith('Error') || status.startsWith('Peer error'))
+  if (status.startsWith('Error') || status.startsWith('Peer error')) {
     return scheme.error;
-  if (status.contains('Transferring') || status.contains('Scanning'))
+  }
+  if (status.contains('Transferring') || status.contains('Scanning')) {
     return scheme.primary;
-  if (status.contains('offline') || status.contains('Waiting'))
+  }
+  if (status.contains('offline') || status.contains('Waiting')) {
     return Colors.amber.shade700;
+  }
   return scheme.outline;
 }

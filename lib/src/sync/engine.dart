@@ -15,8 +15,10 @@ import 'file_send.dart';
 import 'index_diff.dart';
 import 'manifest.dart';
 import 'scanner.dart';
+import 'sync_preview.dart';
 import 'vault_log.dart';
 import 'watcher.dart';
+import '../transfers/transfer_receipt.dart';
 
 /// Conservative folder-sync transfer pipeline. This changes only block request
 /// scheduling; reconciliation, index state, and conflict resolution stay as-is.
@@ -55,6 +57,36 @@ class SyncEvent {
 }
 
 enum SyncEventLevel { info, warn, error }
+
+class VaultRetentionResult {
+  const VaultRetentionResult({
+    required this.expired,
+    required this.deleted,
+    required this.missing,
+    required this.failed,
+  });
+
+  final int expired;
+  final int deleted;
+  final int missing;
+  final int failed;
+}
+
+class VaultDeletionResult {
+  const VaultDeletionResult({
+    required this.requested,
+    required this.deleted,
+    required this.missing,
+    required this.failed,
+    required this.reclaimedBytes,
+  });
+
+  final int requested;
+  final int deleted;
+  final int missing;
+  final int failed;
+  final int reclaimedBytes;
+}
 
 /// Outcome of the receive-time delete-vs-edit decision (Bug #6). See
 /// [SyncEngine._applyRemoteTombstone] for the rule. The caller
@@ -198,6 +230,7 @@ class SyncEngine {
   /// in-flight offers for the lost peer. Never touches the Index DB or any
   /// V2 sync invariant.
   AdHocFileSend? adHocSend;
+  TransferReceiptRepository? transferReceipts;
 
   final _watchers = <String, FolderWatcher>{}; // pairId -> watcher
   final _states = <String, PairSyncState>{};
@@ -274,6 +307,10 @@ class SyncEngine {
   /// wants a flat live map keyed by path, which is cheaper to keep here than to
   /// rebuild from a SQLite query on every reconcile.
   final _peerLive = <String, Map<String, IndexEntry>>{};
+  final _peerPreviewCache = <String, Map<String, IndexEntry>>{};
+  final _localGeneration = <String, int>{};
+  final _peerGeneration = <String, int>{};
+  final _peerUpdatedAt = <String, DateTime>{};
 
   /// Active block-fetch sinks, keyed by `"$pairId|$name"`. The `Msg.response`
   /// handler routes each incoming response into the sink for the file it's a
@@ -296,6 +333,7 @@ class SyncEngine {
   /// reconcile had released its scanning lock.
   final _activeReconcileSessions = <String, PeerSession?>{};
   final _pendingReconnectReconciles = <String>{};
+  final _restoreBarriers = <String, Completer<void>>{};
 
   Stream<PairSyncState> get stateChanges => _stateController.stream;
   Stream<SyncEvent> get events => _eventController.stream;
@@ -345,6 +383,8 @@ class SyncEngine {
   /// Hourly DB backup timer (Roadmap Phase 0.5). Runs [IndexDb.backup] on every
   /// open Index DB so a corrupt main file can be recovered from `.bak`.
   Timer? _backupTimer;
+
+  final _vaultRetentionTasks = <String, Future<VaultRetentionResult>>{};
 
   /// Watcher poll intervals (Roadmap Phase 0.2 + Battery-Saver Polish).
   ///
@@ -415,6 +455,7 @@ class SyncEngine {
       _periodicTick(pair);
     });
 
+    await _enforceVaultRetentionBestEffort(pair);
     log(pair.id, 'Watching "${pair.localPath}"', SyncEventLevel.info);
     final peerId = pair.peerDeviceId;
     final candidate = peerId == null ? null : registry.openSessionFor(peerId);
@@ -446,6 +487,8 @@ class SyncEngine {
     final w = _watchers.remove(pairId);
     await w?.stop();
     _periodicTimers.remove(pairId)?.cancel();
+    final retentionTask = _vaultRetentionTasks[pairId];
+    if (retentionTask != null) await retentionTask;
     // V2: close the Index DB and drop per-pair V2 bookkeeping so a re-added
     // pair reopens cleanly. Closing is best-effort — the file stays on disk
     // and survives a restart; this just releases the SQLite handle.
@@ -457,6 +500,10 @@ class SyncEngine {
     }
     _vaultLogs.remove(pairId); // no resource to close — just a File ref
     _peerLive.remove(pairId);
+    _peerPreviewCache.remove(pairId);
+    _localGeneration.remove(pairId);
+    _peerGeneration.remove(pairId);
+    _peerUpdatedAt.remove(pairId);
     _peerSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _sentSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _activeReconcileSessions.remove(pairId);
@@ -494,14 +541,199 @@ class SyncEngine {
     return vlog.all();
   }
 
-  /// Records a vault event directly. Used by [AppState.restoreVersion],
-  /// which vaults the current live file itself (via `fs.moveToVault`,
-  /// outside the block-transfer path) before overwriting it with an older
-  /// version, so that a restore is itself undoable rather than a one-way
-  /// trip.
+  Future<SyncPreviewInputs> previewInputs(FolderPair pair) async {
+    final db = await _indexDbFor(pair);
+    final peerId = pair.peerDeviceId;
+    final session = peerId == null ? null : registry.openSessionFor(peerId);
+    final connected = session?.isLinkReady == true;
+    final peerEntries = _peerLive[pair.id] ?? _peerPreviewCache[pair.id];
+    final tombstones = await db.tombstones();
+    return SyncPreviewInputs(
+      localLive: await db.localSnapshot(deviceId),
+      peerLive:
+          peerEntries?.values.toList(growable: false) ?? const <IndexEntry>[],
+      localTombstones: tombstones
+          .where((entry) => entry.version.countFor(deviceId) > 0)
+          .toList(growable: false),
+      localGeneration: _localGeneration[pair.id] ?? 0,
+      peerGeneration: _peerGeneration[pair.id] ?? 0,
+      peerUpdatedAt: _peerUpdatedAt[pair.id],
+      connected: connected,
+      transport: connected ? session!.transport : null,
+    );
+  }
+
+  Future<void> refreshLocalIndexForPreview(FolderPair pair) async {
+    final st = _states[pair.id] ??= PairSyncState(pairId: pair.id);
+    if (st.scanning) {
+      throw StateError('A folder scan is already in progress.');
+    }
+    st.scanning = true;
+    st.status = 'Refreshing preview';
+    if (!_disposed) _stateController.add(st);
+    try {
+      final db = await _indexDbFor(pair);
+      final scan = await _scanner.scan(
+        fs: fs,
+        db: db,
+        rootPath: pair.localPath,
+        deviceId: deviceId,
+        batchListWithStat: batchListWithStat,
+        hashFileOverride: hashFileOverride,
+        ignoreGlobs: pair.ignoreGlobs,
+        ignoreExtensions: pair.ignoreExtensions,
+        maxFileSizeBytes: pair.maxFileSizeBytes,
+      );
+      if (scan.changed.isNotEmpty) {
+        _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
+      }
+    } finally {
+      st.scanning = false;
+      st.status = _paused ? 'Paused' : 'Idle';
+      if (!_disposed) _stateController.add(st);
+    }
+  }
+
+  /// Restores a retained version and resurrects its index row while holding
+  /// the pair's scan guard.
+  ///
+  /// Without the guard, a watcher reconcile can observe the newly written
+  /// bytes while the durable row is still a tombstone and delete them again.
+  Future<RestoreResult> restoreVaultEntry(
+    FolderPair pair,
+    VaultLogEntry entry,
+  ) async {
+    final normalized = entry.relPath.replaceAll('\\', '/');
+    if (!_isSafeRelativePath(normalized)) {
+      return RestoreResult.invalidPath;
+    }
+
+    final st = _states[pair.id] ??= PairSyncState(pairId: pair.id);
+    if (st.scanning) return RestoreResult.failed;
+    final restoreBarrier = Completer<void>();
+    _restoreBarriers[pair.id] = restoreBarrier;
+    st.scanning = true;
+    st.status = 'Restoring version';
+    if (!_disposed) _stateController.add(st);
+
+    RestoreResult? failure;
+    try {
+      if (await fs.stat(pair.localPath, entry.vaultPath) == null) {
+        failure = RestoreResult.sourceMissing;
+      } else {
+        final restoredBytes = <int>[];
+        await for (final chunk
+            in fs.openRead(pair.localPath, entry.vaultPath)) {
+          restoredBytes.addAll(chunk);
+        }
+
+        await vaultBeforeDestructiveChange(
+          pair: pair,
+          relPath: normalized,
+          reason: VaultReason.restoreReplacement,
+        );
+        await fs.write(pair.localPath, normalized, restoredBytes);
+        await markVaultEntryRestored(pair, entry.entryId);
+
+        final db = await _indexDbFor(pair);
+        final scan = await _scanner.scan(
+          fs: fs,
+          db: db,
+          rootPath: pair.localPath,
+          deviceId: deviceId,
+          batchListWithStat: batchListWithStat,
+          hashFileOverride: hashFileOverride,
+          ignoreGlobs: pair.ignoreGlobs,
+          ignoreExtensions: pair.ignoreExtensions,
+          maxFileSizeBytes: pair.maxFileSizeBytes,
+        );
+        if (scan.changed.isNotEmpty) {
+          _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
+        }
+        final restored = await db.get(normalized);
+        if (restored == null || restored.deleted) {
+          failure = RestoreResult.failed;
+        }
+      }
+    } catch (e) {
+      log(pair.id, 'Could not restore ${entry.relPath}: $e',
+          SyncEventLevel.warn);
+      failure = RestoreResult.failed;
+    } finally {
+      st.scanning = false;
+      st.status = _paused ? 'Paused' : 'Idle';
+      if (identical(_restoreBarriers[pair.id], restoreBarrier)) {
+        _restoreBarriers.remove(pair.id);
+        restoreBarrier.complete();
+      }
+      if (!_disposed) _stateController.add(st);
+    }
+
+    if (failure != null) return failure;
+
+    final peerId = pair.peerDeviceId;
+    final session = peerId == null ? null : registry.openSessionFor(peerId);
+    final connected = session?.isLinkReady == true;
+    if (connected) await reconcile(pair, session);
+    if (pair.direction == SyncDirection.receiveOnly) {
+      return RestoreResult.restoredLocalOnlyByDirection;
+    }
+    return connected
+        ? RestoreResult.restoredAndQueued
+        : RestoreResult.restoredOffline;
+  }
+
+  /// Records a vault event directly.
   Future<void> recordVaultEvent(FolderPair pair, VaultLogEntry entry) async {
     final vlog = await _vaultLogFor(pair);
     await vlog.record(entry);
+    await _enforceVaultRetentionBestEffort(pair);
+  }
+
+  Future<VaultOutcome> vaultBeforeDestructiveChange({
+    required FolderPair pair,
+    required String relPath,
+    required VaultReason reason,
+    String? sourcePeerId,
+    IndexEntry? prior,
+  }) async {
+    if (!_isSafeRelativePath(relPath)) {
+      return const VaultOutcome(VaultOutcomeStatus.invalidPath);
+    }
+    try {
+      final stat = await fs.stat(pair.localPath, relPath);
+      if (stat == null) {
+        return const VaultOutcome(VaultOutcomeStatus.absent);
+      }
+      final vaultPath = await fs.moveToVault(pair.localPath, relPath);
+      final entry = VaultLogEntry(
+        relPath: relPath,
+        vaultPath: vaultPath,
+        timestamp: DateTime.now(),
+        sizeBytes: stat.size,
+        reason: reason,
+        sourcePeerId: sourcePeerId,
+        originalSha256: prior?.sha256,
+        originalVersion: prior?.version,
+      );
+      final vlog = await _vaultLogFor(pair);
+      await vlog.record(entry);
+      await _enforceVaultRetentionBestEffort(pair);
+      log(pair.id, 'Saved a recovery copy of $relPath', SyncEventLevel.info);
+      return VaultOutcome(VaultOutcomeStatus.moved, entry: entry);
+    } catch (e) {
+      log(pair.id, 'Could not save a recovery copy of $relPath: $e',
+          SyncEventLevel.warn);
+      return const VaultOutcome(VaultOutcomeStatus.failed);
+    }
+  }
+
+  Future<void> markVaultEntryRestored(
+    FolderPair pair,
+    String entryId,
+  ) async {
+    final vlog = await _vaultLogFor(pair);
+    await vlog.markRestored(entryId, DateTime.now());
   }
 
   /// Drops one vault catalog entry (used by [AppState.restoreVersion] after
@@ -509,6 +741,156 @@ class SyncEngine {
   Future<void> removeVaultEntry(FolderPair pair, VaultLogEntry entry) async {
     final vlog = await _vaultLogFor(pair);
     await vlog.remove(entry);
+  }
+
+  Future<VaultDeletionResult> deleteVaultEntries(
+    FolderPair pair,
+    Iterable<VaultLogEntry> requestedEntries,
+  ) async {
+    final activeRetention = _vaultRetentionTasks[pair.id];
+    if (activeRetention != null) await activeRetention;
+
+    final entries = requestedEntries.toList(growable: false);
+    final vlog = await _vaultLogFor(pair);
+    var deleted = 0;
+    var missing = 0;
+    var failed = 0;
+    var reclaimedBytes = 0;
+
+    for (final entry in entries) {
+      if (!_isVaultPath(entry.vaultPath)) {
+        failed++;
+        log(pair.id, 'Manual cleanup rejected an invalid vault path',
+            SyncEventLevel.warn);
+        continue;
+      }
+      try {
+        final stat = await fs.stat(pair.localPath, entry.vaultPath);
+        if (stat == null) {
+          missing++;
+          await vlog.remove(entry);
+          continue;
+        }
+        if (!await fs.delete(pair.localPath, entry.vaultPath)) {
+          failed++;
+          continue;
+        }
+        deleted++;
+        reclaimedBytes += entry.sizeBytes;
+        await vlog.remove(entry);
+      } catch (e) {
+        failed++;
+        log(pair.id, 'Could not remove an archived version: $e',
+            SyncEventLevel.warn);
+      }
+    }
+
+    return VaultDeletionResult(
+      requested: entries.length,
+      deleted: deleted,
+      missing: missing,
+      failed: failed,
+      reclaimedBytes: reclaimedBytes,
+    );
+  }
+
+  Future<VaultRetentionResult> enforceVaultRetention(
+    FolderPair pair, {
+    DateTime? now,
+  }) {
+    final existing = _vaultRetentionTasks[pair.id];
+    if (existing != null) return existing;
+    late final Future<VaultRetentionResult> task;
+    task = _runVaultRetention(pair, now: now).whenComplete(() {
+      if (identical(_vaultRetentionTasks[pair.id], task)) {
+        _vaultRetentionTasks.remove(pair.id);
+      }
+    });
+    _vaultRetentionTasks[pair.id] = task;
+    return task;
+  }
+
+  Future<VaultRetentionResult> _runVaultRetention(
+    FolderPair pair, {
+    DateTime? now,
+  }) async {
+    final vlog = await _vaultLogFor(pair);
+    final entries = await vlog.allForMaintenance();
+    final cutoff = (now ?? DateTime.now()).toUtc().subtract(vaultRetention);
+    final survivors = <VaultLogEntry>[];
+    var expired = 0;
+    var deleted = 0;
+    var missing = 0;
+    var failed = 0;
+
+    for (final entry in entries) {
+      if (!entry.timestamp.toUtc().isBefore(cutoff)) {
+        survivors.add(entry);
+        continue;
+      }
+      expired++;
+      if (!_isVaultPath(entry.vaultPath)) {
+        failed++;
+        survivors.add(entry);
+        log(pair.id, 'Retention rejected an invalid vault path',
+            SyncEventLevel.warn);
+        continue;
+      }
+      try {
+        final stat = await fs.stat(pair.localPath, entry.vaultPath);
+        if (stat == null) {
+          missing++;
+          continue;
+        }
+        if (await fs.delete(pair.localPath, entry.vaultPath)) {
+          deleted++;
+        } else {
+          failed++;
+          survivors.add(entry);
+        }
+      } catch (e) {
+        failed++;
+        survivors.add(entry);
+        log(pair.id, 'Could not remove an expired version: $e',
+            SyncEventLevel.warn);
+      }
+    }
+    await vlog.replaceAll(survivors);
+    return VaultRetentionResult(
+      expired: expired,
+      deleted: deleted,
+      missing: missing,
+      failed: failed,
+    );
+  }
+
+  bool _isVaultPath(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    if (normalized.startsWith('/') ||
+        RegExp(r'^[A-Za-z]:').hasMatch(normalized)) {
+      return false;
+    }
+    final parts = normalized.split('/');
+    if (parts.isEmpty || parts.first != '.syncversions') return false;
+    return !parts.any((part) => part == '..');
+  }
+
+  bool _isSafeRelativePath(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    if (normalized.isEmpty ||
+        normalized.startsWith('/') ||
+        RegExp(r'^[A-Za-z]:').hasMatch(normalized)) {
+      return false;
+    }
+    return !normalized.split('/').any((part) => part == '..' || part.isEmpty);
+  }
+
+  Future<void> _enforceVaultRetentionBestEffort(FolderPair pair) async {
+    try {
+      await enforceVaultRetention(pair);
+    } catch (e) {
+      log(pair.id, 'Version retention cleanup failed: $e', SyncEventLevel.warn);
+    }
   }
 
   Future<void> dispose() async {
@@ -874,6 +1256,9 @@ class SyncEngine {
       ignoreExtensions: pair.ignoreExtensions,
       maxFileSizeBytes: pair.maxFileSizeBytes,
     );
+    if (scan.changed.isNotEmpty) {
+      _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
+    }
 
     if (session == null) {
       // No peer: the DB is now current. Needs/fetch can't run without a peer.
@@ -1046,6 +1431,9 @@ class SyncEngine {
                   vaultPath: vaultPath,
                   timestamp: DateTime.now(),
                   sizeBytes: oldSizeBytes,
+                  reason: need.reason == NeedReason.concurrentPeerWins
+                      ? VaultReason.conflictReplacement
+                      : VaultReason.incomingOverwrite,
                 )),
               ),
             ),
@@ -1059,6 +1447,23 @@ class SyncEngine {
           // the version — the authoritative sha already matches (the peer
           // advertised it and we just verified it).
           await db.confirmLocalObservation(relPath: need.relPath, sha: sha);
+          await transferReceipts?.upsert(TransferReceipt(
+            receiptId:
+                'sync-in:${pair.id}:${session.peer.deviceId}:${need.relPath}:$sha',
+            correlationId: '${pair.id}:${need.relPath}:$sha',
+            kind: TransferKind.folderSync,
+            direction: TransferDirection.incoming,
+            peerId: session.peer.deviceId,
+            peerNameSnapshot: session.peer.name,
+            pairId: pair.id,
+            displayName: need.relPath,
+            sizeBytes: need.peer.size,
+            startedAt: DateTime.now(),
+            completedAt: DateTime.now(),
+            status: TransferStatus.completed,
+            confirmation: TransferConfirmation.localVerified,
+            localDestinationAvailable: true,
+          ));
         } on TerminalFetchError catch (e) {
           // Peer's source is gone (or refused). Drop the need — DO NOT retry.
           // The file will be re-added by a future IndexUpdate if it reappears.
@@ -1131,6 +1536,11 @@ class SyncEngine {
         // backup() already logged; swallow to keep the sweep going.
       }
     }
+    for (final pair in config.folderPairs) {
+      if (_watchers.containsKey(pair.id)) {
+        await _enforceVaultRetentionBestEffort(pair);
+      }
+    }
   }
 
   /// Start the hourly DB backup timer (Roadmap Phase 0.5). Called once after
@@ -1193,6 +1603,8 @@ class SyncEngine {
     final key = _blockKey(pair.id, name);
     var ctrl = _serveStreams[key];
     if (ctrl == null || ctrl.isClosed) {
+      final sourceStat = await fs.stat(pair.localPath, name);
+      var servedRecorded = false;
       ctrl = StreamController<Map<String, dynamic>>();
       _serveStreams[key] = ctrl;
       // Spawn the serve loop. It owns the file cache for this fetch and
@@ -1213,6 +1625,31 @@ class SyncEngine {
               'folderId': pair.id,
               'name': name,
             });
+            final offset = (resp['offset'] as num?)?.toInt() ?? 0;
+            final length = (resp['length'] as num?)?.toInt() ?? 0;
+            if (!servedRecorded &&
+                resp['error'] == null &&
+                sourceStat != null &&
+                offset + length >= sourceStat.size) {
+              servedRecorded = true;
+              unawaited(transferReceipts?.upsert(TransferReceipt(
+                    receiptId:
+                        'sync-out:${pair.id}:${session.peer.deviceId}:$name:${sourceStat.mtime}',
+                    correlationId: '${pair.id}:$name:${sourceStat.mtime}',
+                    kind: TransferKind.folderSync,
+                    direction: TransferDirection.outgoing,
+                    peerId: session.peer.deviceId,
+                    peerNameSnapshot: session.peer.name,
+                    pairId: pair.id,
+                    displayName: name,
+                    sizeBytes: sourceStat.size,
+                    startedAt: DateTime.now(),
+                    completedAt: DateTime.now(),
+                    status: TransferStatus.completed,
+                    confirmation: TransferConfirmation.senderServed,
+                  )) ??
+                  Future<void>.value());
+            }
           },
         ).whenComplete(() {
           // Self-unregister on completion (normal end / error / stream close).
@@ -1620,6 +2057,9 @@ class SyncEngine {
       case Msg.fileOfferControl:
         adHocSend?.handleFileOfferControl(session, msg);
         break;
+      case Msg.fileOfferReceipt:
+        adHocSend?.handleFileOfferReceipt(session, msg);
+        break;
     }
   }
 
@@ -1646,6 +2086,8 @@ class SyncEngine {
   ) async {
     final pairId = msg['pairId'] as String?;
     if (pairId == null) return;
+    final restoreBarrier = _restoreBarriers[pairId];
+    if (restoreBarrier != null) await restoreBarrier.future;
     final pair = _pairById(pairId);
     if (pair == null) return; // unknown pair — nothing to apply
     final entriesRaw = msg['entries'];
@@ -1667,7 +2109,11 @@ class SyncEngine {
       // delete-counter into our row (after the merge the dominance test would
       // no longer be clean). See [_applyRemoteTombstone] for the full rule.
       if (entry.deleted) {
-        final decision = await _applyRemoteTombstone(pairId, entry);
+        final decision = await _applyRemoteTombstone(
+          pairId,
+          entry,
+          sourcePeerId: session.peer.deviceId,
+        );
         if (decision == DeleteDecision.editWins) {
           // Concurrent local edit won: do NOT store deleted=1 (a later sweep
           // would then delete our edit). The counter was already merged into our
@@ -1693,6 +2139,11 @@ class SyncEngine {
       learned++;
     }
     _peerSeq[peerKey] = maxSeq;
+    if (learned > 0 || wasLiveEmpty) {
+      _peerGeneration[pairId] = (_peerGeneration[pairId] ?? 0) + 1;
+      _peerUpdatedAt[pairId] = DateTime.now();
+      _peerPreviewCache[pairId] = Map<String, IndexEntry>.from(live);
+    }
     Diag.log('v2_index_recv',
         peer: session.peer.deviceId,
         pairId: pairId,
@@ -1780,7 +2231,10 @@ class SyncEngine {
   ///   - [DeleteDecision.nothingToDecide]: no live prior row (nothing on disk);
   ///     caller stores the tombstone as-is.
   Future<DeleteDecision> _applyRemoteTombstone(
-      String pairId, IndexEntry entry) async {
+    String pairId,
+    IndexEntry entry, {
+    String? sourcePeerId,
+  }) async {
     final pair = _pairById(pairId);
     if (pair == null) return DeleteDecision.nothingToDecide;
     final db = _indexDbs[pairId];
@@ -1794,29 +2248,20 @@ class SyncEngine {
       return DeleteDecision.nothingToDecide;
     }
 
-    // Concurrent-edit guard: if our prior LIVE version has a counter the
-    // tombstone doesn't know about, we edited the file at the same time the
-    // peer deleted it. Our edit WINS — the delete must NOT remove our bytes,
-    // and (critically) we must NOT record the row as deleted, or the
-    // reconcile-time sweep would later remove our edit. The caller merges the
-    // peer's delete-counter into our LIVE row so future dominance comparisons
-    // are accurate, then drops the tombstone. The peer learns of our edit on
-    // its next reconcile and resurrects the file.
-    //
-    // We use concurrentWith (neither dominates) rather than `prior dominates
-    // entry`: a tombstone always carries the deleter's bumped counter, so a
-    // same-second edit on our side yields genuinely-concurrent vectors (each
-    // side has a counter the other lacks), which is exactly the conflict case
-    // the VV design defers to the editing side for a delete-vs-edit tie.
-    if (prior.version.concurrentWith(entry.version)) {
+    // A tombstone may remove a live file only when it dominates-or-equals that
+    // live version. Otherwise the live version wins: that covers both a
+    // concurrent local edit and a restore that dominates a retransmitted,
+    // stale tombstone. The peer's counter is merged into the live row so the
+    // resurrection can converge normally.
+    if (!entry.version.dominatesEq(prior.version)) {
       await db.resolveEditWinsDelete(
           relPath: entry.relPath, remoteVersion: entry.version);
-      Diag.log('delete_concurrent_edit_kept',
+      Diag.log('delete_live_version_kept',
           pairId: pairId,
           fields: {'path': entry.relPath, 'prior': '${prior.version}'});
       log(
           pairId,
-          'Kept ${entry.relPath} (concurrent local edit wins over peer delete)',
+          'Kept ${entry.relPath} (local live version wins over peer delete)',
           SyncEventLevel.info);
       return DeleteDecision.editWins;
     }
@@ -1825,11 +2270,28 @@ class SyncEngine {
     // the bytes from disk. fs.delete is a no-op if the file is already gone,
     // so this is safe to repeat. A failure is non-fatal: the reconcile-time
     // sweep [_propagateRemoteDeletes] retries every pass.
+    final vault = await vaultBeforeDestructiveChange(
+      pair: pair,
+      relPath: entry.relPath,
+      reason: VaultReason.peerDelete,
+      sourcePeerId: sourcePeerId,
+      prior: prior,
+    );
     try {
-      await fs.delete(pair.localPath, entry.relPath);
+      if (vault.status != VaultOutcomeStatus.moved) {
+        await fs.delete(pair.localPath, entry.relPath);
+      }
       Diag.log('delete_to_disk',
-          peer: '', pairId: pairId, fields: {'path': entry.relPath});
-      log(pairId, 'Removed ${entry.relPath} (peer deleted it)',
+          peer: sourcePeerId ?? '',
+          pairId: pairId,
+          fields: {
+            'path': entry.relPath,
+            'recovery': vault.status == VaultOutcomeStatus.moved,
+          });
+      log(
+          pairId,
+          'Removed ${entry.relPath} (peer deleted it)'
+          '${vault.status == VaultOutcomeStatus.moved ? '; recovery copy saved' : ''}',
           SyncEventLevel.info);
     } catch (e) {
       log(pairId, 'Delete-to-disk failed for ${entry.relPath}: $e',
@@ -1855,8 +2317,16 @@ class SyncEngine {
     for (final t in tombstones) {
       final stat = await fs.stat(pair.localPath, t.relPath);
       if (stat == null) continue; // already gone — nothing to do
+      final vault = await vaultBeforeDestructiveChange(
+        pair: pair,
+        relPath: t.relPath,
+        reason: VaultReason.peerDelete,
+        prior: t,
+      );
       try {
-        await fs.delete(pair.localPath, t.relPath);
+        if (vault.status != VaultOutcomeStatus.moved) {
+          await fs.delete(pair.localPath, t.relPath);
+        }
         log(
             pair.id,
             'Removed orphan ${t.relPath} (tombstoned, was still on disk)',
@@ -1921,7 +2391,6 @@ class _BlockSink {
   final _queue = <Map<String, dynamic>>[];
   bool _closed = false;
   final _waiters = <Completer<Map<String, dynamic>?>>[];
-  DateTime _lastActivity = DateTime.now();
 
   bool get isClosed => _closed;
 
@@ -1930,7 +2399,6 @@ class _BlockSink {
   /// next [next] call.
   void add(Map<String, dynamic> resp) {
     if (_closed) return;
-    _lastActivity = DateTime.now();
     if (_waiters.isNotEmpty) {
       _waiters.removeAt(0).complete(resp);
     } else {

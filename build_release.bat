@@ -6,7 +6,8 @@ echo  Conduit Release Builder (Windows ^& Android APK)
 echo ============================================================
 
 :: Define environment paths
-set "FLUTTER_ROOT=C:\Users\Administrator\flutter"
+set "FLUTTER_ROOT=E:\Developer\flutter"
+set "GRADLE_USER_HOME=E:\Developer\Gradle"
 set "JAVA_HOME=C:\Users\Administrator\jdk17\jdk-17.0.13+11"
 set "PATH=%FLUTTER_ROOT%\bin;%JAVA_HOME%\bin;C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
 set "ROOT=%~dp0"

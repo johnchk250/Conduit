@@ -39,6 +39,7 @@ class FlutterWindow : public Win32Window {
  private:
   // Phase 3d: Helper to send paths to Flutter Dart side.
   void SendPathsToDart(const std::vector<std::wstring>& paths);
+  void FlushPendingSendPaths();
   void PostPlatformTask(std::function<void()> task);
   void DrainPlatformTasks();
 

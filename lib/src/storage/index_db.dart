@@ -424,6 +424,7 @@ class IndexDb {
     final all = await liveSnapshot();
     return all.where((e) {
       if (e.localSha.isNotEmpty) return true;
+      if (e.localSize < 0) return false;
       final c = e.version.counts[deviceId];
       return c != null && c > 0;
     }).toList(growable: false);
@@ -484,6 +485,7 @@ class IndexDb {
     return all
         .where((e) {
           if (e.localSha.isNotEmpty) return true;
+          if (e.localSize < 0) return false;
           final c = e.version.counts[deviceId];
           return c != null && c > 0;
         })
@@ -535,7 +537,9 @@ class IndexDb {
       // a peer's newer row may be in the DB while our disk still holds the old
       // bytes; re-scanning those bytes must NOT be recorded as authorship or
       // it creates a concurrent version that reverts the peer's edit.
-      if (sha256 == priorLocalSha && sha256.isNotEmpty) {
+      if (prior?.deleted != true &&
+          sha256 == priorLocalSha &&
+          sha256.isNotEmpty) {
         if (prior!.localSize != size || prior.localMtime != mtime) {
           await txn.update('files', {'local_size': size, 'local_mtime': mtime},
               where: 'path = ?', whereArgs: [relPath]);
@@ -704,6 +708,36 @@ class IndexDb {
       // commutative, so running it on every frame cannot loop or grow.
       final mergedVersion =
           (prior?.version ?? const VersionVector.empty()).merge(remote.version);
+
+      // A live version that causally dominates our tombstone is an explicit
+      // resurrection. Accept it even when its per-device sequence is lower
+      // than ours (sequences are not comparable across devices), but mark it
+      // as awaiting local bytes. The old tombstone contains our device counter;
+      // without this sentinel localSnapshot/localLivePaths would mistake the
+      // metadata-only row for a file we still have, re-tombstone it before the
+      // fetch, and send a newer delete back to the restoring peer.
+      if (prior?.deleted == true &&
+          !remote.deleted &&
+          remote.version.dominates(prior!.version)) {
+        final staged = IndexEntry(
+          relPath: remote.relPath,
+          size: remote.size,
+          mtime: remote.mtime,
+          sha256: remote.sha256,
+          version: mergedVersion,
+          sequence: remote.sequence > prior.sequence
+              ? remote.sequence
+              : prior.sequence,
+          deleted: false,
+          blockHashes: remote.blockHashes,
+          localSha: '',
+          localSize: -1,
+          localMtime: -1,
+        );
+        await txn.insert('files', _entryToRow(staged),
+            conflictAlgorithm: ConflictAlgorithm.replace);
+        return;
+      }
 
       // Transport dedup: a remote row at or below the sequence we already hold
       // must NOT move the transport fields (size/mtime/sha/sequence) backwards

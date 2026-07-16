@@ -108,10 +108,7 @@ bool FlutterWindow::OnCreate() {
           result->Success(flutter::EncodableValue(ok));
         } else if (call.method_name() == "shareHandlerReady") {
           share_handler_ready_ = true;
-          if (!pending_send_paths_.empty()) {
-            SendPathsToDart(pending_send_paths_);
-            pending_send_paths_.clear();
-          }
+          FlushPendingSendPaths();
           result->Success(flutter::EncodableValue(true));
         } else {
           result->NotImplemented();
@@ -123,6 +120,7 @@ bool FlutterWindow::OnCreate() {
     // Mark the engine as ready. Shared files are flushed only after Dart
     // registers its method-channel handler and calls shareHandlerReady.
     is_dart_ready_ = true;
+    FlushPendingSendPaths();
   });
 
   // Flutter can complete the first frame before the "show window" callback is
@@ -177,6 +175,15 @@ void FlutterWindow::SendPathsToDart(const std::vector<std::wstring>& paths) {
   };
 
   share_channel_->InvokeMethod("incomingFiles", std::make_unique<flutter::EncodableValue>(args));
+}
+
+void FlutterWindow::FlushPendingSendPaths() {
+  if (!is_dart_ready_ || !share_handler_ready_ || !share_channel_ ||
+      pending_send_paths_.empty()) {
+    return;
+  }
+  SendPathsToDart(pending_send_paths_);
+  pending_send_paths_.clear();
 }
 
 LRESULT

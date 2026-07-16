@@ -1,624 +1,431 @@
-# Conduit — Architecture & Sync-Hardening Reference
+# Conduit architecture
 
-> **Purpose.** A single document that lets any new agent (or contributor) grasp
-> *what Conduit is*, *how it is built*, and — most importantly — *what hardening
-> is already in place to make the sync feature reliable*. Every claim below is
-> traceable to a source file; read this first, then drill into the files it cites.
->
-> **Status as written:** LAN-preferred dual transport with Bluetooth Classic
-> fallback, deterministic session arbitration, Windows-owned LAN upgrade
-> probing, bandwidth-aware Bluetooth behavior, and SAF scan hashing
-> optimization (2026-07-16). **202 tests pass; Android release APK and Windows
-> release application both build successfully.**
->
-> **Maintained by:** append a dated section to *Appendix B — Change log* when you
-> change anything the document describes.
+This document describes the current Conduit 2.0 runtime. It is the
+authoritative technical reference; historical implementation plans and session
+logs are intentionally not part of the repository.
 
----
+## 1. System boundaries
 
-## 1. What Conduit is
+Conduit is a direct peer-to-peer application for Windows and Android.
 
-A **peer-to-peer folder sync** application for **two devices that you own** — a
-Windows PC and an Android phone. It mirrors the contents of paired folders in
-**both directions over LAN when possible, with Bluetooth Classic as a direct
-fallback transport**.
+It owns:
 
-```
-┌─── PC (Windows) ───┐              ┌── Phone (Android) ──┐
-│  D:\Sync            │   UDP beacon  │  /storage/.../Sync   │
-│  + SQLite index DB  │◀─────────────▶│  + SQLite index DB   │
-│  + block transfers  │   TCP+TLS     │  + foreground svc    │
-└─────────────────────┘  (port 41828) └──────────────────────┘
-```
+- persistent device identity and peer pins;
+- local discovery and authenticated sessions;
+- folder indexing, reconciliation, and block transfer;
+- Android Storage Access Framework integration;
+- local version history and transfer receipts;
+- clipboard, device status, phone alerts, and allowlisted remote actions;
+- a responsive Flutter interface.
 
-**Key properties (these are the product's reason to exist):**
+It does not provide:
 
-| Property | How |
-|---|---|
-| No cloud, no account, no relay | Everything happens directly between your two devices over LAN or Bluetooth. |
-| Private | File bytes never go to a server. Discovery exposes only public connection metadata; every transport still uses Conduit's authenticated pinned-key handshake. |
-| Cross-network auto-reconnect | Pairing is identity-based (pinned ed25519 keys), so home ↔ office Wi-Fi needs no re-pairing. |
-| One codebase | A single Flutter/Dart project compiles to a Windows `.exe` and an Android `.apk`. |
+- accounts, cloud storage, or relay servers;
+- internet-based discovery;
+- arbitrary remote command execution;
+- an append-only backup/archive policy;
+- guaranteed recovery of files manually deleted before Conduit can vault them.
 
-**Built from:** `pubspec.yaml` → Flutter SDK 3.27+, Dart SDK ^3.6.0. Core deps:
-`crypto`, `ed25519_edwards` (identity), `sqflite_common_ffi` + `sqlite3_flutter_libs`
-(index DB on both platforms), `network_info_plus` (LAN IP discovery), `qr_flutter` +
-`mobile_scanner` (pairing), `provider` (state), `file_picker`.
+## 2. Runtime composition and state
 
----
+`lib/main.dart` creates one `AppRuntime` and publishes its state through
+Provider.
 
-## 2. What it does (user-facing behavior)
-
-- **Define folder pairs.** Each pair links a local folder on this device to a
-  folder on the paired peer. Direction is per-pair: **two-way**, **receive-only**,
-  or **send-only**.
-- **Automatic two-way sync.** When both devices are on the same Wi-Fi, changes
-  propagate in the background. Edits, additions, and **deletes** all converge.
-- **Conflict safety.** When both sides edit the same file, the **newer version
-  wins** (decided by version vector, not mtime) and the loser is backed up to
-  `.syncversions/` for 14 days.
-- **Resumable transfers.** Files move in 1 MiB SHA-256-verified blocks; a dropped
-  connection mid-transfer resumes from the last verified block.
-- **Pairing.** QR-code scan (code embedded in the QR) or 6-digit code entry. The
-  code is **single-use** — consumed on successful pair.
-- **Transport selection.** LAN has higher priority than Bluetooth. The live
-  session registry drives both connection behavior and UI state, so phase,
-  transport, and link quality cannot contradict each other.
-- **Bluetooth bandwidth policy.** Control messages, clipboard, status, and
-  small files remain available. Sync and ad-hoc files over 10 MiB are deferred
-  until a LAN session becomes available.
-
-**UI (Material 3):** four destinations — Overview, Folders, Devices, Activity.
-Adaptive: `NavigationRail` on wide screens, `BottomNav` on phones.
-(`lib/src/ui/*.dart`.)
-
----
-
-## 3. Architecture overview
-
-### 3.1 Two engines coexist — the V2 engine is the one in use
-
-There is a single sync engine in the codebase. The V2 index-based design is
-documented in `REDESIGN.md` ("Syncthing-inspired"). The old manifest-based v1
-path has been removed.
-
-| | **V2 engine** (`SyncEngine`) |
-|---|---|
-| Entry point | `engine.dart` → `reconcile` → `scanner` → `indexDiff` → `fetchFileBlockLevel` |
-| Source of truth | **Per-folder SQLite Index DB**, durable across reconnects |
-| Ordering | **Version vectors** (the sole ordering authority) |
-| Delete detection | Tombstone rows in the Index DB, version-vector dominance |
-| Transfer | **block-level**, `.syncpart` + atomic rename, **terminal errors drop the need** |
-| Status | **Active** |
-
-**When reading code, assume the index-based path.** Shared file I/O lives in
-`manifest.dart` (`FileEntry`, `FileSystemAccess`, `hashFile`).
-
-### 3.2 Module map
-
-```
-lib/src/
-  core/
-    identity.dart        ed25519 keypair; deviceId = first 8 hex of sha256(pubKey) → "XXXX-XXXX"
-    config_store.dart    config.json: folder pairs + paired peers + feature flags
-  protocol/
-    wire.dart            length-prefixed JSON wire messages + FolderPair/SyncDirection models
-  net/
-    discovery.dart       UDP broadcast auto-discovery of paired peers on the LAN
-    bluetooth_bridge.dart native RFCOMM bridge exposed to Dart as loopback TCP
-    transport.dart       transport priority, connection phase, and quality model
-    peer_registry.dart   PeerConnectionRegistry: THE source of truth for "live session for peer X"
-    peer_session.dart    one persistent TLS session per peer; send()/onMessage
-    secure_frame.dart    FrameCodec: [4-byte len][JSON] envelope, single-owner (no silent drops)
-    tls_keys.dart        self-signed cert / key material
-    connection_supervisor.dart  beacon-independent reconnect policy (5s sweep + exp backoff)
-  storage/
-    db_factory.dart      sqflite_common_ffi bootstrap (works on Windows AND Android)
-    index_db.dart        ★ the per-folder SQLite Index DB — durable source of truth
-  sync/
-    version_vector.dart  ★ per-file {deviceId→counter}; the SOLE ordering authority
-    scanner.dart         walks the folder, reconciles disk ↔ Index DB (decoupled from sync)
-    ignore_rules.dart    Phase 6.2 — glob/extension/size matcher (hand-rolled, no glob pkg dep)
-    index_diff.dart      ★ computes the needs-queue from local vs peer snapshots
-    block_transfer.dart  ★ 1 MiB block fetch + .syncpart + atomic rename + terminal-error
-    vault_log.dart       Phase 6.4 — per-pair catalog of .syncversions/ entries (no native listing)
-    engine.dart          ★ the coordinator: per-pair reconcile loop
-    watcher.dart         debounced filesystem change signal (triggers reconcile)
-    manifest.dart        shared file I/O: FileEntry, FileSystemAccess, hashFile, moveToVault
-  platform/
-    saf_access.dart      FileSystemAccess backed by Android SAF document trees
-  ui/                    Material 3 screens + theme
-    version_history_screen.dart  Phase 6.4 — browse/restore a pair's vaulted file versions
-  app_state.dart         central ChangeNotifier wiring engine + net + UI
-  diag.dart              structured diagnostic log (profile-gated)
-
-android/app/src/main/kotlin/.../
-  MainActivity.kt        SAF tree-picker channel
-  BluetoothProxy.kt      Android RFCOMM server/client and loopback TCP proxy
-  SafOps.kt              SAF read/write/list/delete/moveToVault (native)
-  SyncService.kt         foreground service (wake lock, dataSync)
-
-windows/runner/
-  bluetooth_proxy_win.*  Win32 RFCOMM service, paired-device enumeration,
-                         bounded connect, and loopback TCP proxy
-
-test/                    202 tests — see Appendix A
+```text
+AppRuntime
+├── AppState (runtime compatibility facade and service coordinator)
+├── AppLifecycleController
+├── ConnectionController
+├── FolderSyncController
+├── TransferController
+└── DeviceServicesController
 ```
 
-★ = the heart of the V2 sync engine.
-
-### 3.3 The three independent, idempotent mechanisms
-
-The V2 architecture (REDESIGN.md) deliberately splits sync into **three mechanisms
-that each stay correct on their own**, so a failure in one can't corrupt another:
-
-1. **Persistent Index DB** (`index_db.dart`) — one row per file, survives
-   reconnects. The durable source of truth. No "rebuild on every reconcile."
-2. **Version vectors** (`version_vector.dart`) — per-file ordering. Bumps only
-   THIS device's counter; merges take the per-device max. Dominance decides newer;
-   neither-dominates = conflict.
-3. **Monotonic sequence + Index/IndexUpdate frames** — per-folder counter. `Index`
-   (full list) once per connection; afterwards only `IndexUpdate` entries with
-   `sequence > peerMax`. Kills the manifest-rebuild race.
-
-Plus: **scanner decoupled from sync** (`scanner.dart` writes rows independently),
-**block-level transfer** (`block_transfer.dart`), and a **dumb persistent
-connection** that just delivers frames.
-
----
-
-### 3.4 Connection and transport lifecycle
-
-The application has one authoritative connection view per paired peer:
-`PeerConnectionSnapshot` in `net/transport.dart`. It separates:
-
-- **phase** — offline, connecting, or connected;
-- **transport** — LAN or Bluetooth;
-- **quality** — healthy, degraded, or unstable, derived from RTT and missed
-  heartbeats without mislabeling a live session as "reconnecting."
-
-Both native Bluetooth implementations expose RFCOMM as a loopback TCP socket.
-The existing secure framing, pinned public-key validation, ready handshake,
-heartbeat, generation guard, sync engine, clipboard, and remote-command paths
-therefore remain transport-independent.
-
-LAN always has higher priority. While Windows is connected through Bluetooth,
-it sends a lightweight `lan_probe` every 10 seconds. Android responds with its
-current IPv4 candidates and Conduit TCP port; it does not run a periodic
-mobile-side watcher. Windows establishes an authenticated LAN session and
-atomically supersedes Bluetooth. If LAN later disappears, the persisted
-Bluetooth endpoint is retried as the fallback.
-
-Healthy duplicate sessions are rejected. A replacement is accepted only when
-it is a transport upgrade or the existing session is demonstrably stale. This
-prevents competing automatic dials from creating a reconnect loop.
-
----
-
-## 4. The sync loop, step by step
-
-This is `SyncEngine.reconcile` (`engine.dart`), the per-pair coordinator. Read this
-alongside `engine.dart:700-874`.
-
-```
-                       ┌─────────────────────────────┐
-   watcher / reconnect │  reconcile(pair, session?)  │  ← triggered by: watcher
-   / index arrival ───▶│                             │     fire, peer (re)connect,
-                       └──────────────┬──────────────┘     inbound IndexUpdate
-                                      │
-            1. _propagateRemoteDeletes(pair)   ← apply authoritative peer tombstones
-                                      │
-            2. scanner.scan(...)               ← disk → Index DB (no-op on idle folder)
-                                      │
-                   ┌──── session == null? ────┐
-                   YES                        NO
-                   │                          │
-            (DB current,               3. _advertiseDelta()  ← send IndexUpdate past watermark
-             "Idle (no peer)")               │
-                                      4. have peer snapshot?
-                                         NO → send indexRequest, RETURN (work resumes
-                                              when the peer's index frame arrives)
-                                         YES ↓
-                                      5. _processNeeds()
-                                         indexDiff(local, peer) → needs-queue
-                                         for each need: fetchFileBlockLevel (1MiB blocks,
-                                           .syncpart, atomic rename), confirmLocalObservation
-                                      │
-                                   "Idle" / "V2 synced: N/N fetched"
-```
-
-**Why a reconcile ends early at step 4 when the peer snapshot isn't known yet:**
-needs can't be computed without the peer's live entries, and fetch can't run
-without needs. The peer's reply to `indexRequest` re-enters `_handleIndexFrame`,
-which kicks another reconcile that *does* have the snapshot. This two-phase shape
-is intentional — it's what keeps the loop from spinning on incomplete state.
-
-**The no-op-invariant (load-bearing):** on an idle folder, `scanner.scan` and
-`upsertLocal` must burn **zero** sequences, or peers would re-fetch unchanged
-files forever. This invariant is the subject of `smoke3_revert_test.dart` and is
-protected by the sha-primary no-op guard in `upsertLocal`.
-
----
-
-## 5. The Index DB — the durable source of truth
-
-`lib/src/storage/index_db.dart`. One SQLite DB **per folder pair**, holding one row
-per file (`IndexEntry`):
-
-```
-relPath, size, mtime, sha256, versionVector, sequence, deleted, blockHashes, localSha
-```
-
-### 5.1 The two fields that prevent every known sync bug — read this twice
-
-| Field | Meaning | Why it matters |
-|---|---|---|
-| `sha256` | the **authoritative** whole-file hash | the "current version of this file" identity |
-| `localSha` | the sha of the bytes **THIS device last confirmed on its OWN disk** | the **disk truth**. DB-LOCAL ONLY — `toJson()` strips it, so it never crosses the wire. |
-
-`localSha` exists precisely because the authoritative `sha256` is *not* the disk
-truth after a peer edit merges in. The distinction is the fix for hardware smoke
-#3 (edit reversion), Bug #8 (re-fetch loop), and Bug #9 (delete propagation). It
-is the most subtle field in the codebase; if you change sync behavior, re-read the
-doc comments on `localSha` in `index_db.dart` and the two snapshot methods below.
-
-### 5.2 The two snapshot methods and why both exist
-
-- **`liveSnapshot()`** — every non-tombstone row (both ours and peers'). Used to
-  compute needs.
-- **`localSnapshot(deviceId)`** — rows THIS device has bytes for: `localSha` is
-  non-empty **OR** we originated it (counter > 0). Used as "what WE have" in
-  `indexDiff`. *A freshly-received-but-not-fetched peer row has `localSha == ''`
-  and no local counter, so it's correctly excluded — indexDiff then needs it.*
-- **`localLivePaths(deviceId)`** — the path set the scanner's **tombstone
-  detector** diffs against. Same predicate as `localSnapshot` (originated **OR**
-  localSha-confirmed). See §6.3 for why the `localSha` branch is there.
-
-### 5.3 Key write operations
-
-- **`upsertLocal`** — scanner's local observation. No-op guard: if size+mtime+sha
-  (+blocks) all match the prior row, it writes nothing and burns no sequence. This
-  is the no-op invariant's enforcement point.
-- **`confirmLocalObservation(relPath, sha)`** — engine's post-fetch step. Stamps
-  `localSha = sha` **without bumping version or sequence** (the authoritative sha
-  already matches; we just verified it). This is what moves a fetched file from
-  "unconfirmed" to "we have these bytes."
-- **`applyRemote(entry)`** — merge an inbound peer row. **A fresh row (no prior on
-  this device) is forced to `localSha = ''`** (an unfetched file must never look
-  confirmed). For a row we already had, `priorLocalSha` is preserved across the
-  peer's content update.
-- **`markDeletedLocal`** — scanner's tombstone: bumps our counter + sets
-  `deleted = 1`. Never a row removal — a delete is just a version-bumped entry
-  with the deleted flag, so version-vector dominance can propagate it.
-
----
-
-## 6. How ordering, fetch, and deletes actually work
-
-### 6.1 Ordering — version vectors are the sole authority
-
-`version_vector.dart`. A `VersionVector` is `{deviceId → counter}`.
-
-- **Bump:** on a local change, only **OUR** counter increments (+1).
-- **Merge:** per-device **max** (idempotent, commutative).
-- **`a > b` (dominates):** `a ≥ b` everywhere and `≠`. This is "a is newer."
-- **Concurrent:** neither dominates → **conflict** → loser to `.syncversions`.
-
-**Critical rule (the edit-reversion fix):** sha is reduced to a **content**
-comparison only — it answers "are the bytes the same," *never* "which is newer."
-When both sides have a live file with a sha mismatch, the version vector decides
-(see `index_diff.dart` doc + `indexDiff`):
-
-```
-my version ≥ peer's  → SKIP (never revert a local edit)
-peer strictly newer  → fetch
-concurrent / conflict→ fetch (Phase 4 will move loser to .syncversions)
-```
-
-**No mtime comparison anywhere.** The legacy mtime tiebreaker was the race the
-redesign removed.
-
-### 6.2 Fetch — block-level, resumable, terminal-error-safe
-
-`block_transfer.dart`. `fetchFileBlockLevel`:
-
-1. Plan blocks: `ceil(size / 1MiB)` at offsets 0, B, 2B, … each with an expected
-   sha from `blockHashes` (when the peer supplied them).
-2. **Resume:** if `.<name>.syncpart` exists with a verified prefix of blocks, skip
-   the blocks already present → survives a mid-download reconnect.
-3. Per outstanding block: send `request`, verify block sha, write at offset.
-4. All blocks filled → whole-file SHA-256 == `expectedSha`? → **atomic rename**
-   `.<name>.syncpart` → final name. Else throw (corrupt `.syncpart` left for retry).
-
-**Terminal errors:** a `response` with an `error` field throws
-`TerminalFetchError`. The engine's needs-queue catches it and **drops the file
-without retry**. This is the fix for flaw #2 — the whole-file fetch loop that
-retried a vanished source file every ~4s forever. The next `IndexUpdate` re-adds
-the file if it reappears.
-
-### 6.3 Deletes — tombstones, dominance, and the two bugs it took to get right
-
-A local delete = the scanner notices a tracked file is gone from disk →
-`markDeletedLocal` → a tombstone row (bumped counter, `deleted = 1`). The tombstone
-propagates via normal `IndexUpdate`; the receiver's `_applyRemoteTombstone`
-decides **delete-vs-edit at receive time**:
-
-| Inbound tombstone vs our live version | Decision (`DeleteDecision`) |
-|---|---|
-| Tombstone version dominates-or-equals ours | `deleteWins` — bytes removed, store tombstone |
-| Our live edit is concurrent / newer | `editWins` — bytes KEPT, do not store `deleted=1` (a later sweep would delete our edit) |
-| We never had the file | `nothingToDecide` — store the tombstone as-is |
-
-This dominance check must run **before** `applyRemote` merges the peer's delete
-counter into our row (after the merge, dominance would no longer be clean). See
-`_applyRemoteTombstone` + the `DeleteDecision` enum.
-
-**Bug #6 (delete didn't sync to peer):** fixed by the Phase 4 delete-to-disk path
-above. `delete_propagation_test.dart` pins it (authoritative tombstone removes
-file; concurrent edit wins; resurrection re-fetches).
-
-**Bug #9 (received-file delete didn't propagate):** the **tombstone detector's**
-`localLivePaths` predicate originally admitted only files WE originated (counter
-> 0). But a file we *received and fetched* is confirmed via
-`confirmLocalObservation`, which stamps `localSha` **without** bumping our counter
-— so every received file was excluded from tombstone detection. Delete a received
-file on disk and the scanner never compared it → no tombstone → the peer never
-learned → permanent divergence. **Fix:** `localLivePaths` now also admits any row
-with `localSha.isNotEmpty` (originated **OR** confirmed). Pinned by
-`bug9_recv_delete_propagation_test.dart` (positive: received-then-deleted →
-tombstoned; negative: never-fetched peer row → never tombstoned, the delete-storm
-guard). Safety: `localSha` never crosses the wire, so an unfetched peer row always
-has `localSha == ''` and can never be falsely tombstoned.
-
----
-
-## 7. Networking & security
-
-### 7.1 Discovery + connection (the net layer)
-
-- **UDP broadcast auto-discovery** (`discovery.dart`) — beacons carry public
-  identity only. Reaches a paired peer anywhere on the LAN.
-- **QR fallback** — for networks that block device-to-device traffic (guest Wi-Fi,
-  client isolation).
-- **`PeerConnectionRegistry`** — THE single source of truth for "which session is
-  live for peer X." Replaced an older mutable field that disagreed with `AppState`
-  and got clobbered by reconnect churn.
-- **`ConnectionSupervisor`** — beacon-independent reconnect policy. Every 5s it
-  sweeps paired peers with no live session and redials the last-known address,
-  with **exponential backoff per peer** (so an offline peer isn't hammered; a
-  returning peer reconnects within ≤5s). Closes the gap where reconnect depended
-  on a lucky beacon or a 36s heartbeat timeout.
-- **`FrameCodec`** (`secure_frame.dart`) — `[4-byte BE length][UTF-8 JSON]`
-  envelopes. Deliberately **single-owner** (`onMessage` callback, not a broadcast
-  stream) to structurally eliminate the silent-drop failure mode (a broadcast
-  stream has no buffer → a message arriving with no listener is lost).
-
-### 7.2 Security model
-
-| Layer | Mechanism |
-|---|---|
-| Transport | Self-signed TLS (when an openssl cert is available); otherwise plaintext framing |
-| Identity | Persistent **ed25519** keypair; `deviceId = first 8 hex of sha256(pubKey)` |
-| Pinning | Peer pubkeys pinned in `config.json` on first successful pair |
-| First-pair auth | Single-use 6-digit code (embedded in the QR for scan flow); **consumed on success** |
-| Returning peer | PubKey checked against the pin — **no code needed**, hence cross-network works |
-| Privacy | No file bytes leave the LAN; beacons carry public identity only |
-
-No all-files-access permission on Android — all file I/O goes through the
-**Storage Access Framework** (`platform/saf_access.dart` + Kotlin `SafOps.kt`).
-
----
-
-## 8. Platform notes
-
-- **Windows:** `%APPDATA%\Conduit\` for identity/config. Listens on **TCP 41828**
-  — a one-time firewall rule is required (see README "First-run setup"). Native FS
-  via `dart:io`.
-- **Android:** app support dir for identity/config. SAF document trees for folder
-  access. `SyncService` foreground service; no blanket wake lock is held while
-  idle. Instead it owns two renewable partial wake locks (moved here from
-  `MainActivity` in the 2026-07-10 ownership fix — an Activity-scoped lock was
-  released on a plain swipe-from-recents, defeating the point of it): a
-  transfer lock held only while bytes are moving, and a connection lock held
-  whenever any peer session is live (off in battery-saver mode). Both renew
-  every 45s from Dart; see §9.4. Permissions: INTERNET, WIFI state, multicast,
-  FOREGROUND_SERVICE(dataSync), WAKE_LOCK. **No** all-files access.
-- **Per synced folder:** `.syncstate/` (legacy manifests), `.syncversions/`
-  (conflict backups, 14-day retention), `.<name>.syncpart` (V2 partial downloads).
-
----
-
-## 9. The hardening that makes sync reliable
-
-This is the heart of this document: **what has already been battle-tested and
-hardened, so a new agent doesn't reinvent it or accidentally regress it.** Each
-item maps to a regression test (Appendix A).
-
-### 9.1 Architectural hardening (prevents whole classes of bugs)
-
-1. **Durable Index DB, not a rebuilt manifest.** The vanish window (PC snapshots
-   the file list at scan time T; phone fetches at T+1s; the file is gone) is
-   eliminated — the DB is the durable source of truth across reconnects.
-2. **Version vectors, not mtime.** Ordering is monotonic and provenance-bearing.
-   No mtime race, no "last synced" snapshot to lose.
-3. **Block-level transfer + terminal errors.** A vanished source file produces ONE
-   terminal error and is dropped — never a retry loop. Transfers resume from the
-   last verified block.
-4. **Scanner decoupled from sync.** The watcher/scanner writes rows independently;
-   a sync failure doesn't lose filesystem observations.
-5. **Dumb, persistent connection.** The session just delivers frames; reconnect =
-   "send me anything past my last sequence." No generation guards in the sync path.
-6. **Single-owner frame codec.** No silent message drops (structural, not by timing).
-7. **Beacon-independent reconnect supervisor.** Recovery doesn't depend on a lucky
-   UDP packet; exponential backoff prevents peer-hammering.
-
-### 9.2 Logic hardening (specific bugs fixed and pinned)
-
-| Bug | Symptom | Root cause | Fix & guard |
-|---|---|---|---|
-| **#6 / delete-to-disk** | Deletes didn't sync to the peer | Phase 2 dropped tombstones; never removed bytes | Receive-time delete-vs-edit decision (`_applyRemoteTombstone`); `delete_propagation_test.dart` |
-| **#7** | (paired with #6) | concurrent-edit edge | dominance check **before** merge; editWins keeps bytes |
-| **#8 / re-fetch loop** | Fetched files re-fetched every reconcile → perpetual loop, WAL churn | `localSnapshot` used the origin counter only; a fetched file (no local counter) was excluded → always a need | `localSnapshot` admits `localSha`-confirmed rows; `bug8_refetch_loop_test.dart` |
-| **#9 / recv-delete propagation** | Deleting a *received* file didn't propagate | `localLivePaths` (tombstone detector) used origin counter only; fetched files excluded from delete tracking | `localLivePaths` admits `localSha`-confirmed rows; `bug9_recv_delete_propagation_test.dart` (+ delete-storm negative control) |
-| **smoke #3 / edit reversion** | A freshly-advertised stale peer copy reverted a higher-version local edit | sha was used as the ordering authority | sha is content-only; version vector is sole ordering authority; `mineDiskSha = localSha` for convergence; `smoke3_revert_test.dart`, `smoke3_twodb_cycle_test.dart` |
-| **SAF duplicate write** | Double-write on Android | (Fix 4) | `HANDOFF_2026-06-24_FIX4_SAF_DUPLICATE_WRITE.md` |
-
-**The `localSha` invariant — the single most important correctness property:**
-
-> `localSha` is the sha of the bytes THIS device last confirmed on its OWN disk.
-> It is DB-local only (never serialized on the wire). It is the **disk truth** that
-> distinguishes a genuine local edit from stale disk after a peer merge, AND the
-> **confirmation witness** that a fetched file is now ours. If you touch anything in
-> `index_db.dart`, `index_diff.dart`, or the scanner, re-verify these three:
->
-> 1. An unfetched peer row has `localSha == ''` (applyRemote forces it).
-> 2. A fetched file gets `localSha` via `confirmLocalObservation` (no seq bump).
-> 3. `localSnapshot` and `localLivePaths` both admit `localSha`-confirmed rows.
-
-If any of those three breaks, you reintroduce #8 and/or #9.
-
-### 9.3 Why there is no delete-storm risk
-
-`localSha` never crosses the wire (`toJson` strips it). So a freshly-received,
-unfetched peer row **always** has `localSha == ''` and stays excluded from
-`localLivePaths` — it can never be falsely tombstoned. The only rows the
-`localSha` branch newly admits to deletion-tracking are rows whose bytes this
-device genuinely holds (via `confirmLocalObservation`). The negative-control test
-in `bug9_recv_delete_propagation_test.dart` pins this.
-
-### 9.4 Android wake-lock ownership (battery, Phase 0.4 + 0.6)
-
-Two independent, renewable `PARTIAL_WAKE_LOCK`s exist, both owned by
-**`SyncService`**, not `MainActivity`:
-
-- **Transfer lock** (`Conduit::Transfer`) — held only while
-  `engine.dart`'s active-transfer-burst counter is above zero.
-- **Connection lock** (`Conduit::Connection`) — held whenever at least one
-  peer session is live and battery-saver mode is off.
-
-Dart (`app_state.dart`) renews each one every 45s for as long as it should be
-held (`_renewTransferWakeLock`, `_renewConnectionWakeLock`), against a 120s
-native timeout on the Kotlin side — the timeout is a safety net for a lost
-message, not the intended hold duration. `MainActivity` only *forwards*
-`conduit/wakelock` channel calls to `SyncService` (`setTransferLockEnabled`,
-`setConnectionLockEnabled`); it holds no `PowerManager.WakeLock` of its own.
-
-**Why this matters:** `MainActivity` is `launchMode="singleTask"` with no
-`excludeFromRecents`. Before the 2026-07-10 fix, both locks lived directly on
-the Activity, which released them in `onDestroy()` — so a plain
-swipe-from-recents mid-transfer killed the lock immediately, even though the
-Dart isolate and foreground service kept running (`shouldDestroyEngineWithHost()
-= false`). Separately, the transfer lock had no renewal at all, so any burst
-longer than its old 60s timeout lost protection on its own. Owning both locks
-in `SyncService` ties their lifetime to the thing that's actually meant to
-outlive the UI, matching how the `MulticastLock` toggle
-(`SyncService.multicastLock`) already worked correctly before this fix.
-
-**Known gap, unchanged by this fix:** there is still no automated test
-coverage for any of this — Kotlin service/wake-lock code isn't reachable from
-`flutter test`. This was true before 2026-07-10 and remains true after;
-verification here is manual code review only, not `flutter analyze`/`flutter
-test` (no Flutter/Dart SDK in the review environment either). Recommended
-follow-up: an instrumented Android test (`androidTest/`) exercising
-`SyncService` directly.
-
----
-
-## 10. Testing
-
-- **Targeted analysis** — no new errors on the Bluetooth/transport lifecycle
-  paths as of 2026-07-16. Existing unrelated lint warnings remain.
-- **`flutter test`** — **202/202 passed** on 2026-07-16.
-- **Release builds** — `flutter build apk` and `flutter build windows` both
-  passed on 2026-07-16.
-- Tests are **deterministic and logic-only**: they use real `IndexDb`s (SQLite via
-  `sqflite_common_ffi`) and the real scanner/diff/block-transfer code paths. No
-  hardware, no SAF, no sockets. This is why the V2 bugs were caught and fixed
-  without a device — the logic is pure and fully testable in isolation.
-- Each fixed bug has a dedicated regression test (see Appendix A) with an
-  extensive header explaining the bug, the fix, and the safety argument.
-
-**The hardware test is the final gate, not the first.** The pattern this project
-has settled into: reproduce in a logic test → fix → add regression test → rebuild
-both binaries → hardware confirmation. (See Appendix B.)
-
----
-
-## 11. Build & deploy
-
-```bash
-cd conduit
-flutter doctor        # toolchain check
-flutter analyze       # 0 errors expected
-flutter test          # 202 expected
-
-# Windows (profile mode keeps the Diag log; release strips it)
-flutter build windows --profile
-# → build\windows\x64\runner\Profile\conduit.exe
-
-# Android
-flutter build apk --profile
-# → build\app\outputs\flutter-apk\app-profile.apk
+`AppRuntime` owns construction and disposal. `AppDependencies` supplies
+identity, configuration, support-directory, filesystem, and clock dependencies
+so tests can create isolated runtimes.
+
+The controllers expose feature-scoped immutable snapshots and commands:
+
+- lifecycle/startup/onboarding;
+- peers and connection status;
+- folder pairs, sync state, preview, invitations, and restore;
+- pending share input and transfer receipt queries;
+- clipboard and remote-service availability.
+
+`AppState` remains the authoritative integration facade for networking,
+platform channels, and several mature feature services. New UI should depend
+on the narrowest controller available. Direct `AppState` access is transitional
+and must not create additional root-level broad rebuilds.
+
+Durable events and transient UI state are separate:
+
+- folder/index truth lives in SQLite and the filesystem;
+- transfer history lives in its own SQLite repository;
+- configuration and identity live in app-private files;
+- controller snapshots are reconstructable views, not persistence.
+
+## 3. Major components
+
+### Networking
+
+`lib/src/net/` contains:
+
+- UDP LAN discovery;
+- connection management and duplicate-session arbitration;
+- the peer registry and current-session ownership;
+- Bluetooth bridge integration;
+- transport metadata and LAN preference;
+- secure handshake and record framing;
+- heartbeat, reconnect, and session generation handling.
+
+There is one published live session per peer. A replacement session must win
+the registry arbitration before feature or sync code can use it. Session
+generation checks prevent callbacks from a superseded socket changing current
+state.
+
+### Protocol
+
+`lib/src/protocol/wire.dart` defines the JSON message vocabulary and shared
+folder models. Messages are length-framed, then protected by Secure Transport
+v1. Folder synchronization, ad-hoc send, clipboard, status, and remote actions
+use distinct message families.
+
+Capabilities are negotiated during the secure hello/welcome exchange. Additive
+features such as transfer receipts do not require a protocol-version break;
+unsupported peers continue with explicitly reduced semantics.
+
+### Synchronization
+
+`lib/src/sync/` contains:
+
+- filesystem scanner and ignore-rule evaluation;
+- version vectors and deterministic conflict ordering;
+- pure index-difference calculation;
+- per-pair reconciliation;
+- resumable block transfer;
+- sync preview assembly;
+- folder presets;
+- version vault catalog and retention.
+
+`SyncEngine` coordinates this layer but does not own platform UI.
+
+### Storage
+
+`lib/src/storage/index_db.dart` provides one SQLite index per folder pair. The
+index is the durable synchronization source of truth. It survives process and
+connection restarts.
+
+`lib/src/transfers/transfer_receipt.dart` owns a separate
+`transfer_history.db`. Receipt writes must never block or invalidate a file
+transfer.
+
+### Platform adapters
+
+Windows uses direct filesystem access and native runner integrations.
+
+Android uses:
+
+- persisted SAF tree grants for synchronized and received folders;
+- a foreground service for background operation;
+- native SAF listing, stat, block read/write, delete, and vault operations;
+- Bluetooth and device-status method channels.
+
+Both platforms implement the same `FileSystemAccess` contract.
+
+## 4. Connection lifecycle
+
+1. A device loads or creates its persistent Ed25519 identity.
+2. Discovery advertises public local metadata and a listen port.
+3. A connection is opened over LAN or the local Bluetooth bridge.
+4. First-time peers authenticate with a random, time-limited pairing secret.
+5. Existing peers require the stored device ID and public-key pin.
+6. Secure Transport v1 derives fresh directional session keys.
+7. Encrypted key confirmation completes.
+8. The registry publishes one winning session.
+9. Heartbeats maintain liveness; reconnect logic replaces dead sessions.
+10. A Bluetooth session upgrades to LAN when authenticated LAN reachability
+    returns.
+
+LAN and Bluetooth share the same authenticated application session model.
+Operating-system Bluetooth pairing only enables the link; it does not
+authorize a Conduit peer.
+
+## 5. Secure Transport v1
+
+The transport uses:
+
+- ephemeral X25519 key agreement;
+- persistent Ed25519 signatures over a canonical, role-bound transcript;
+- HKDF-SHA256 directional keys and nonce prefixes;
+- ChaCha20-Poly1305 authenticated records;
+- monotonically increasing 64-bit record sequence numbers;
+- encrypted key confirmation before session publication.
+
+Modified, replayed, skipped, or out-of-order records close the connection.
+Older plaintext builds are rejected.
+
+Discovery remains public to the reachable local network and contains only
+connection metadata: device name and ID, platform, public identity key,
+protocol version, and listen port.
+
+See [SECURITY.md](SECURITY.md) for the threat model.
+
+## 6. Folder-pair contract
+
+A `FolderPair` contains:
+
+- a shared pair ID;
+- local display name and folder path/grant;
+- the peer device ID;
+- direction: two-way, send-only, or receive-only;
+- local ignore globs, ignored extensions, and optional size cap.
+
+The initiating device creates the pair ID and sends it in a folder invitation.
+The peer accepts the same ID after choosing its local folder. Independently
+creating IDs on both devices does not form a pair.
+
+Pair updates stop the old watcher/engine instance, persist the replacement,
+and start a fresh instance. If startup fails, configuration rollback restores
+the previous pair.
+
+Ignore rules are local. A newly ignored file is frozen rather than converted
+into a deletion tombstone.
+
+## 7. Synchronization model
+
+### Index entries
+
+Each indexed path contains:
+
+- relative path, size, mtime, and authoritative SHA-256;
+- version vector;
+- monotonic pair sequence;
+- tombstone flag;
+- block hashes;
+- `localSha`, `localSize`, and `localMtime` describing confirmed local disk
+  state.
+
+The pair sequence drives incremental index updates. Version vectors, not
+timestamps or hashes, are the ordering authority.
+
+### Critical invariants
+
+1. **Version vectors order changes.** A hash compares content; it never decides
+   which edit is newer.
+2. **`localSha` is disk truth.** The authoritative row may already contain a
+   peer's metadata before this device has fetched those bytes.
+3. **Deletes are tombstones.** A deletion is a versioned row, not row removal.
+4. **Remote metadata is not local possession.** A peer entry is not considered
+   locally present until the bytes are verified on disk.
+5. **The scanner is the resurrection authority.** Restore writes bytes; the
+   next scan creates the new live version through the normal path.
+
+Changes to these invariants require focused regression tests.
+
+### Reconciliation
+
+For each active pair:
+
+1. Retry any authoritative tombstone whose disk cleanup did not complete.
+2. Scan the local folder and update the per-pair index.
+3. Advertise local rows beyond the peer-specific sent watermark.
+4. Request a peer index when no usable peer snapshot exists.
+5. Apply incoming entries idempotently.
+6. Compute required files with `indexDiff()`.
+7. Fetch allowed files in verified blocks.
+8. Confirm the final local bytes in the index.
+9. publish pair status and schedule future reconciliation.
+
+Reconciliation is triggered by watcher changes, peer connection, incoming index
+updates, explicit Sync Now, and a periodic safety net. A pair-level guard
+prevents concurrent scans.
+
+### Direction
+
+- `twoWay` permits incoming and outgoing changes.
+- `receiveOnly` permits incoming fetches but does not advertise local content
+  as an outbound sync source.
+- `sendOnly` advertises local content but does not pull peer content.
+
+Direction does not mean permanent backup retention. Tombstones follow the
+allowed synchronization direction.
+
+### Conflict ordering
+
+If versions are concurrent, both devices use the same deterministic winner:
+
+1. greater modification time;
+2. lexical SHA-256 tie-break when times are equal.
+
+The losing live copy is vaulted before replacement when possible.
+
+### Deletes
+
+When a peer tombstone arrives, the engine compares it with the prior live row:
+
+- a dominating/equal tombstone wins and removes the live path;
+- a concurrent local edit wins and remains live;
+- an unknown/already-deleted path stores the tombstone without live work.
+
+Before a winning peer deletion removes bytes, Conduit attempts to move the file
+to the version vault and record a `peerDelete` entry. A vault failure is
+reported but does not rewrite the version-vector decision.
+
+### Block transfer
+
+Files move in 1 MiB blocks. Blocks and final files are verified with SHA-256.
+Temporary partial files support reconnection and resumption. A terminal source
+error drops that request rather than creating an immediate retry storm.
+
+Transfers above 10 MiB are deferred on Bluetooth.
+
+## 8. Preview, versions, and restore
+
+### Sync preview
+
+Preview captures immutable local and peer inputs and runs the same
+`indexDiff()` logic in both directions. It reports receives, sends, conflicts,
+local deletion advertisements, byte totals, and Bluetooth deferrals.
+
+Preview is informational:
+
+- automatic reconciliation is not paused;
+- a newer scan/index generation marks the result stale;
+- an offline cached snapshot is labelled as such;
+- no peer snapshot is shown as unavailable, never as "up to date";
+- confirmed peer tombstones may already have been applied.
+
+### Version vault
+
+`.syncversions` contains local recovery bytes. The app-support
+`vault_log/<pair>.json` catalogs known entries and their reason:
+
+- incoming overwrite;
+- conflict replacement;
+- peer deletion;
+- restore replacement.
+
+Entries and files are retained for 14 days. Cleanup is best-effort and path
+validated.
+
+Restore is non-destructive: the selected recovery copy stays until retention
+expiry. If a live file exists, it is vaulted first. The restored bytes then
+flow through the scanner and ordinary version-vector reconciliation.
+
+## 9. Ad-hoc transfer and receipts
+
+Ad-hoc send is separate from folder indexes. The sender offers a file and the
+receiver pulls blocks into its configured receive folder.
+
+Peers advertising `transfer_receipt_v1` send `file_offer_receipt` only after
+the receiver has verified and committed the file. The receipt frame carries
+the offer ID, bounded result, received byte count, and optional fixed failure
+code. It does not carry a file name or path.
+
+Receipt history stores local metadata:
+
+- display name, size, direction, peer, and time;
+- ad-hoc or folder-sync kind;
+- completion, cancellation, failure, deferral, or interruption;
+- receiver-confirmed, locally verified, sender-served, or unsupported-peer
+  confirmation.
+
+History is pruned after 30 days and capped at 1,000 rows. Older peers remain
+compatible and complete as unconfirmed.
+
+## 10. Auxiliary features
+
+Clipboard synchronization is optional and content is not persisted as history.
+Android background clipboard restrictions are surfaced rather than bypassed.
+
+Remote PC actions use a fixed allowlist and are disabled unless enabled by the
+user. The protocol does not accept arbitrary commands or shell strings.
+
+Device status publishes bounded battery, charging, storage, and app-health
+metadata to an authenticated peer. Phone alert is a fixed action and can be
+disabled on the phone.
+
+These features do not enter folder indexes, version vectors, or sync queues.
+
+## 11. Lifecycle and background operation
+
+Windows can remain available through its tray integration.
+
+Android uses a foreground service for durable background operation. Wake locks
+are scoped to connection setup or active transfer work and released when idle.
+The app does not hold an unconditional process-lifetime wake lock.
+
+Pause prevents new local reconciliation while preserving connection and
+protocol correctness. Shutdown cancels timers, watchers, transfers, services,
+and sessions before disposing storage.
+
+## 12. Persistence layout
+
+App support directory:
+
+```text
+identity.json
+config.json
+index/<pair-id>.db
+vault_log/<pair-id>.json
+transfer_history.db
 ```
 
-Profile builds keep the `Diag` structured log (profile-gated) — essential for diagnosing hardware behavior. The Release exe strips it. **Always rebuild BOTH targets** after a sync-logic change.
+Synced folder:
 
-No DB migration is ever needed for the index DB: every fix so far has been runtime-logic-only. Existing rows are correct as-is; the new predicate simply classifies them correctly on the next reconcile.
+```text
+<user files>
+.syncversions/    local recovery bytes; excluded from sync
+```
 
----
+On Windows the app support directory is `%APPDATA%\Conduit`. Android uses the
+private application support directory.
 
-## Appendix A — Test catalog (what each test guards)
+## 13. Testing
 
-| File | Guards |
-|---|---|
-| `bug9_recv_delete_propagation_test.dart` | Bug #9: received-file delete propagates (+ delete-storm negative control) |
-| `bug8_refetch_loop_test.dart` | Bug #8: a fetched file is not a perpetual need (+ negative control) |
-| `delete_propagation_test.dart` | Bug #6/#7: authoritative tombstone removes file; concurrent edit wins; resurrection re-fetches; orphan-backlog sweep |
-| `smoke3_revert_test.dart` | smoke #3: indexDiff never reverts a higher-version local edit; idle scans burn no sequence |
-| `smoke3_twodb_cycle_test.dart` | two-way edit cycle survives reconcile (convergence via localSha) |
-| `engine_v2_test.dart` | reconcile phases: no-peer seed, advertise, index exchange, empty-update no-kick, session-lost clear, unknown-pair error |
-| `connect_token_test.dart` | Bluetooth-only QR/connect tokens are accepted; tokens with no usable transport are rejected |
-| `connection_arbitration_test.dart` | healthy sessions reject automatic duplicate takeovers |
-| `transport_metadata_test.dart` | transport priority, Bluetooth bandwidth policy, connection phase/quality separation, Bluetooth-to-LAN lifecycle |
-| `block_transfer_test.dart` | single/multi-block fetch, verify, resume from `.syncpart`; Phase 6.4 — existing file vaulted before overwrite, vault failure never blocks the transfer |
-| `index_db_test.dart` | open/schema, upsertLocal no-op guard, snapshot methods |
-| `index_diff_test.dart` | needs-queue cases |
-| `scanner_test.dart` | first-scan records changes; Phase 6.2 — glob/extension/size ignore rules never indexed, retroactive rule FREEZES an already-synced file (no tombstone), further edits to a frozen file don't propagate, removing a rule resumes normal tracking |
-| `ignore_rules_test.dart` | Phase 6.2 — `matchesIgnoreRule` glob/`**`/`?`/extension/size-cap matching in isolation, including documented limitations (no full gitignore semantics) |
-| `vault_log_test.dart` | Phase 6.4 — `VaultLog` record/list/remove, most-recent-first ordering, corrupt-file resilience, per-pair isolation |
-| `local_fs_access_test.dart` | Phase 6.4 — `LocalFileSystemAccess.moveToVault` regression test for the relative- vs absolute-path return value fix |
-| `version_vector_test.dart` | bump/merge/dominates/concurrent/serialization |
-| `watcher_test.dart` | debounced change signal |
-| `recent_msg_ids_test.dart` | dedup |
-| `file_send_test.dart` | AdHocFileSend: sender offer & serving blocks, receiver auto-fetch & write to disk, session-lost cancellation |
-| `widget_test.dart` | app smoke (builds + Overview) |
+The test suite contains unit, widget, storage, protocol, and two-node tests.
+Important groups cover:
 
----
+- secure handshake, tamper, replay, and pinning;
+- version vectors and index differences;
+- local disk truth and re-fetch prevention;
+- tombstone propagation and concurrent-edit behavior;
+- block transfer, resume, and terminal failures;
+- vault catalog, retention, peer-delete restore, and resurrection;
+- preview reasons, directions, freshness, and totals;
+- preset validation and explicit peer selection;
+- receipt persistence, pruning, and compatibility;
+- duplicate-session arbitration;
+- clipboard and remote command behavior;
+- app startup smoke behavior.
 
-## Appendix B — Change log
+The two-node harness uses independent identities, state directories, indexes,
+folder roots, and real secure loopback sessions.
 
-| Date | Change |
-|---|---|
-| 2026-06-21 | v1 design spec (`docs/2026-06-21-conduit-design.md`) |
-| 2026-06-23 | V2 redesign approved (`REDESIGN.md`); phased, feature-flagged rollout |
-| 2026-06-24 | Bug #6/#7 delete propagation + delete-to-disk; Bug #8 re-fetch loop; smoke #3 edit reversion; SAF duplicate write; **Bug #9** received-file delete propagation (this document) |
-| 2026-06-25 | **Roadmap Phase 0 + Phase 1 — additive wiring only, engine untouched.** 0.1 periodic reconcile safety-net (`Map<String,Timer>` in `engine.dart`, no-op-invariant pinned by `phase0_reliability_test.dart`); 0.2 watcher backoff when no peer (`FolderWatcher.setInterval` + engine connect/disconnect hooks, 4s↔30s); 0.3 discovery beacon backoff when stable (`Discovery.setBeaconMode`, 3s↔15s, driven by session liveness in `app_state.dart`); 0.4 transfer-tied wake lock (`SyncEngine.onTransferState` → method channel → `MainActivity` wake lock, ref-counted 0↔1 transitions); 0.5 DB hardening (`PRAGMA synchronous=NORMAL` in `onConfigure`, `integrity_check` on open, hourly `IndexDb.backup()` to `.bak`). Phase 1: Windows close-to-tray + system tray (`lib/src/desktop/tray.dart`, `window_manager`+`tray_manager`) with intentional **Quit**; Android foreground-service start/stop + battery-optimization prompt + transfer wake lock via new `conduit/sync_service` & `conduit/wakelock` channels; `BootReceiver` + `onTaskRemoved` restart; in-app Survival screen (`lib/src/desktop/background_survival_screen.dart`) with OEM battery/autostart guidance. Tests 117/117; the three `localSha` invariants in §9.2 are unchanged. See `HANDOFF_2026-06-25_PHASE0_PHASE1.md`. |
-| 2026-06-26 | Windows tray hardening: tray icon left-click now restores/focuses the app, right-click explicitly opens the context menu, and all Windows Quit paths route through a shared tray teardown + bounded graceful shutdown before `exit(0)` so the tray icon/process do not linger. |
-| 2026-06-27 | **Roadmap Phase 2 — clipboard sync. Additive, engine untouched.** New `Msg.clipboardPush` in `wire.dart` (no pairId, no msgId — clipboard is device-wide and re-applying is a harmless no-op). One new `onClipboardPush` constructor callback + one **appended** `case Msg.clipboardPush` in `_handlePeerMessage` (subject to the gen guard, NOT in the bypass list — a stale session's clipboard is dropped). New `lib/src/clipboard/clipboard_sync.dart`: pure `ClipboardController` (echo-loop guard — `lastHandledHash` + 800ms suppress window after a local write, so the PC never echoes a value it just received; unit-tested with an injectable clock) and `ClipboardSync` (PC auto-watcher 1.5s poll, Android foreground copy-detection 1s poll, manual `sendCurrentClipboard`, broadcast to paired open sessions only; read/write seams are injectable for tests). PC→phone automatic, phone→PC manual via a QuickShare-style floating chip (`lib/src/ui/clipboard_chip.dart`) that arms only while foregrounded (Android 10+ background-clipboard rule honored). Off by default (`clipboardSyncEnabled` flag in `config_store.dart`); never logs clipboard contents (content-free `SyncEvent`). New `lib/src/ui/clipboard_screen.dart` + Clipboard nav dest. Tests 129/129 (12 new in `clipboard_sync_test.dart`); the three `localSha` invariants in §9.2 are unchanged. See `HANDOFF_2026-06-27_PHASE2.md`. |
-| 2026-06-27 | **Roadmap Phase 3 — ad-hoc file send + notifications + folder badges. Additive, engine untouched.** Upgraded `flutter_local_notifications` to `^19.5.0` (with `flutter_local_notifications_windows` 1.0.3) for SDK 3.6.0 compatibility. Added `fileOffer`, `fileOfferBlock`, `fileOfferData` message types to `wire.dart` (no-ack handshake). Added `lib/src/sync/file_send.dart` (`AdHocFileSend`) implementing sender block serving and receiver auto-fetch logic, fully decoupled from the Index DB or any sync loop/needs-queue. Added `lib/src/notifications/notifier.dart` (`AppNotifier`) system notifications wrapper. Added `lib/src/ui/send_panel.dart` (Send tab) for picking connected peer and selecting a file to transfer. Added `receivedFilesPath` settings to config/Overview. Added `_SyncBadge` custom widget to `folder_pairs_screen.dart` with status micro-animations. Tests 132/132 (3 new in `file_send_test.dart`); sync correctness unchanged. |
-| 2026-07-06 | Hardened clipboard sync: immediate sync on connection ready event + transactional push marking (only mark as pushed when broadcast succeeds, preventing stale hash lockout during connection drops/inactivity). Added 3 new unit tests in `clipboard_sync_test.dart` (total 146/146 tests passing). |
-| 2026-07-07 | Restored V2 as the production folder-sync path for existing installs by migrating useNewEngine to true on config load and defaulting missing test configs to V2. Fixed the Folders screen's manual Sync now action so it reconciles with the current ready peer session instead of forcing a local-only 
-ull session. Added config_store_test.dart; full suite 154/154 passing. |
+Before release:
 
-| 2026-07-08 | Documentation: verified the suite via `flutter test` (154/154 passing, 0 errors) and corrected stale test-count claims to match current code. `ARCHITECTURE.md` header / §11 / module-map and `Roadmap.md` "current state" counts updated from 112/112 and 146/146 to 154/154; the Roadmap current-state snapshot date advanced to 2026-07-07. No source changes. |
-| 2026-07-10 | **Wake-lock ownership fix + battery-doc audit** (see `HANDOFF_2026-07-10_WAKELOCK_FIX.md`). Audit of Phase 0.4/0.6 found the transfer- and connection-tied wake locks were acquired directly on `MainActivity` (a code comment claiming they were "routed to SyncService" was false — only the `MulticastLock` toggle actually was). Since `MainActivity` is `launchMode="singleTask"` with no `excludeFromRecents`, its `onDestroy()` explicitly released both locks — so a plain swipe-from-recents mid-transfer killed the lock immediately even though the Dart engine and foreground service kept running. Separately, the transfer lock had no renewal at all (unlike the connection lock's existing 45s renewal), so any burst longer than its 60s native timeout lost the lock on its own. **Fix:** moved both locks' real ownership into `SyncService` (`transferWakeLock`/`connectionWakeLock` fields, `ACTION_SET_TRANSFER_LOCK`/`ACTION_SET_CONNECTION_LOCK`, `setTransferLockEnabled`/`setConnectionLockEnabled`); `MainActivity` now only forwards the `conduit/wakelock` channel to `SyncService` and no longer holds any `PowerManager.WakeLock` itself. Added `_transferWakeLockRenewal` (45s periodic, mirroring `_connectionWakeLockRenewal`) in `app_state.dart`, released on `dispose()`/`quit()`. Native timeout for both locks raised to 120s (safety net only; Dart renewal is the real mechanism). Also corrected several stale doc passages: `Roadmap.md`'s 0.4 row (described the old, broken design as current), a pre-Phase-0.4 "10-min cap" description in `ARCHITECTURE.md` §8, and documented the previously-unwritten-up Phase 0.6 layer (battery-saver mode, connection lock, discovery multicast toggle) in both `Roadmap.md` (new 0.6 row) and `ARCHITECTURE.md` (new §9.4). **Known gap, unchanged by this fix:** still zero automated test coverage for any Kotlin service/wake-lock code — verification here is manual review only (no Flutter/Dart SDK or Android toolchain in the reviewing environment); an instrumented `androidTest/` suite exercising `SyncService` directly is the recommended follow-up. |
-| 2026-07-09 | **Ad-hoc send throughput + compact send widget** (see `docs/2026-07-05-send-widget-and-throughput.md` for full design). `TCP_NODELAY` set best-effort on both connect and accept paths in `peer_session.dart`. `fetchFileBlockLevel` (`block_transfer.dart`) gained an optional `pipelineDepth` param (sliding-window request pipelining; default 1 = byte-for-byte original stop-and-wait); `file_send.dart` uses depth 8 for ad-hoc receives. New compact popup send flow on Windows (`send_widget_screen.dart`, `send_flow_view.dart`, `AppState.sendWidgetMode`, `tray.dart`'s `suppressWindowBoundsPersistence`) reshapes the single existing window instead of opening a second native one. **Also present in this snapshot, not covered by that doc:** `engine.dart` now sets `_syncPipelineDepth = 4` and passes it to the V2 needs-queue's own `fetchFileBlockLevel` call (previously depth 1 / omitted, per the doc's "left alone here deliberately" note) — i.e. the background sync engine's own block fetch is now pipelined too, not just ad-hoc sends. Reviewed by inspection: `_sendBlockRequest` + `_BlockSink` (`engine.dart`) run `session.send(frame)` and enqueue the matching `_waiters`/`_queue` slot synchronously (before any `await`) on every call, so firing several requests before awaiting any of them still preserves strict FIFO request/response order — the same guarantee `block_transfer_test.dart`'s depth-3/4 tests check against a fake `sendRequest`. No `localSha`/version-vector path touched; only wire scheduling. **Gap:** no test currently drives the *real* engine needs-queue end-to-end at depth 4 (existing pipelining tests exercise the primitive directly with a fake `sendRequest`) — recommend adding one before relying on this further. Tests: `block_transfer_test.dart` pipelining tests present; full-suite count not independently re-verified this session (no `flutter` toolchain available in the reviewing environment — see `PROGRESS.md`). |
-| 2026-07-11 | **Fixed battery-saver disconnect cycling.** Diagnosed a repeating disconnect → heartbeat-timeout → reconnect cycle (~72–90s) reported while the Android phone was idle with both OS Doze and Conduit's own **Battery saver mode** active. Root cause: `_applyBeaconMode()` in `app_state.dart` computed the connection wake lock as `anyLive && !_config.batterySaverMode` — battery-saver mode unconditionally prevented the lock even while a peer session was already live, letting Doze stall the Dart-side heartbeat mid-session (Windows peer eventually surfaces `SocketException: semaphore timeout period has expired`, errno 121; Conduit's own 72s heartbeat-dead timer then tears the session down). **Fix:** decoupled the two concerns — the lock is now held whenever `anyLive` is true, independent of battery-saver mode (`_setConnectionWakeLockEnabled(anyLive)`). Battery-saver's idle-battery savings are unaffected: they come entirely from the separate watcher-polling-interval path (`_engine.setBatterySaverMode`) and the discovery-lock toggle just below this line in the same function, neither of which reads `batterySaverMode` for the connection lock. The existing "Battery saver mode" toggle subtitle in `dashboard_screen.dart` only ever described the watcher-polling behavior, so no UI copy change was needed once the undisclosed side effect was removed. See `PROGRESS.md` / `THINKING.md` (2026-07-11 entries) for the full investigation and reasoning trail. **Not yet verified:** no `flutter analyze`/`flutter test`/device test run in the reviewing environment (no Flutter toolchain available) — recommend running the existing suite plus a real-device idle/Doze soak test before merging. |
-| 2026-07-11 | **Fixed false "clipboard couldn't be written" notification.** Diagnosed inconsistent firing of the Android "clipboard ready to paste" notification (`AppNotifier.showClipboardSyncReceived`) — appearing even when the PC→phone write genuinely succeeded and synced. Root cause: `ClipboardSync.onPushReceived` writes via the native `conduit/clipboard` channel (`applicationContext`-based, built to survive a backgrounded Activity — see `MainActivity.kt` `CH_CLIPBOARD`), but then verified that write by reading back through Flutter's own Activity-bound `Clipboard.getData()`. Android 10+ restricts clipboard *reads* to whichever app currently has window focus or the default IME — with no exception for the app that just wrote the data, and a foreground service does not count as focus — so the verify-read was denied by the OS independent of whether the write succeeded, essentially every time this path is actually used (a backgrounded receive). `app_state.dart`'s `_onClipboardPushReceived` treats a non-null `ClipboardSync.pendingRemoteText` after the attempt as "OS blocked it" and fires the notification, so a genuinely successful write was misreported as blocked whenever the app lacked focus at that instant — matching the reported "inconsistent" symptom exactly. The native write path already surfaces real failures correctly (it throws, and `onPushReceived`'s existing `catch` already handles that). **Fix:** on phone (`!isDesktopPlatform`), `onPushReceived` now treats "the write call returned without throwing" as the success signal and skips the readback comparison entirely; the readback-based verify remains for desktop, where no such OS read restriction exists. `test/clipboard_sync_test.dart`'s three background-write tests were re-based off a corrected fake (`_FailingWriteClipboard`, modeling a genuine thrown write failure, replacing `_BlockedWriteClipboard`'s inaccurate "write silently no-ops" model) plus one new fake (`_FocusRestrictedReadClipboard`) and a new regression test asserting `pendingRemoteText` clears on a successful write even when the readback is denied. See `PROGRESS.md` / `THINKING.md` (2026-07-11 entries) for the full investigation. **Not yet verified:** no `flutter analyze`/`flutter test`/device test run in the reviewing environment (no Flutter toolchain available) — manual review only (balanced-delimiter check on the two touched Dart files, and every call site of the touched functions read by hand). Test count in this snapshot: 155 (154 prior + 1 new), not independently re-run. Recommend running the suite and a real-device backgrounded-receive test (screen off, push from PC, phone not focused) before merging. |
-| 2026-07-14 | **File Transfer Cancel Option on Receiving Device.** Added a "Cancel" action button to the file receive progress notification on Android. Implemented port-based background notification response routing (`conduit_notification_port`) in `AppNotifier` (`notifier.dart`) using `IsolateNameServer` and `ReceivePort` to deliver action taps from the background isolate to the main isolate without forcing the user interface to open. Integrated the "Cancel" action tap to trigger `cancelInboundOffer` in `AdHocFileSend` (`file_send.dart`), which stops the local block-pull loop, notifies the sender with `Msg.fileOfferControl` (`action: 'cancel'`), logs the action, and dismisses the local notification. Updated the sender's `handleFileOfferControl` to process receiver cancellation messages by cleanly terminating the block serving loop. Added public notification dismissal helpers `cancelReceiveProgress`/`cancelSendProgress` and wired them to clean up progress notifications on all transfer error/interrupt paths. Updated the `_FakeNotifier` mock class in `test/file_send_test.dart` to match the updated `AppNotifier` interface signature. Verified all 193 unit tests passing. |
-| 2026-07-16 | **Bluetooth Classic fallback + deterministic transport lifecycle.** Added Android and Windows RFCOMM bridges that proxy Bluetooth through loopback TCP so the existing authenticated Conduit protocol is reused unchanged. Added persisted Bluetooth endpoints, OS-paired candidate discovery, Bluetooth-only QR tokens, LAN-over-Bluetooth upgrade probes, Windows-only active LAN monitoring, transport-aware UI, and a single connection phase/quality snapshot. LAN always supersedes Bluetooth; healthy duplicate sessions are rejected; heartbeat pong IDs are echoed; files over 10 MiB and deep transfer pipelines are suspended/reduced on Bluetooth. Also added persisted local size/mtime fingerprints and native Android SAF hashing to avoid re-reading unchanged files, prevented overlapping watcher scans, and updated the Android Gradle toolchain/desugaring configuration. Verification: 202/202 tests passed; Android and Windows release builds passed. |
+```powershell
+flutter analyze
+flutter test
+flutter build windows --release
+flutter build apk --release
+```
 
----
+The physical Windows/Android smoke procedure is stored in
+`docs/windows-android-smoke-checklist.json`.
 
-*If anything in this document contradicts the source, **the source is right** —
-fix the document and append a change-log entry.*
+## 14. Change policy
+
+When modifying synchronization:
+
+1. Preserve the critical invariants in section 7.
+2. Keep wire changes additive unless a deliberate protocol bump is required.
+3. Keep platform errors recoverable and visible.
+4. Add the narrow regression test that proves the changed behavior.
+5. Run the two-node tests when session, index, transfer, delete, or restore
+   behavior changes.
+6. Update this document only when the runtime architecture changes.
+
+Release history belongs in [CHANGELOG.md](CHANGELOG.md). Planned work belongs
+in [Roadmap.md](Roadmap.md).

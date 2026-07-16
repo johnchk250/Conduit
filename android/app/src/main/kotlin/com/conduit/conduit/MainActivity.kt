@@ -99,12 +99,11 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        // Phase 3d: handle a share intent that launched the app cold (i.e. the
-        // activity was not yet running when the user tapped "Conduit" in the
-        // share sheet). The channel is not ready yet at this point — we store
-        // the intent and flush it after configureFlutterEngine completes.
+        // FlutterActivity may configure the engine inside super.onCreate().
+        // Capture the cold-start share first so that setup can flush it after
+        // Dart registers the share handler.
         _pendingShareIntent = intent
+        super.onCreate(savedInstanceState)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -139,12 +138,21 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "pick" -> {
                         pendingTreeResult = result
+                        val initialHint = call.argument<String>("initialHint")
                         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
                             addFlags(
                                 Intent.FLAG_GRANT_READ_URI_PERMISSION or
                                         Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
                                         Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
                             )
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                                !initialHint.isNullOrBlank()) {
+                                val documentUri = DocumentsContract.buildDocumentUri(
+                                    "com.android.externalstorage.documents",
+                                    "primary:${initialHint.trimStart('/')}"
+                                )
+                                putExtra(DocumentsContract.EXTRA_INITIAL_URI, documentUri)
+                            }
                         }
                         @Suppress("DEPRECATION")
                         startActivityForResult(intent, REQ_PICK_TREE)
@@ -184,6 +192,10 @@ class MainActivity : FlutterActivity() {
                         // The in-app Survival screen documents the OEM-specific
                         // steps beyond this.
                         openBatteryOptimizationSettings()
+                        result.success(null)
+                    }
+                    "openNotificationSettings" -> {
+                        openNotificationSettings()
                         result.success(null)
                     }
                     // Polish: toggle the notification visibility (normal vs silent
@@ -477,6 +489,23 @@ class MainActivity : FlutterActivity() {
                     }
                 startActivity(intent)
             } catch (_: Throwable) {}
+        }
+    }
+
+    private fun openNotificationSettings() {
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+            putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: Throwable) {
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:$packageName")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
         }
     }
 

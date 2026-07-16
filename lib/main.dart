@@ -6,8 +6,11 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
+import 'package:conduit/l10n/generated/app_localizations.dart';
 
 import 'src/app_state.dart';
+import 'src/controllers/app_controllers.dart';
+import 'src/runtime/app_runtime.dart';
 import 'src/storage/db_factory.dart';
 import 'src/ui/theme.dart';
 import 'src/ui/dashboard_screen.dart';
@@ -102,9 +105,9 @@ void main() {
     // process death or boot; synchronization must not depend on a widget's
     // initState being reached. DashboardScreen.start() remains as an idempotent
     // fallback and joins this same startup operation.
-    final appState = AppState();
-    runApp(ConduitApp(appState: appState));
-    unawaited(appState.start().catchError((Object error, StackTrace stack) {
+    final runtime = AppRuntime();
+    runApp(ConduitApp(runtime: runtime));
+    unawaited(runtime.start().catchError((Object error, StackTrace stack) {
       _logCrash(error, stack, source: 'app_start');
     }));
   }, (error, stack) {
@@ -116,17 +119,53 @@ void main() {
   });
 }
 
-class ConduitApp extends StatelessWidget {
-  const ConduitApp({super.key, this.appState});
+class ConduitApp extends StatefulWidget {
+  const ConduitApp({super.key, this.runtime, this.appState});
 
+  final AppRuntime? runtime;
   final AppState? appState;
 
   @override
+  State<ConduitApp> createState() => _ConduitAppState();
+}
+
+class _ConduitAppState extends State<ConduitApp> {
+  late final AppRuntime _runtime =
+      widget.runtime ?? AppRuntime(appState: widget.appState);
+  late final bool _ownsRuntime = widget.runtime == null;
+
+  @override
+  void dispose() {
+    if (_ownsRuntime) _runtime.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => appState ?? AppState(),
+    return MultiProvider(
+      providers: [
+        Provider<AppRuntime>.value(value: _runtime),
+        ChangeNotifierProvider<AppState>.value(value: _runtime.appState),
+        ChangeNotifierProvider<AppLifecycleController>.value(
+          value: _runtime.lifecycle,
+        ),
+        ChangeNotifierProvider<ConnectionController>.value(
+          value: _runtime.connections,
+        ),
+        ChangeNotifierProvider<FolderSyncController>.value(
+          value: _runtime.folders,
+        ),
+        ChangeNotifierProvider<TransferController>.value(
+          value: _runtime.transfers,
+        ),
+        ChangeNotifierProvider<DeviceServicesController>.value(
+          value: _runtime.deviceServices,
+        ),
+      ],
       child: MaterialApp(
-        title: 'Conduit',
+        onGenerateTitle: (context) => AppLocalizations.of(context).appTitle,
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
         debugShowCheckedModeBanner: false,
         theme: AppTheme.light(),
         darkTheme: AppTheme.dark(),

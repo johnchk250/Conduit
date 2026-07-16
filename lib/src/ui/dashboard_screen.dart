@@ -2,7 +2,7 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
@@ -12,14 +12,18 @@ import '../net/transport.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
 import '../sync/engine.dart';
+import '../controllers/app_controllers.dart';
 import 'pairing_screen.dart';
 import 'folder_pairs_screen.dart';
 import 'activity_screen.dart';
-import 'clipboard_screen.dart';
 import 'send_panel.dart';
 import 'send_widget_screen.dart';
 import 'remote_control_screen.dart';
 import 'glass.dart';
+import 'connection_doctor_screen.dart';
+import 'onboarding_screen.dart';
+
+enum AppDestination { home, folders, devices, remote, settings }
 
 /// A fast 180 ms fade transition used for all pushed sub-screens.
 /// The default [MaterialPageRoute] slide takes ~300 ms and feels heavy on top
@@ -53,7 +57,7 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  int _index = 0;
+  AppDestination _destination = AppDestination.home;
 
   /// The pairId of the invite whose dialog is currently on screen. Used to
   /// avoid re-showing the same dialog if a rebuild fires before
@@ -104,49 +108,45 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   /// Phase 3d: if the OS share/send mechanism queued files into AppState,
-  /// switch to the Send tab so the user immediately sees the peer picker
-  /// with their files pre-loaded. Uses a post-frame callback so we never
-  /// navigate during a build call.
+  /// open the Send route so the user immediately sees the peer picker with
+  /// their files pre-loaded.
   bool _sendPanelPushed = false;
-  void _navigateToSendIfSharedFiles(AppState state, bool isWide) {
+  void _navigateToSendIfSharedFiles(bool hasPendingFiles) {
     if (_sendPanelPushed) return;
-    if (state.pendingSharedFiles == null) return;
-    if (isWide) {
-      _sendPanelPushed = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) {
-          setState(() => _index = 3);
-        }
+    if (!hasPendingFiles) return;
+    _sendPanelPushed = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        _sendPanelPushed = false;
+        return;
+      }
+      Navigator.of(context).popUntil((route) => route.isFirst);
+      Navigator.of(context)
+          .push(
+        _fadeRoute((_) => const SendPanel()),
+      )
+          .then((_) {
         _sendPanelPushed = false;
       });
-    } else {
-      _sendPanelPushed = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) {
-          _sendPanelPushed = false;
-          return;
-        }
-        // Pop any sub-routes to root (e.g. settings or keep-alive sub-screens)
-        // so that the SendPanel is pushed directly on top of the DashboardScreen
-        // and doesn't get obscured or make the back stack confusing.
-        Navigator.of(context).popUntil((route) => route.isFirst);
-        Navigator.of(context)
-            .push(
-          _fadeRoute((_) => const SendPanel()),
-        )
-            .then((_) {
-          _sendPanelPushed = false;
-        });
-      });
-    }
+    });
   }
 
   @override
   Widget build(BuildContext ctx) {
-    final state = ctx.watch<AppState>();
+    final lifecycle = ctx.watch<AppLifecycleController>().snapshot;
+    final pendingInvite = ctx.select<FolderSyncController, FolderPairInvite?>(
+      (controller) => controller.snapshot.pendingInvite,
+    );
+    final isPaused = ctx.select<FolderSyncController, bool>(
+      (controller) => controller.snapshot.isPaused,
+    );
+    final hasPendingFiles = ctx.select<TransferController, bool>(
+      (controller) => controller.snapshot.pendingFiles.isNotEmpty,
+    );
+    final state = ctx.read<AppState>();
     // Guard against the brief window before AppState.start() finishes
     // initializing the late identity/config/engine fields.
-    if (!state.isStarted) {
+    if (!lifecycle.isStarted) {
       final c = GlassColors.of(ctx);
       return Scaffold(
         backgroundColor: Colors.transparent,
@@ -174,7 +174,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  state.status,
+                  lifecycle.status,
                   style: TextStyle(color: c.textSecondary, fontSize: 12),
                 ),
               ],
@@ -182,6 +182,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
         ),
       );
+    }
+    if (lifecycle.onboardingVersion <
+        AppLifecycleController.currentOnboardingVersion) {
+      return const OnboardingScreen();
     }
     // Roadmap Phase 4: a KDE-Connect-style compact "send widget" stands in
     // for the full shell while a Windows-triggered ad-hoc send is active, so
@@ -194,7 +198,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     // exactly where the user left it once the widget closes — see
     // SendWidgetScreen's doc comment. Android has no window to shrink, so it
     // keeps the existing full-screen Send-tab navigation unconditionally.
-    if (Platform.isWindows && state.sendWidgetMode) {
+    if (Platform.isWindows && lifecycle.sendWidgetMode) {
       // Pop all sub-routes to root so the SendWidgetScreen is visible
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
@@ -210,39 +214,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
     // showDialog is idempotent for a given pairId (see _displayedInvitePairId
     // guard). Doing this here — rather than via a listener — is what makes
     // delivery robust against rebuilds: the rebuild itself is the trigger.
-    _showInviteDialogIfNeeded(state.pendingInvite);
+    _showInviteDialogIfNeeded(pendingInvite);
     // Phase 3d: if files arrived via the OS share sheet or "Send to" menu,
-    // auto-navigate to the Send tab (index 3) so the user immediately sees
-    // the peer picker pre-loaded with their files.
-    _navigateToSendIfSharedFiles(state, isWide);
+    // Open the Send route so the user immediately sees the peer picker
+    // pre-loaded with their files.
+    _navigateToSendIfSharedFiles(hasPendingFiles);
 
-    final desktopPages = [
+    final pages = [
       _OverviewPage(
-        onNavigate: (i) => setState(() => _index = i),
+        onNavigate: (i) =>
+            setState(() => _destination = AppDestination.values[i]),
       ),
       const RepaintBoundary(child: FolderPairsScreen()),
       const RepaintBoundary(child: PairingScreen()),
-      const RepaintBoundary(child: SendPanel()),
-      const RepaintBoundary(child: ActivityScreen()),
-      const RepaintBoundary(child: ClipboardScreen()),
       const RepaintBoundary(child: RemoteControlScreen()),
       const RepaintBoundary(child: _SettingsHubPage()),
     ];
 
-    final mobilePages = [
-      _OverviewPage(
-        onNavigate: (i) => setState(() => _index = i),
-      ),
-      const RepaintBoundary(child: FolderPairsScreen()),
-      const RepaintBoundary(child: PairingScreen()),
-      const RepaintBoundary(child: ClipboardScreen()),
-      const RepaintBoundary(child: RemoteControlScreen()),
-      const RepaintBoundary(child: _SettingsHubPage()),
-    ];
-
-    final activeIndex = isWide
-        ? _index.clamp(0, desktopPages.length - 1)
-        : _index.clamp(0, mobilePages.length - 1);
+    final activeIndex = _destination.index;
 
     if (isWide) {
       return Scaffold(
@@ -262,8 +251,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 width: 220,
                 child: _NavRail(
                   index: activeIndex,
-                  onChanged: (i) => setState(() => _index = i),
+                  onChanged: (i) =>
+                      setState(() => _destination = AppDestination.values[i]),
                   state: state,
+                  isPaused: isPaused,
                   onPauseToggle: () {
                     if (state.isPaused) {
                       state.resumeSync();
@@ -278,7 +269,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               // with its own border/blur, so a hard-line divider next to it
               // reads as a glass rendering artifact rather than a boundary.
               Expanded(
-                child: desktopPages[activeIndex],
+                child: IndexedStack(index: activeIndex, children: pages),
               ),
             ],
           ),
@@ -289,10 +280,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: Scaffold(
         backgroundColor: Colors.transparent,
         extendBody: false,
-        body: mobilePages[activeIndex],
+        body: IndexedStack(index: activeIndex, children: pages),
         bottomNavigationBar: GlassNavBar(
           selectedIndex: activeIndex,
-          onDestinationSelected: (i) => setState(() => _index = i),
+          onDestinationSelected: (i) =>
+              setState(() => _destination = AppDestination.values[i]),
           destinations: const [
             GlassNavDestination(
                 icon: Icons.dashboard_outlined,
@@ -306,10 +298,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 icon: Icons.devices_outlined,
                 selectedIcon: Icons.devices,
                 label: 'Devices'),
-            GlassNavDestination(
-                icon: Icons.content_copy_outlined,
-                selectedIcon: Icons.content_copy,
-                label: 'Clipboard'),
             GlassNavDestination(
                 icon: Icons.settings_remote_outlined,
                 selectedIcon: Icons.settings_remote,
@@ -366,12 +354,14 @@ class _NavRail extends StatelessWidget {
     required this.index,
     required this.onChanged,
     required this.state,
+    required this.isPaused,
     required this.onPauseToggle,
     required this.onQuit,
   });
   final int index;
   final ValueChanged<int> onChanged;
   final AppState state;
+  final bool isPaused;
   final VoidCallback onPauseToggle;
   final VoidCallback onQuit;
 
@@ -426,9 +416,9 @@ class _NavRail extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             GlassButton(
-              icon: state.isPaused ? Icons.play_arrow : Icons.pause,
-              label: state.isPaused ? 'Resume' : 'Pause',
-              accentColor: state.isPaused ? c.mint : c.amber,
+              icon: isPaused ? Icons.play_arrow : Icons.pause,
+              label: isPaused ? 'Resume' : 'Pause',
+              accentColor: isPaused ? c.mint : c.amber,
               style: GlassButtonStyle.primary,
               onTap: onPauseToggle,
             ),
@@ -457,16 +447,6 @@ class _NavRail extends StatelessWidget {
             selectedIcon: Icons.devices,
             label: 'Devices'),
         GlassNavDestination(
-            icon: Icons.send_outlined, selectedIcon: Icons.send, label: 'Send'),
-        GlassNavDestination(
-            icon: Icons.history_outlined,
-            selectedIcon: Icons.history,
-            label: 'Activity'),
-        GlassNavDestination(
-            icon: Icons.content_copy_outlined,
-            selectedIcon: Icons.content_copy,
-            label: 'Clipboard'),
-        GlassNavDestination(
             icon: Icons.settings_remote_outlined,
             selectedIcon: Icons.settings_remote,
             label: 'Remote'),
@@ -492,7 +472,6 @@ class _OverviewPage extends StatelessWidget {
         .where((p) => state.isPeerConnected(p.deviceId))
         .length;
     final discovered = state.discoveredPeers;
-    final isCompact = MediaQuery.sizeOf(ctx).width < 900;
 
     // Reference has no separate app-bar row — the "Overview" heading is
     // just the first thing in the scrollable content
@@ -552,28 +531,22 @@ class _OverviewPage extends StatelessWidget {
             );
           }(),
           const SizedBox(height: 26),
-          // Compact layouts do not have the desktop Send destination in their
-          // bottom navigation. Keep this global entry point available even
-          // while every paired device is offline; SendFlowView can then show
-          // those devices and offer reconnection.
-          if (isCompact) ...[
-            const GlassSectionLabel('Quick actions'),
-            GlassListTile(
-              leadingIcon: Icons.send_outlined,
-              accentColor: c.amber,
-              title: 'Send files',
-              subtitle: connectedCount > 0
-                  ? 'Choose files and a destination device'
-                  : 'Open Send to reconnect a paired device',
-              trailing: Icon(Icons.chevron_right, color: c.textTertiary),
-              onTap: () {
-                Navigator.of(ctx).push(
-                  _fadeRoute((_) => const SendPanel()),
-                );
-              },
-            ),
-            const SizedBox(height: 26),
-          ],
+          const GlassSectionLabel('Quick actions'),
+          GlassListTile(
+            leadingIcon: Icons.send_outlined,
+            accentColor: c.amber,
+            title: 'Send files',
+            subtitle: connectedCount > 0
+                ? 'Choose files and a destination device'
+                : 'Open Send to reconnect a paired device',
+            trailing: Icon(Icons.chevron_right, color: c.textTertiary),
+            onTap: () {
+              Navigator.of(ctx).push(
+                _fadeRoute((_) => const SendPanel()),
+              );
+            },
+          ),
+          const SizedBox(height: 26),
           if (Platform.isWindows) ...[
             ...state.pairedPeers
                 .where((p) => p.platform == 'android')
@@ -887,6 +860,35 @@ class _SettingsHubPage extends StatelessWidget {
                 );
               },
             ),
+            const SizedBox(height: 10),
+            GlassListTile(
+              leadingIcon: Icons.health_and_safety_outlined,
+              accentColor: c.blue,
+              title: 'Connection Doctor',
+              subtitle:
+                  'Check local readiness, folder access, discovery, and secure connections',
+              trailing:
+                  Icon(Icons.chevron_right, size: 20, color: c.textTertiary),
+              onTap: () {
+                Navigator.of(context).push(
+                  _fadeRoute((_) => const ConnectionDoctorScreen()),
+                );
+              },
+            ),
+            const SizedBox(height: 10),
+            GlassListTile(
+              leadingIcon: Icons.school_outlined,
+              accentColor: c.teal,
+              title: 'Run setup again',
+              subtitle: 'Reopen the guided pairing and first-use flow',
+              trailing:
+                  Icon(Icons.chevron_right, size: 20, color: c.textTertiary),
+              onTap: () {
+                Navigator.of(context).push(
+                  _fadeRoute((_) => const OnboardingScreen(reopened: true)),
+                );
+              },
+            ),
 
             const SizedBox(height: 20),
 
@@ -920,7 +922,7 @@ class _SettingsHubPage extends StatelessWidget {
                 trailing: Switch(
                   value: state.showPersistentNotification,
                   onChanged: (v) => state.setShowPersistentNotification(v),
-                  activeColor: c.teal,
+                  activeThumbColor: c.teal,
                 ),
               ),
               const SizedBox(height: 10),
@@ -934,7 +936,7 @@ class _SettingsHubPage extends StatelessWidget {
                 trailing: Switch(
                   value: state.allowPlayPhoneAlert,
                   onChanged: (v) => state.setAllowPlayPhoneAlert(v),
-                  activeColor: c.amber,
+                  activeThumbColor: c.amber,
                 ),
               ),
               const SizedBox(height: 10),
@@ -951,7 +953,7 @@ class _SettingsHubPage extends StatelessWidget {
               trailing: Switch(
                 value: state.batterySaverMode,
                 onChanged: (v) => state.setBatterySaverMode(v),
-                activeColor: c.teal,
+                activeThumbColor: c.teal,
               ),
             ),
 
@@ -1230,7 +1232,7 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
           const SizedBox(height: 14),
           Text(
             'Sync health',
-            style: GoogleFonts.manrope(
+            style: AppTypography.manrope(
               textStyle: TextStyle(
                 color: c.textPrimary,
                 fontSize: 13.5,
@@ -1275,7 +1277,7 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
                   const SizedBox(width: 8),
                   Text(
                     widget.peer.name,
-                    style: GoogleFonts.manrope(
+                    style: AppTypography.manrope(
                       textStyle: TextStyle(
                         color: c.textPrimary,
                         fontSize: 16.5,
@@ -1351,15 +1353,14 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
                 onTap: () async {
                   final ok = await state.sendClipboard(
                       targetPeerId: widget.peer.deviceId);
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        content: Text(ok
-                            ? 'Clipboard sent to ${widget.peer.name}'
-                            : 'Failed to send clipboard (is it empty?)'),
-                      ),
-                    );
-                  }
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(this.context).showSnackBar(
+                    SnackBar(
+                      content: Text(ok
+                          ? 'Clipboard sent to ${widget.peer.name}'
+                          : 'Failed to send clipboard (is it empty?)'),
+                    ),
+                  );
                 },
               ),
               if (!isConnected)
@@ -1373,11 +1374,10 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
                     try {
                       await state.reconnectPeer(widget.peer);
                     } catch (e) {
-                      if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text(e.toString())),
-                        );
-                      }
+                      if (!mounted) return;
+                      ScaffoldMessenger.of(this.context).showSnackBar(
+                        SnackBar(content: Text(e.toString())),
+                      );
                     }
                   },
                 ),
@@ -1410,36 +1410,35 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
 
     final res = await state.playPhoneAlert(widget.peer.deviceId);
 
-    if (mounted) {
-      setState(() {
-        _alerting = false;
-      });
+    if (!mounted || !ctx.mounted) return;
+    setState(() {
+      _alerting = false;
+    });
 
-      String msg = '';
-      switch (res) {
-        case 'started':
-          msg = 'Alert played successfully on ${widget.peer.name}.';
-          break;
-        case 'disabled':
-          msg =
-              '${widget.peer.name} has locating/play alerts disabled in settings.';
-          break;
-        case 'unsupported':
-          msg = 'Locate alerts are not supported by the peer.';
-          break;
-        case 'offline':
-          msg = 'Locate failed: Peer went offline.';
-          break;
-        case 'timeout':
-          msg = 'Alert request timed out.';
-          break;
-        default:
-          msg = 'Locate failed.';
-      }
-
-      ScaffoldMessenger.of(ctx).showSnackBar(
-        SnackBar(content: Text(msg)),
-      );
+    String msg = '';
+    switch (res) {
+      case 'started':
+        msg = 'Alert played successfully on ${widget.peer.name}.';
+        break;
+      case 'disabled':
+        msg =
+            '${widget.peer.name} has locating/play alerts disabled in settings.';
+        break;
+      case 'unsupported':
+        msg = 'Locate alerts are not supported by the peer.';
+        break;
+      case 'offline':
+        msg = 'Locate failed: Peer went offline.';
+        break;
+      case 'timeout':
+        msg = 'Alert request timed out.';
+        break;
+      default:
+        msg = 'Locate failed.';
     }
+
+    ScaffoldMessenger.of(ctx).showSnackBar(
+      SnackBar(content: Text(msg)),
+    );
   }
 }

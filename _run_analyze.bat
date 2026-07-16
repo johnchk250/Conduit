@@ -1,6 +1,7 @@
 @echo off
 setlocal
-set "DART=C:\Users\Administrator\flutter\bin\cache\dart-sdk\bin\dart.exe"
+set "GRADLE_USER_HOME=E:\Developer\Gradle"
+set "DART=E:\Developer\flutter\bin\cache\dart-sdk\bin\dart.exe"
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 cd /d "%ROOT%"

@@ -81,6 +81,10 @@ object ConduitEngineHost {
                             result.error("NO_ACTIVITY", "Battery settings require an Activity", null)
                             return@setMethodCallHandler
                         }
+                        "openNotificationSettings" -> {
+                            result.error("NO_ACTIVITY", "Notification settings require an Activity", null)
+                            return@setMethodCallHandler
+                        }
                         else -> {
                             result.notImplemented()
                             return@setMethodCallHandler

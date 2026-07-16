@@ -25,6 +25,9 @@ import 'sync/engine.dart';
 import 'sync/vault_log.dart';
 import 'sync/file_send.dart';
 import 'sync/manifest.dart';
+import 'sync/sync_preview.dart';
+import 'runtime/app_dependencies.dart';
+import 'transfers/transfer_receipt.dart';
 
 /// Central app state, exposed to the UI via Provider. Owns:
 ///   - device identity
@@ -40,7 +43,10 @@ import 'sync/manifest.dart';
 /// every rebuild via `context.watch<AppState>()`; there is no
 /// StreamSubscription to attach "in time" or to lose on a rebuild.
 class AppState extends ChangeNotifier with WidgetsBindingObserver {
-  AppState();
+  AppState({AppDependencies? dependencies})
+      : dependencies = dependencies ?? AppDependencies.production();
+
+  final AppDependencies dependencies;
 
   late DeviceIdentity _identity;
   late ConfigStore _config;
@@ -69,6 +75,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// Roadmap Phase 3a — ad-hoc file send / auto-receive handler.
   AdHocFileSend? _adHoc;
+  TransferReceiptRepository? _transferReceipts;
+  TransferReceiptRepository? get transferReceipts => _transferReceipts;
 
   // Phase 3d: files shared into Conduit from outside the app that are
   // waiting to be sent (when no peer is connected at share-time, or when
@@ -244,6 +252,28 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     );
   }
 
+  Future<SyncPreview> buildSyncPreview(
+    FolderPair pair, {
+    bool refreshLocal = true,
+  }) async {
+    if (refreshLocal) {
+      await _engine.refreshLocalIndexForPreview(pair);
+    }
+    final inputs = await _engine.previewInputs(pair);
+    var preview = assembleSyncPreview(
+      pair: pair,
+      inputs: inputs,
+      capturedAt: DateTime.now(),
+    );
+    final latest = await _engine.previewInputs(pair);
+    if (latest.localGeneration != inputs.localGeneration) {
+      preview = preview.withFreshness(SyncPreviewFreshness.staleLocal);
+    } else if (latest.peerGeneration != inputs.peerGeneration) {
+      preview = preview.withFreshness(SyncPreviewFreshness.stalePeer);
+    }
+    return preview;
+  }
+
   bool isPeerConnected(String deviceId) =>
       connectionStateFor(deviceId).isConnected;
 
@@ -284,8 +314,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
             ? 'android'
             : 'other';
 
-    _identity = await DeviceIdentity.loadOrCreate(platform: platform);
-    _config = await ConfigStore.load();
+    _identity = await dependencies.loadIdentity(platform);
+    _config = await dependencies.loadConfig();
 
     // Load persisted dashboard states
     final snapshots = _config.deviceStatusSnapshots;
@@ -315,9 +345,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       }
     });
 
-    _fs = platform == 'android'
-        ? const SafFileSystemAccess()
-        : const LocalFileSystemAccess();
+    _fs = dependencies.createFileSystemAccess(platform);
 
     // Step 4: shared registry — the single source of truth for live sessions.
     _registry = PeerConnectionRegistry();
@@ -333,7 +361,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
     // App-private dir for sync metadata. Same place as config.json /
     // identity.json. NEVER inside the synced folder.
-    final stateDir = await ConfigStore.appSupportDir();
+    final stateDir = await dependencies.loadSupportDirectory();
+    _transferReceipts = await TransferReceiptRepository.open(stateDir);
 
     _engine = SyncEngine(
       fs: _fs,
@@ -494,11 +523,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       notifier: _notifier,
       getReceivedFilesPath: _resolveReceivedFilesPath,
       getPeerName: _peerNameFor,
+      receipts: _transferReceipts,
       onLog: (msg, {bool isError = false}) {
         Diag.log('adhoc', fields: {'msg': msg, if (isError) 'level': 'error'});
       },
     );
     _engine.adHocSend = _adHoc;
+    _engine.transferReceipts = _transferReceipts;
 
     // Phase 3b: initialise the notification plugin (channel setup + permission).
     // Wire up the file-open callback BEFORE init() so any notification that
@@ -1203,6 +1234,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _setConnectionWakeLockEnabled(false);
     _onTransferState(false); // cancel renewal timer + release, if held
     _engine.dispose();
+    final receipts = _transferReceipts;
+    if (receipts != null) unawaited(receipts.close());
     super.dispose();
   }
 
@@ -1245,7 +1278,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         state == AppLifecycleState.detached) {
       // Real backgrounding starts the clock. inactive doesn't — it's the
       // ephemeral pre-state for every transition and would fire constantly.
-      _backgroundedAt ??= DateTime.now();
+      _backgroundedAt ??= dependencies.now();
       return;
     }
     if (state != AppLifecycleState.resumed) return;
@@ -1261,7 +1294,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // cheap and safe regardless of how long the app was backgrounded.
     unawaited(_clipboard?.onResume());
     if (bgStart == null ||
-        DateTime.now().difference(bgStart) < _minBgForReset) {
+        dependencies.now().difference(bgStart) < _minBgForReset) {
       return; // too brief — sockets are fine
     }
     _resetAllSessionsOnResume();
@@ -1306,13 +1339,70 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   // ---- Folder pair management -------------------------------------------
 
+  Future<FolderPair> createFolderPair(FolderPairDraft draft) async {
+    final pair = draft.materialize(DeviceIdentity.uuid.v4());
+    await _config.upsertPair(pair);
+    try {
+      await _engine.startPair(pair);
+    } catch (_) {
+      await _config.removePair(pair.id);
+      rethrow;
+    }
+    notifyListeners();
+    return pair;
+  }
+
+  /// Replaces a pair configuration and restarts its watcher/engine so no
+  /// closure can retain the previous path, direction, peer, or rules.
+  Future<void> updateFolderPair(
+    String pairId,
+    FolderPairDraft draft,
+  ) async {
+    final previous = _config.folderPairs
+        .cast<FolderPair?>()
+        .firstWhere((pair) => pair?.id == pairId, orElse: () => null);
+    if (previous == null) {
+      throw StateError('Folder pair $pairId no longer exists.');
+    }
+    final updated = draft.materialize(pairId);
+    await _engine.stopPair(pairId);
+    await _config.upsertPair(updated);
+    try {
+      await _engine.startPair(updated);
+    } catch (_) {
+      await _config.upsertPair(previous);
+      try {
+        await _engine.startPair(previous);
+      } catch (rollbackError) {
+        Diag.log(
+          'folder_pair_update_rollback_error',
+          fields: {'pairId': pairId, 'error': rollbackError.toString()},
+        );
+      }
+      rethrow;
+    }
+    notifyListeners();
+  }
+
   /// Add a folder pair locally (used by the "Add synced folder" flow on the
   /// initiating device, BEFORE sending the invite). The UI then calls
   /// [invitePeerToFolder] to send it to the connected peer.
+  @Deprecated('Use createFolderPair or updateFolderPair explicitly.')
   Future<void> addFolderPair(FolderPair pair) async {
-    await _config.upsertPair(pair);
-    await _engine.startPair(pair);
-    notifyListeners();
+    final exists = _config.folderPairs.any((item) => item.id == pair.id);
+    final draft = FolderPairDraft.fromPair(pair);
+    if (exists) {
+      await updateFolderPair(pair.id, draft);
+    } else {
+      await _config.upsertPair(pair);
+      try {
+        await _engine.startPair(pair);
+      } catch (_) {
+        await _config.removePair(pair.id);
+        rethrow;
+      }
+      notifyListeners();
+    }
   }
 
   /// Update a pair's ignore rules (Roadmap Phase 6.2) and take effect
@@ -1351,77 +1441,35 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       ignoreExtensions: ignoreExtensions,
       maxFileSizeBytes: maxFileSizeBytes,
     );
-    await _config.upsertPair(updated);
-    await _engine.stopPair(pairId);
-    await _engine.startPair(updated);
-    notifyListeners();
+    await updateFolderPair(pairId, FolderPairDraft.fromPair(updated));
   }
 
-  /// Roadmap Phase 6.4 — version-restore (edit-only scope; see PROGRESS.md
-  /// 2026-07-11 for why delete-restore is out of scope — it would require
-  /// touching `_applyRemoteTombstone`, which is on the project's
-  /// do-not-touch list). Lists this pair's vault catalog for the "Restore
-  /// versions" screen, most-recent-first.
+  /// Lists this pair's vault catalog for the version-history screen,
+  /// most-recent-first.
   Future<List<VaultLogEntry>> vaultEntries(FolderPair pair) =>
       _engine.vaultEntries(pair);
 
   /// Restores [entry]'s vaulted bytes back to their live path.
   ///
-  /// The CURRENT live file (if any) is itself vaulted first — same
-  /// best-effort, never-block-on-failure vaulting `_replacePartWithFinal`
-  /// already uses for incoming transfers — so a restore is itself
-  /// undoable, not a one-way trip.
-  ///
-  /// Writing the restored bytes is an ordinary filesystem write through
-  /// [_fs]: deliberately NOT special-cased anywhere in the sync engine (no
-  /// direct Index DB write, no version-vector bump here, nothing in
-  /// scanner.dart/engine.dart's reconcile logic/indexDiff/upsertLocal/
-  /// VersionVector touched). The next periodic scan (or the folder
-  /// watcher, usually much sooner) picks this up exactly like any other
-  /// local edit — same path as if the user had edited the file directly —
-  /// and propagates it to the peer as a normal sync.
-  Future<void> restoreVersion(FolderPair pair, VaultLogEntry entry) async {
-    final oldBytes = <int>[];
-    await for (final chunk in _fs.openRead(pair.localPath, entry.vaultPath)) {
-      oldBytes.addAll(chunk);
-    }
-
-    final currentStat = await _fs.stat(pair.localPath, entry.relPath);
-    if (currentStat != null) {
-      try {
-        final vaultPath = await _fs.moveToVault(pair.localPath, entry.relPath);
-        await _engine.recordVaultEvent(
-          pair,
-          VaultLogEntry(
-            relPath: entry.relPath,
-            vaultPath: vaultPath,
-            timestamp: DateTime.now(),
-            sizeBytes: currentStat.size,
-          ),
-        );
-      } catch (_) {
-        // Best-effort — proceed with the restore even if vaulting the
-        // about-to-be-replaced file failed; matches
-        // _replacePartWithFinal's existing never-block-on-vault-failure
-        // behavior.
-      }
-    }
-
-    await _fs.write(pair.localPath, entry.relPath, oldBytes);
-
-    // The just-restored vault copy is now redundant (its bytes are live
-    // again) — tidy it up. Best-effort: a failure here just leaves a
-    // harmless extra copy in .syncversions/ and a stale log row: neither
-    // affects sync correctness, since .syncversions/ is already excluded
-    // from the scanner's index.
-    try {
-      await _fs.delete(pair.localPath, entry.vaultPath);
-    } catch (_) {}
-    try {
-      await _engine.removeVaultEntry(pair, entry);
-    } catch (_) {}
-
+  /// The engine holds the pair's scan guard from the filesystem write through
+  /// index resurrection, so a watcher cannot mistake the restored bytes for
+  /// an orphan belonging to the previous tombstone.
+  Future<RestoreResult> restoreVersion(
+    FolderPair pair,
+    VaultLogEntry entry,
+  ) async {
+    final result = await _engine.restoreVaultEntry(pair, entry);
     notifyListeners();
+    return result;
+  }
+
+  Future<VaultDeletionResult> deleteVaultEntries(
+    FolderPair pair,
+    Iterable<VaultLogEntry> entries,
+  ) async {
+    final result = await _engine.deleteVaultEntries(pair, entries);
+    notifyListeners();
+    return result;
   }
 
   Future<void> removeFolderPair(String id) async {
@@ -1528,6 +1576,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _dashboardStates.remove(deviceId);
     await _config.removeDeviceStatusSnapshot(deviceId);
     await _config.forgetPeer(deviceId);
+    await _transferReceipts?.deleteByPeer(deviceId);
     _applyBeaconMode();
     notifyListeners();
   }
@@ -1994,23 +2043,22 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  /// Phone UI → host: send a named command to every connected peer.
+  /// Phone UI → host: send a named command to one explicitly selected peer.
   /// The PC peer validates the name against its allowlist and executes it only
   /// if remote control is enabled there. Engine-safe: sends a plain
   /// [Msg.runCommand] frame; never touches the sync engine's state.
-  Future<void> sendRemoteCommand(String name) async {
-    final peerIds = _registry.readyPeerIds.toList();
-    if (peerIds.isEmpty) return;
+  Future<void> sendRemoteCommand(
+    String name, {
+    required String targetPeerId,
+  }) async {
+    final session = _registry.openSessionFor(targetPeerId);
+    if (session == null || !session.isLinkReady) return;
     final frame = <String, dynamic>{'t': Msg.runCommand, 'name': name};
-    for (final peerId in peerIds) {
-      final session = _registry.openSessionFor(peerId);
-      if (session == null) continue;
-      try {
-        session.send(frame);
-      } catch (e) {
-        Diag.log('remote_cmd_send_error',
-            fields: {'name': name, 'peer': peerId, 'error': '$e'});
-      }
+    try {
+      session.send(frame);
+    } catch (e) {
+      Diag.log('remote_cmd_send_error',
+          fields: {'name': name, 'peer': targetPeerId, 'error': '$e'});
     }
   }
 
@@ -2241,6 +2289,25 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     });
   }
 
+  void openNotificationSettings() {
+    if (!Platform.isAndroid) return;
+    _chSync.invokeMethod<void>('openNotificationSettings').catchError(
+      (Object e) {
+        Diag.log(
+          'notification_settings_error',
+          fields: {'error': e.toString()},
+        );
+      },
+    );
+  }
+
+  Future<void> requestBluetoothPermissions() async {
+    if (!Platform.isAndroid) return;
+    await _bluetooth?.requestPermissions();
+  }
+
+  int get listenerPort => _connections.listenPort;
+
   Future<void> setBluetoothEnabled(bool enabled) async {
     await _config.setBluetoothEnabled(enabled);
     if (enabled) {
@@ -2276,6 +2343,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// every live pair so drift accrued while paused is caught up.
   void resumeSync() {
     _engine.resumeSync();
+    notifyListeners();
+  }
+
+  Future<void> setOnboardingVersion(int version) async {
+    await _config.setOnboardingVersion(version);
     notifyListeners();
   }
 

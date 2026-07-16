@@ -75,10 +75,11 @@ class DesktopTray with TrayListener {
   /// Install the close-to-tray guard + tray icon. Call once after the app is
   /// running (e.g. from the Dashboard's first frame). Idempotent.
   Future<void> init() async {
+    final closeHandler = _CloseHandler(_context);
     await windowManager.ensureInitialized();
     await windowManager.setPreventClose(true);
     windowManager.setAspectRatio(0); // allow free resize
-    windowManager.addListener(_CloseHandler(_context));
+    windowManager.addListener(closeHandler);
 
     // Restore window bounds if saved. Skip if a send-widget entry is already
     // under way and has flagged the window as off-limits — otherwise this
@@ -211,7 +212,7 @@ class DesktopTray with TrayListener {
 
   @override
   void onTrayIconRightMouseDown() {
-    trayManager.popUpContextMenu(bringAppToFront: true);
+    trayManager.popUpContextMenu();
   }
 }
 
@@ -224,6 +225,7 @@ class _CloseHandler extends WindowListener {
 
   @override
   void onWindowClose() async {
+    final state = !_shownTrayHint ? _context.read<AppState>() : null;
     // Hide instead of destroy. The process — and therefore the sync engine —
     // stays alive in the background. A future "Show" (tray) or app re-launch
     // re-surfaces it.
@@ -234,9 +236,8 @@ class _CloseHandler extends WindowListener {
     if (!_shownTrayHint) {
       _shownTrayHint = true;
       try {
-        final state = _context.read<AppState>();
         await trayManager.setToolTip('Conduit is still running here.\n'
-            '${state.identity.name} (${state.identity.deviceId})');
+            '${state!.identity.name} (${state.identity.deviceId})');
       } catch (_) {}
     }
   }

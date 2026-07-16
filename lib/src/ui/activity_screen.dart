@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../sync/engine.dart';
 import 'glass.dart';
+import 'transfer_history_screen.dart';
 
 enum _FilterType { user, all, warnings }
 
@@ -106,7 +107,8 @@ class _ActivityScreenState extends State<ActivityScreen> {
                             child: Row(
                               children: [
                                 IconButton(
-                                  icon: const Icon(Icons.arrow_back_ios_new_rounded),
+                                  icon: const Icon(
+                                      Icons.arrow_back_ios_new_rounded),
                                   color: c.textPrimary,
                                   iconSize: 20,
                                   onPressed: () => Navigator.pop(context),
@@ -115,7 +117,7 @@ class _ActivityScreenState extends State<ActivityScreen> {
                                 Expanded(
                                   child: Text(
                                     'Activity',
-                                    style: GoogleFonts.manrope(
+                                    style: AppTypography.manrope(
                                       textStyle: TextStyle(
                                         color: c.textPrimary,
                                         fontSize: 22,
@@ -157,13 +159,22 @@ class _ActivityScreenState extends State<ActivityScreen> {
                           icon: _filter == _FilterType.warnings
                               ? Icons.warning_amber_rounded
                               : null,
-                          accentColor: _filter == _FilterType.warnings
-                              ? c.amber
-                              : null,
+                          accentColor:
+                              _filter == _FilterType.warnings ? c.amber : null,
                           onTap: () =>
                               setState(() => _filter = _FilterType.warnings),
                         ),
                       ],
+                    ),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => const TransferHistoryScreen(),
+                        ),
+                      ),
+                      icon: const Icon(Icons.receipt_long_outlined),
+                      label: const Text('Transfer receipts'),
                     ),
                     const SizedBox(height: 16),
                   ],

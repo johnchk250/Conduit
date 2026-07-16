@@ -418,10 +418,10 @@ void main() {
         sync.setEnabled(true);
         // Connect peer and mark ready.
         registry.publish(_bobDeviceId, session);
-        
+
         // Trigger connectivity change event.
         sync.onPeerConnectivityChanged();
-        
+
         // Wait for microtasks to run (since sendCurrentClipboard is async).
         async.elapse(const Duration(milliseconds: 10));
 
@@ -450,14 +450,14 @@ void main() {
         );
 
         sync.setEnabled(true);
-        
+
         // Timer ticks. Broadcast fails due to exception.
         async.elapse(const Duration(milliseconds: 1500));
-        
+
         // Replace failing session with working session.
         final workingSession = _FakeSession();
         registry.publish(_bobDeviceId, workingSession);
-        
+
         // Wait for next timer tick. Since the previous failed, it should retry.
         async.elapse(const Duration(milliseconds: 1500));
 
@@ -467,7 +467,8 @@ void main() {
       });
     });
 
-    test('successful broadcast marks as pushed (does not retry on next tick)', () {
+    test('successful broadcast marks as pushed (does not retry on next tick)',
+        () {
       fakeAsync((async) {
         final registry = PeerConnectionRegistry();
         final session = _FakeSession();
@@ -486,16 +487,16 @@ void main() {
         );
 
         sync.setEnabled(true);
-        
+
         // Timer ticks. Broadcast succeeds.
         async.elapse(const Duration(milliseconds: 1500));
         expect(session.sent, hasLength(1));
         expect(session.sent.single['text'], 'value');
-        
+
         // Next timer tick. Since it succeeded, it should NOT send again.
         async.elapse(const Duration(milliseconds: 1500));
         expect(session.sent, hasLength(1)); // Still just 1 sent message
-        
+
         sync.dispose();
       });
     });
@@ -506,11 +507,11 @@ void main() {
   // -------------------------------------------------------------------------
 
   group('ClipboardSync background write recovery', () {
-    _FakeClipboard _makeClipboard({String? initial}) {
+    _FakeClipboard makeClipboard({String? initial}) {
       return _FakeClipboard(initial: initial);
     }
 
-    ClipboardSync _makeSync({
+    ClipboardSync makeSync({
       required _FakeClipboard clipboard,
       bool Function()? isDesktopPlatform,
     }) {
@@ -534,8 +535,8 @@ void main() {
     test(
         'pendingRemoteText is null when clipboard write succeeds immediately (foreground)',
         () async {
-      final clip = _makeClipboard();
-      final sync = _makeSync(clipboard: clip);
+      final clip = makeClipboard();
+      final sync = makeSync(clipboard: clip);
       sync.setEnabled(true);
 
       // write will succeed because the fake clipboard always works
@@ -547,10 +548,9 @@ void main() {
       expect(await clip.read(), 'hello world');
     });
 
-    test(
-        'pendingRemoteText is set when the write call itself genuinely fails',
+    test('pendingRemoteText is set when the write call itself genuinely fails',
         () async {
-      final clip = _makeClipboard();
+      final clip = makeClipboard();
       // Simulate a genuine failure: the write call throws.
       final failingClip = _FailingWriteClipboard(delegate: clip);
       final registry = PeerConnectionRegistry();
@@ -581,7 +581,7 @@ void main() {
         'pendingRemoteText is cleared on a successful phone write even when '
         'a same-process readback would be denied (regression test for the '
         'false "clipboard blocked" notification — 2026-07-11)', () async {
-      final clip = _makeClipboard();
+      final clip = makeClipboard();
       final focusRestricted = _FocusRestrictedReadClipboard(delegate: clip);
       final registry = PeerConnectionRegistry();
       final session = _FakeSession();
@@ -614,7 +614,7 @@ void main() {
     });
 
     test('onResume commits the pending clipboard and clears it', () async {
-      final clip = _makeClipboard();
+      final clip = makeClipboard();
       final failingClip = _FailingWriteClipboard(delegate: clip);
       final registry = PeerConnectionRegistry();
       final session = _FakeSession();
@@ -642,13 +642,14 @@ void main() {
       await sync.onResume();
 
       expect(sync.pendingRemoteText, isNull,
-          reason: 'After successful resume write, pending text should be cleared');
+          reason:
+              'After successful resume write, pending text should be cleared');
       expect(await clip.read(), 'queued text',
           reason: 'The pending text must be written on resume');
     });
 
     test('setEnabled(false) clears any pending clipboard', () async {
-      final clip = _makeClipboard();
+      final clip = makeClipboard();
       final failingClip = _FailingWriteClipboard(delegate: clip);
       final registry = PeerConnectionRegistry();
       final session = _FakeSession();
@@ -675,7 +676,6 @@ void main() {
     });
   });
 }
-
 
 // ---------------------------------------------------------------------------
 // Fake clipboard helpers for background write tests

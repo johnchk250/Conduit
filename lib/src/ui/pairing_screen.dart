@@ -1,7 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -11,6 +11,7 @@ import '../core/config_store.dart';
 import '../net/discovery.dart';
 import '../net/transport.dart';
 import 'glass.dart';
+import 'device_detail_screen.dart';
 
 /// Fast 180 ms fade push for the QR scan sub-screen.
 PageRoute<T> _fadeRoute<T>(WidgetBuilder builder) => PageRouteBuilder<T>(
@@ -161,7 +162,7 @@ class _GlassSegmentedControl extends StatelessWidget {
                         child: Text(
                           segments[i],
                           overflow: TextOverflow.ellipsis,
-                          style: GoogleFonts.manrope(
+                          style: AppTypography.manrope(
                             textStyle: TextStyle(
                               fontSize: 12,
                               fontWeight: FontWeight.w600,
@@ -209,7 +210,7 @@ class _DiscoveredList extends StatelessWidget {
                 const SizedBox(height: 12),
                 Text(
                   'No paired devices yet',
-                  style: GoogleFonts.manrope(
+                  style: AppTypography.manrope(
                     textStyle: TextStyle(
                       color: c.textPrimary,
                       fontWeight: FontWeight.w700,
@@ -222,7 +223,7 @@ class _DiscoveredList extends StatelessWidget {
                   'Use a QR code or pair with a device discovered on this '
                   'network.',
                   textAlign: TextAlign.center,
-                  style: GoogleFonts.inter(
+                  style: AppTypography.inter(
                     textStyle: TextStyle(color: c.textSecondary, fontSize: 12),
                   ),
                 ),
@@ -240,6 +241,9 @@ class _DiscoveredList extends StatelessWidget {
               onReconnect: () => _reconnect(ctx, state, peer),
               onDisconnect: () => _confirmDisconnect(ctx, state, peer),
               onUnpair: () => _confirmUnpair(ctx, state, peer),
+              onOpen: () => Navigator.of(ctx).push(
+                _fadeRoute((_) => DeviceDetailScreen(peer: peer)),
+              ),
             ),
             const SizedBox(height: 10),
           ],
@@ -258,7 +262,7 @@ class _DiscoveredList extends StatelessWidget {
                 const SizedBox(height: 12),
                 Text(
                   'Looking for devices...',
-                  style: GoogleFonts.manrope(
+                  style: AppTypography.manrope(
                     textStyle: TextStyle(
                       color: c.textPrimary,
                       fontWeight: FontWeight.w700,
@@ -271,7 +275,7 @@ class _DiscoveredList extends StatelessWidget {
                   'Conduit checks LAN and Bluetooth. LAN is preferred; '
                   'Bluetooth is used automatically when LAN is unavailable.',
                   textAlign: TextAlign.center,
-                  style: GoogleFonts.inter(
+                  style: AppTypography.inter(
                     textStyle: TextStyle(color: c.textSecondary, fontSize: 12),
                   ),
                 ),
@@ -279,7 +283,7 @@ class _DiscoveredList extends StatelessWidget {
                 Text(
                   state.bluetoothStatus,
                   textAlign: TextAlign.center,
-                  style: GoogleFonts.inter(
+                  style: AppTypography.inter(
                     textStyle: TextStyle(
                       color: state.bluetoothStatusHealthy ? c.mint : c.amber,
                       fontSize: 11.5,
@@ -421,17 +425,17 @@ class _DiscoveredList extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'On ${peer.name}, open Conduit -> Devices -> "Pair manually", then enter the 6-digit code shown there.',
+              'On ${peer.name}, open Conduit -> Devices -> "Pair manually", then enter the one-time pairing secret shown there.',
               style: Theme.of(ctx).textTheme.bodySmall,
             ),
             const SizedBox(height: 16),
             TextField(
               controller: ctl,
-              keyboardType: TextInputType.number,
-              maxLength: 6,
+              keyboardType: TextInputType.text,
+              maxLength: 64,
               autofocus: true,
               decoration: const InputDecoration(
-                labelText: 'Pairing code',
+                labelText: 'One-time pairing secret',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -460,6 +464,7 @@ class _PairedPeerTile extends StatelessWidget {
     required this.onReconnect,
     required this.onDisconnect,
     required this.onUnpair,
+    required this.onOpen,
   });
 
   final PairedPeer peer;
@@ -469,6 +474,7 @@ class _PairedPeerTile extends StatelessWidget {
   final VoidCallback onReconnect;
   final VoidCallback onDisconnect;
   final VoidCallback onUnpair;
+  final VoidCallback onOpen;
 
   @override
   Widget build(BuildContext context) {
@@ -489,6 +495,7 @@ class _PairedPeerTile extends StatelessWidget {
       subtitle: '$platform · $status',
       subtitleDotColor: connected ? c.mint : c.textTertiary,
       subtitleLive: connected,
+      onTap: onOpen,
       // PopupMenuButton is an overlay/menu surface, same standard-Material
       // carve-out glass.dart's class doc gives dialogs/SnackBars/
       // BottomSheets — only its trigger icon is restyled to blend in.
@@ -550,7 +557,7 @@ class _ManualConnect extends StatelessWidget {
         Text(
           'Show this QR on the other device',
           textAlign: TextAlign.center,
-          style: GoogleFonts.manrope(
+          style: AppTypography.manrope(
             textStyle: TextStyle(
               color: c.textPrimary,
               fontWeight: FontWeight.w700,
@@ -561,7 +568,7 @@ class _ManualConnect extends StatelessWidget {
         const SizedBox(height: 8),
         Text(
           'Scan this QR code from the other device to connect automatically.',
-          style: GoogleFonts.inter(
+          style: AppTypography.inter(
             textStyle: TextStyle(color: c.textSecondary, fontSize: 13),
           ),
           textAlign: TextAlign.center,
@@ -693,13 +700,14 @@ class _ManualConnect extends StatelessWidget {
     return showDialog<String>(
       context: ctx,
       builder: (dctx) => AlertDialog(
-        title: const Text('Enter pairing code'),
+        title: const Text('Enter pairing secret'),
         content: TextField(
           controller: ctl,
-          keyboardType: TextInputType.number,
-          maxLength: 6,
+          keyboardType: TextInputType.text,
+          maxLength: 64,
           autofocus: true,
-          decoration: const InputDecoration(labelText: '6-digit code'),
+          decoration:
+              const InputDecoration(labelText: 'One-time pairing secret'),
         ),
         actions: [
           TextButton(

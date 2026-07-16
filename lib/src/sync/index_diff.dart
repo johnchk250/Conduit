@@ -6,12 +6,21 @@ import 'version_vector.dart';
 /// blockHashes for verification and resume).
 class Need {
   final IndexEntry peer;
+  final NeedReason reason;
 
-  Need(this.peer);
+  Need(this.peer, {required this.reason});
 
   String get relPath => peer.relPath;
   @override
   String toString() => 'Need(${peer.relPath}, ${peer.size}B)';
+}
+
+enum NeedReason {
+  missingLocally,
+  peerVersionNewer,
+  concurrentPeerWins,
+  equalVersionDifferentDiskBytes,
+  resurrection,
 }
 
 /// Compute the needs-queue for THIS device given the local and peer live
@@ -75,12 +84,12 @@ List<Need> indexDiff({
     if (mine == null) {
       // I don't have it at all (or only as a tombstone, which applyRemote
       // stores with deleted=1 and is excluded from liveSnapshot).
-      needs.add(Need(peer));
+      needs.add(Need(peer, reason: NeedReason.missingLocally));
       continue;
     }
     if (mine.deleted) {
       // Resurrection: peer has it live, my row is a tombstone.
-      needs.add(Need(peer));
+      needs.add(Need(peer, reason: NeedReason.resurrection));
       continue;
     }
     // Both live. "In sync" means my DISK bytes equal the peer's sha. We must
@@ -118,13 +127,20 @@ List<Need> indexDiff({
     // the unhashed fallback, we can't be sure the bytes actually differ, so
     // gate on size to avoid a fetch storm; the next scan resolves it.
     if (mine.sha256.isEmpty || peer.sha256.isEmpty) {
-      if (peer.size != mine.size) needs.add(Need(peer));
+      if (peer.size != mine.size) {
+        needs.add(Need(peer, reason: NeedReason.peerVersionNewer));
+      }
       continue;
     }
     // Both hashed, shas differ, peer version does not genuinely lose to mine.
     // If the peer strictly dominates or they are equal, we must fetch (no conflict).
     if (peer.version.dominates(mine.version) || peer.version == mine.version) {
-      needs.add(Need(peer));
+      needs.add(Need(
+        peer,
+        reason: peer.version == mine.version
+            ? NeedReason.equalVersionDifferentDiskBytes
+            : NeedReason.peerVersionNewer,
+      ));
       continue;
     }
     // CONCURRENT versions (neither dominates). Use a deterministic Last-Write-
@@ -140,7 +156,7 @@ List<Need> indexDiff({
     final peerWins = peer.mtime > mine.mtime ||
         (peer.mtime == mine.mtime && peer.sha256.compareTo(mineDiskSha) > 0);
     if (peerWins) {
-      needs.add(Need(peer));
+      needs.add(Need(peer, reason: NeedReason.concurrentPeerWins));
     }
     // else: we are the LWW winner — skip, the peer will fetch from us.
   }

@@ -1,7 +1,7 @@
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 
 /// Liquid-glass design tokens + shared widgets used across every screen.
 ///
@@ -245,7 +245,8 @@ Widget _specularLine(GlassColors c) {
                 colors: [
                   Colors.transparent,
                   c.glassHighlight.withValues(
-                      alpha: c.glassHighlight.a * 0.55), // ::before opacity:0.55
+                      alpha:
+                          c.glassHighlight.a * 0.55), // ::before opacity:0.55
                   Colors.transparent,
                 ],
               ),
@@ -300,7 +301,8 @@ Widget _glassSurface(
 }) {
   final c = GlassColors.of(context);
   final platform = Theme.of(context).platform;
-  final isMobile = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
+  final isMobile =
+      platform == TargetPlatform.android || platform == TargetPlatform.iOS;
   final useBlur = blur && !isMobile;
 
   final Gradient actualFill;
@@ -566,8 +568,7 @@ class GlassPanel extends StatelessWidget {
       padding: padding,
       sweep: ringColor != null,
       blur: blur,
-      borderOverride:
-          ringColor != null ? ringColor!.withValues(alpha: c.ringBorderAlpha) : null,
+      borderOverride: ringColor?.withValues(alpha: c.ringBorderAlpha),
       fillOverride: ringColor != null
           ? LinearGradient(
               begin: const Alignment(-0.3, -1),
@@ -602,7 +603,7 @@ class GlassSectionLabel extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(2, 0, 2, 12),
       child: Text(
         text.toUpperCase(),
-        style: GoogleFonts.manrope(
+        style: AppTypography.manrope(
           textStyle: TextStyle(
             color: c.textSecondary,
             fontSize: 13,
@@ -629,7 +630,7 @@ class GlassPageTitle extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(2, 0, 2, 22),
       child: Text(
         text,
-        style: GoogleFonts.manrope(
+        style: AppTypography.manrope(
           textStyle: TextStyle(
             color: c.textPrimary,
             fontSize: 30,
@@ -715,7 +716,8 @@ class GlassListTile extends StatelessWidget {
     final row = Row(
       children: [
         if (leadingIcon != null) ...[
-          _TileIconChip(icon: leadingIcon!, accent: accent, size: dense ? 34 : 38),
+          _TileIconChip(
+              icon: leadingIcon!, accent: accent, size: dense ? 34 : 38),
           const SizedBox(width: 14),
         ],
         Expanded(
@@ -727,7 +729,7 @@ class GlassListTile extends StatelessWidget {
                 title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: GoogleFonts.manrope(
+                style: AppTypography.manrope(
                   textStyle: TextStyle(
                     color: c.textPrimary,
                     fontSize: dense ? 13.5 : 14.5,
@@ -741,8 +743,7 @@ class GlassListTile extends StatelessWidget {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     if (subtitleDotColor != null) ...[
-                      _StatusDot(
-                          color: subtitleDotColor!, glow: subtitleLive),
+                      _StatusDot(color: subtitleDotColor!, glow: subtitleLive),
                       const SizedBox(width: 6),
                     ],
                     Flexible(
@@ -751,18 +752,17 @@ class GlassListTile extends StatelessWidget {
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: subtitleMono
-                            ? GoogleFonts.jetBrainsMono(
+                            ? AppTypography.jetBrainsMono(
                                 textStyle: TextStyle(
                                   color: c.textSecondary,
                                   fontSize: dense ? 10.5 : 11.5,
                                   letterSpacing: 0.2,
                                 ),
                               )
-                            : GoogleFonts.inter(
+                            : AppTypography.inter(
                                 textStyle: TextStyle(
-                                  color: subtitleLive
-                                      ? c.mint
-                                      : c.textSecondary,
+                                  color:
+                                      subtitleLive ? c.mint : c.textSecondary,
                                   fontSize: dense ? 11.5 : 12.5,
                                 ),
                               ),
@@ -824,7 +824,6 @@ class _TileIconChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final c = GlassColors.of(context);
     return Container(
       width: size,
       height: size,
@@ -908,7 +907,7 @@ class GlassStatusBanner extends StatelessWidget {
               children: [
                 Text(
                   title,
-                  style: GoogleFonts.manrope(
+                  style: AppTypography.manrope(
                     textStyle: TextStyle(
                       color: c.textPrimary,
                       fontWeight: FontWeight.w700,
@@ -920,7 +919,7 @@ class GlassStatusBanner extends StatelessWidget {
                   const SizedBox(height: 3),
                   Text(
                     subtitle!,
-                    style: GoogleFonts.inter(
+                    style: AppTypography.inter(
                       textStyle: TextStyle(
                         color: c.textSecondary,
                         fontSize: 13,
@@ -977,7 +976,7 @@ class GlassChip extends StatelessWidget {
           ],
           Text(
             label,
-            style: GoogleFonts.manrope(
+            style: AppTypography.manrope(
               textStyle: TextStyle(
                 color: accent,
                 fontSize: 11.5,
@@ -1208,7 +1207,10 @@ class GlassNavBar extends StatelessWidget {
                 ? Border.all(color: Colors.white.withValues(alpha: 0.12))
                 : null,
             boxShadow: active
-                ? [BoxShadow(color: c.violet.withValues(alpha: 0.35), blurRadius: 14)]
+                ? [
+                    BoxShadow(
+                        color: c.violet.withValues(alpha: 0.35), blurRadius: 14)
+                  ]
                 : null,
           ),
           child: Column(
@@ -1225,7 +1227,7 @@ class GlassNavBar extends StatelessWidget {
                 maxLines: 1,
                 softWrap: false,
                 overflow: TextOverflow.visible,
-                style: GoogleFonts.manrope(
+                style: AppTypography.manrope(
                   textStyle: TextStyle(
                     fontSize: 9.5,
                     fontWeight: FontWeight.w600,
@@ -1326,7 +1328,7 @@ class GlassNavRail extends StatelessWidget {
                 Expanded(
                   child: Text(
                     d.label,
-                    style: GoogleFonts.manrope(
+                    style: AppTypography.manrope(
                       textStyle: TextStyle(
                         fontSize: 12.5,
                         fontWeight: FontWeight.w600,

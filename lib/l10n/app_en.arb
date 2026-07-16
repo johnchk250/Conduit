@@ -1,0 +1,19 @@
+{
+  "@@locale": "en",
+  "appTitle": "Conduit",
+  "destinationHome": "Home",
+  "destinationFolders": "Folders",
+  "destinationDevices": "Devices",
+  "destinationRemote": "Remote",
+  "destinationSettings": "Settings",
+  "onboardingTitle": "Set up Conduit",
+  "connectionDoctorTitle": "Connection Doctor",
+  "pairedDeviceCount": "{count, plural, =0{No paired devices} =1{1 paired device} other{{count} paired devices}}",
+  "@pairedDeviceCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  }
+}

@@ -8,8 +8,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:conduit/main.dart';
+import 'package:conduit/src/ui/dashboard_screen.dart';
 
 void main() {
+  test('desktop and mobile share stable primary destinations', () {
+    expect(AppDestination.values, [
+      AppDestination.home,
+      AppDestination.folders,
+      AppDestination.devices,
+      AppDestination.remote,
+      AppDestination.settings,
+    ]);
+  });
+
   testWidgets('App builds and shows Overview', (WidgetTester tester) async {
     await tester.pumpWidget(const ConduitApp());
     // First frame only — don't pump the full AppState.start() pipeline,

@@ -1,6 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
 
 import '../core/config_store.dart';
 import '../core/identity.dart';
@@ -9,6 +13,7 @@ import '../protocol/wire.dart';
 import 'discovery.dart';
 import 'peer_registry.dart';
 import 'secure_frame.dart';
+import 'secure_handshake.dart';
 import 'transport.dart';
 import 'bluetooth_bridge.dart';
 
@@ -366,7 +371,8 @@ class PeerConnectionManager {
   }
 
   Future<void> stop() async {
-    for (final s in _active.values) {
+    // Closing can trigger a done callback that removes from [_active].
+    for (final s in _active.values.toList(growable: false)) {
       await s.close();
     }
     _active.clear();
@@ -394,13 +400,14 @@ class PeerConnectionManager {
   // where a message can arrive unowned: the handler is set BEFORE listen()
   // starts pumping the socket.
 
-  void _handleIncoming(Socket socket) {
+  void _handleIncoming(Socket socket) async {
     // Perf: mirror the client-side setting in connectMultiHost — whichever
     // side dialed, both ends of the socket should skip Nagle's algorithm.
     try {
       socket.setOption(SocketOption.tcpNoDelay, true);
     } catch (_) {}
     final codec = FrameCodec(socket);
+    final secureOffer = await SecureHandshake.createOffer();
     // Temp handshake handler. Owns all messages until hello/welcome completes,
     // then _publishSession hands the codec to PeerSession and the engine
     // reassigns onMessage.
@@ -408,7 +415,7 @@ class PeerConnectionManager {
       final type = msg['t'] as String?;
       if (type == Msg.hello) {
         try {
-          await _onHello(socket, codec, msg);
+          await _onHello(socket, codec, secureOffer, msg);
         } catch (e, st) {
           // ignore: avoid_print
           print('[Conduit] _onHello failed: $e\n$st');
@@ -429,14 +436,26 @@ class PeerConnectionManager {
   }
 
   Future<void> _onHello(
-      Socket socket, FrameCodec codec, Map<String, dynamic> hello) async {
+    Socket socket,
+    FrameCodec codec,
+    SecureHandshakeOffer secureOffer,
+    Map<String, dynamic> hello,
+  ) async {
     final incoming = resolveIncomingTransport?.call(socket.remotePort) ??
         const IncomingTransport(ConnectionTransport.lan);
     final peerDeviceId = hello['deviceId'] as String;
     final peerName = hello['name'] as String;
     final peerPlatform = hello['platform'] as String;
     final peerPubKey = hello['pubKey'] as String;
-    final pairCode = hello['pairCode'] as String?;
+    if (hello['secureVersion'] != secureTransportVersion) {
+      codec.send({
+        't': Msg.error,
+        'message':
+            'This device uses an older insecure Conduit protocol. Update Conduit on both devices.',
+      });
+      await socket.close();
+      return;
+    }
 
     final known = config.pairedPeers.firstWhere(
       (p) => p.deviceId == peerDeviceId,
@@ -454,7 +473,13 @@ class PeerConnectionManager {
 
     if (!isAlreadyPaired) {
       final pending = _pendingIncomingPairCode;
-      if (pairCode == null || pending == null || pairCode != pending.code) {
+      final proof = hello['pairingProof'] as String?;
+      if (pending == null ||
+          proof == null ||
+          !_constantTimeEquals(
+            proof,
+            _pairingProof(pending.code, hello),
+          )) {
         codec.send({
           't': Msg.error,
           'message': 'pairing required: wrong/missing code'
@@ -474,7 +499,6 @@ class PeerConnectionManager {
         await socket.close();
         return;
       }
-      _pendingIncomingPairCode = null;
     } else {
       if (peerPubKey != known.publicKeyB64) {
         codec.send({'t': Msg.error, 'message': 'pinned pubkey mismatch'});
@@ -537,14 +561,48 @@ class PeerConnectionManager {
     }
     final features = (hello['features'] as List?)?.cast<String>().toList() ??
         const <String>[];
-    codec.send({
+    final welcome = <String, dynamic>{
       't': Msg.welcome,
       'deviceId': identity.deviceId,
       'name': identity.name,
       'platform': identity.platform,
       'pubKey': identity.publicKeyB64,
-      'features': ['device_status_v1', 'phone_alert_v1'],
-    });
+      'features': [
+        'device_status_v1',
+        'phone_alert_v1',
+        'transfer_receipt_v1',
+      ],
+      ...secureOffer.toJson(),
+    };
+    final transcript = SecureHandshake.transcript(
+      initiator: hello,
+      responder: welcome,
+    );
+    welcome['signature'] = SecureHandshake.sign(identity, transcript);
+    codec.send(welcome);
+
+    final finish = await waitForMessage(codec, 'secure_finish',
+        timeout: const Duration(seconds: 10));
+    if (!SecureHandshake.verify(
+      identity,
+      transcript,
+      finish['signature'] as String,
+      peerPubKey,
+    )) {
+      throw StateError('secure handshake signature mismatch');
+    }
+    final keys = await SecureHandshake.deriveKeys(
+      local: secureOffer,
+      remoteEphemeralKey: hello['ephemeralKey'] as String,
+      transcriptHash: transcript,
+      initiator: false,
+    );
+    codec.send({'t': 'secure_switch'});
+    codec.enableSecurity(keys);
+    await waitForMessage(codec, 'secure_confirm',
+        timeout: const Duration(seconds: 10));
+    codec.send({'t': 'secure_confirmed'});
+    if (!isAlreadyPaired) _pendingIncomingPairCode = null;
 
     final peer = PairedPeer(
       deviceId: peerDeviceId,
@@ -612,7 +670,7 @@ class PeerConnectionManager {
   // ---- Pairing code (incoming side) --------------------------------------
 
   String armPairingFor(DiscoveredPeer peer) {
-    final code = (_rand.nextInt(900000) + 100000).toString();
+    final code = _newPairingSecret();
     _pendingIncomingPairCode = _PendingPairCode(
       code: code,
       boundPubKey: peer.publicKeyB64,
@@ -622,13 +680,21 @@ class PeerConnectionManager {
   }
 
   String armGenericPairing() {
-    final code = (_rand.nextInt(900000) + 100000).toString();
+    final code = _newPairingSecret();
     _pendingIncomingPairCode = _PendingPairCode(
       code: code,
       boundPubKey: null,
       expiresAt: DateTime.now().add(_pairCodeTtl),
     );
     return code;
+  }
+
+  String _newPairingSecret() {
+    final bytes = Uint8List(32);
+    for (var i = 0; i < bytes.length; i++) {
+      bytes[i] = _rand.nextInt(256);
+    }
+    return base64UrlEncode(bytes).replaceAll('=', '');
   }
 
   // ---- Client side (connect out) -----------------------------------------
@@ -770,6 +836,7 @@ class PeerConnectionManager {
     String? transportEndpoint,
   }) async {
     final codec = FrameCodec(socket);
+    final secureOffer = await SecureHandshake.createOffer();
 
     final hello = <String, dynamic>{
       't': Msg.hello,
@@ -777,9 +844,16 @@ class PeerConnectionManager {
       'name': identity.name,
       'platform': identity.platform,
       'pubKey': identity.publicKeyB64,
-      'features': ['device_status_v1', 'phone_alert_v1'],
+      'features': [
+        'device_status_v1',
+        'phone_alert_v1',
+        'transfer_receipt_v1',
+      ],
+      ...secureOffer.toJson(),
     };
-    if (pairCode != null) hello['pairCode'] = pairCode;
+    if (pairCode != null) {
+      hello['pairingProof'] = _pairingProof(pairCode, hello);
+    }
     if (forceTakeover && isPaired) hello['takeover'] = true;
 
     // Listen FIRST (so onDone/onError are wired), then set a temp onMessage
@@ -794,6 +868,23 @@ class PeerConnectionManager {
     codec.send(hello);
 
     final welcome = await waitForMessage(codec, Msg.welcome, timeout: timeout);
+    if (welcome['secureVersion'] != secureTransportVersion) {
+      throw StateError(
+        'This device uses an older insecure Conduit protocol. Update Conduit on both devices.',
+      );
+    }
+    final transcript = SecureHandshake.transcript(
+      initiator: hello,
+      responder: welcome,
+    );
+    if (!SecureHandshake.verify(
+      identity,
+      transcript,
+      welcome['signature'] as String,
+      welcome['pubKey'] as String,
+    )) {
+      throw StateError('secure handshake signature mismatch');
+    }
     final features = (welcome['features'] as List?)?.cast<String>().toList() ??
         const <String>[];
     final peer = PairedPeer(
@@ -812,6 +903,21 @@ class PeerConnectionManager {
         throw StateError('paired peer identity mismatch');
       }
     }
+
+    codec.send({
+      't': 'secure_finish',
+      'signature': SecureHandshake.sign(identity, transcript),
+    });
+    final keys = await SecureHandshake.deriveKeys(
+      local: secureOffer,
+      remoteEphemeralKey: welcome['ephemeralKey'] as String,
+      transcriptHash: transcript,
+      initiator: true,
+    );
+    await waitForMessage(codec, 'secure_switch', timeout: timeout);
+    codec.enableSecurity(keys);
+    codec.send({'t': 'secure_confirm'});
+    await waitForMessage(codec, 'secure_confirmed', timeout: timeout);
 
     if (!isPaired) {
       await config.rememberPeer(peer);
@@ -837,4 +943,25 @@ class PeerConnectionManager {
   }
 
   PeerSession? sessionFor(String deviceId) => _active[deviceId];
+}
+
+String _pairingProof(String secret, Map<String, dynamic> hello) {
+  final input = utf8.encode(jsonEncode({
+    'deviceId': hello['deviceId'],
+    'pubKey': hello['pubKey'],
+    'ephemeralKey': hello['ephemeralKey'],
+    'secureNonce': hello['secureNonce'],
+    'secureVersion': hello['secureVersion'],
+  }));
+  return base64Encode(Hmac(sha256, utf8.encode(secret)).convert(input).bytes);
+}
+
+bool _constantTimeEquals(String left, String right) {
+  final a = utf8.encode(left);
+  final b = utf8.encode(right);
+  var difference = a.length ^ b.length;
+  for (var i = 0; i < a.length || i < b.length; i++) {
+    difference |= a[i % a.length] ^ b[i % b.length];
+  }
+  return difference == 0;
 }

@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 
 import 'glass.dart';
 import 'send_flow_view.dart';
@@ -41,7 +41,7 @@ class SendPanel extends StatelessWidget {
                     Expanded(
                       child: Text(
                         'Send',
-                        style: GoogleFonts.manrope(
+                        style: AppTypography.manrope(
                           textStyle: TextStyle(
                             color: c.textPrimary,
                             fontSize: 22,

@@ -16,7 +16,8 @@ REM       print() output (the VM service that forwards it isn't attached).
 REM       Profile mode keeps near-release perf WITH the diag stream.
 REM ==========================================================================
 setlocal
-set "PATH=C:\Users\Administrator\flutter\bin;%PATH%"
+set "GRADLE_USER_HOME=E:\Developer\Gradle"
+set "PATH=E:\Developer\flutter\bin;%PATH%"
 cd /d "%~dp0"
 if not exist logs mkdir logs
 

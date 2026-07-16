@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../core/identity.dart';
+import 'secure_handshake.dart';
 import 'transport.dart';
 
 /// A peer discovered on the local network.
@@ -134,6 +135,7 @@ class Discovery {
   void _broadcast() {
     final payload = jsonEncode({
       'v': 1,
+      'secureTransportVersion': secureTransportVersion,
       'deviceId': self.deviceId,
       'name': self.name,
       'platform': self.platform,
@@ -206,6 +208,7 @@ class Discovery {
         .toList();
     return jsonEncode({
       'v': 1,
+      'secureTransportVersion': secureTransportVersion,
       'type': 'conduit-connect',
       'deviceId': self.deviceId,
       'name': self.name,

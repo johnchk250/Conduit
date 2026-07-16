@@ -352,6 +352,16 @@ class ConfigStore {
     await _persist();
   }
 
+  /// Versioned first-run state. A version allows later releases to introduce
+  /// only newly required setup instead of replaying the complete wizard.
+  int get onboardingVersion =>
+      (_data['onboardingVersion'] as num?)?.toInt() ?? 0;
+
+  Future<void> setOnboardingVersion(int value) async {
+    _data['onboardingVersion'] = value;
+    await _persist();
+  }
+
   /// Stored device status snapshots for offline staleness reference.
   Map<String, dynamic> get deviceStatusSnapshots {
     final snapshots = _data['deviceStatusSnapshots'];

@@ -286,6 +286,11 @@ Future<void> _replacePartWithFinal(
       // matching pre-existing behavior when vaulting isn't possible.
     }
   }
+  if (fs is TemporaryFileFinalizer) {
+    await (fs as TemporaryFileFinalizer)
+        .replaceFromTemporary(rootPath, partRel, relPath);
+    return;
+  }
   final bytes = await _readAll(fs, rootPath, partRel);
   await fs.write(rootPath, relPath, bytes);
   await fs.delete(rootPath, partRel);

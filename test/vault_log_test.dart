@@ -30,6 +30,10 @@ void main() {
       vaultPath: '.syncversions/docs/report.2026-07-11T12-00-00.docx',
       timestamp: DateTime.utc(2026, 7, 11, 12),
       sizeBytes: 12345,
+      reason: VaultReason.peerDelete,
+      sourcePeerId: 'peer',
+      originalSha256: 'abc',
+      restoredAt: DateTime.utc(2026, 7, 12),
     );
     await log.record(entry);
 
@@ -39,6 +43,38 @@ void main() {
     expect(all.single.vaultPath, entry.vaultPath);
     expect(all.single.timestamp, entry.timestamp);
     expect(all.single.sizeBytes, entry.sizeBytes);
+    expect(all.single.reason, VaultReason.peerDelete);
+    expect(all.single.sourcePeerId, 'peer');
+    expect(all.single.originalSha256, 'abc');
+    expect(all.single.restoredAt, DateTime.utc(2026, 7, 12));
+  });
+
+  test('old JSON without optional fields remains readable', () async {
+    final log = await VaultLog.open('pairA', tempRoot);
+    final file = File(p.join(tempRoot.path, 'vault_log', 'pairA.json'));
+    await file.writeAsString(
+      '[{"relPath":"a.txt","vaultPath":".syncversions/a.txt",'
+      '"timestamp":"2026-07-11T12:00:00Z","sizeBytes":4}]',
+    );
+    final entry = (await log.all()).single;
+    expect(entry.reason, VaultReason.incomingOverwrite);
+    expect(entry.sourcePeerId, isNull);
+  });
+
+  test('markRestored keeps the catalog entry and source identity', () async {
+    final log = await VaultLog.open('pairA', tempRoot);
+    final entry = VaultLogEntry(
+      relPath: 'a.txt',
+      vaultPath: '.syncversions/a.txt',
+      timestamp: DateTime.utc(2026, 7, 11),
+      sizeBytes: 4,
+      reason: VaultReason.peerDelete,
+    );
+    await log.record(entry);
+    await log.markRestored(entry.entryId, DateTime.utc(2026, 7, 12));
+    final restored = (await log.all()).single;
+    expect(restored.entryId, entry.entryId);
+    expect(restored.restoredAt, DateTime.utc(2026, 7, 12));
   });
 
   test('all() returns entries most-recent-first', () async {

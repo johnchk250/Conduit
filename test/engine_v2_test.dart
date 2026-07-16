@@ -177,8 +177,8 @@ void main() {
   });
 
   test(
-      '_handleIndexFrame merges a peer index, advances the watermark, and ' +
-          'kicks a reconcile that fetches the file', () async {
+      '_handleIndexFrame merges a peer index, advances the watermark, and '
+      'kicks a reconcile that fetches the file', () async {
     // Bob has a file Alice lacks. Delivering Bob's advertisement to Alice must
     // merge it into _peerLive, advance _peerSeq, and kick a reconcile that
     // fetches the block from Bob. This is the full V2 happy path on one side.

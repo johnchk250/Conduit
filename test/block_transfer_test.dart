@@ -118,6 +118,27 @@ void main() {
     expect(clientFs.files['big.bin'], content);
   });
 
+  test('completed fetch uses the filesystem fast-finalize hook', () async {
+    final content = bytes(4096);
+    final serverFs = FakeFs({'fast.bin': content});
+    final clientFs = _FastFinalizeFs({});
+
+    final b = bridge(serverFs: serverFs, relPath: 'fast.bin');
+    await fetchFileBlockLevel(
+      fs: clientFs,
+      rootPath: 'r',
+      relPath: 'fast.bin',
+      expectedSize: content.length,
+      expectedSha: sha(content),
+      blockHashes: blockHashesFor(content),
+      sendRequest: b.sendRequest,
+    );
+
+    expect(clientFs.finalizeCalls, 1);
+    expect(clientFs.files['fast.bin'], content);
+    expect(clientFs.files.containsKey('fast.bin$syncPartSuffix'), isFalse);
+  });
+
   test(
       'fetching a file that already exists locally vaults the old bytes '
       'under .syncversions/ and lands the new bytes at the live path '
@@ -198,8 +219,7 @@ void main() {
 
   test(
       'pipelining keeps up to pipelineDepth requests outstanding at once '
-      'instead of waiting for each response before sending the next',
-      () async {
+      'instead of waiting for each response before sending the next', () async {
     // A hand-rolled sendRequest (not the bridge helper) so the test controls
     // exactly when each response "arrives", to prove requests 2..depth are
     // sent before request 1's response is ever supplied — the actual
@@ -308,10 +328,10 @@ void main() {
     final requestedOffsets = <int>[];
     final serverFs = FakeFs({'a.txt': content});
     final b = bridge(serverFs: serverFs, relPath: 'a.txt');
-    final instrumented = (Map<String, dynamic> req) async {
+    Future<Map<String, dynamic>?> instrumented(Map<String, dynamic> req) async {
       requestedOffsets.add((req['offset'] as num).toInt());
       return b.sendRequest(req);
-    };
+    }
 
     await fetchFileBlockLevel(
       fs: clientFs,
@@ -470,8 +490,9 @@ class FakeFs implements FileSystemAccess {
 
   /// Was dead code (`throw UnsupportedError`) before Phase 6.4 wired
   /// `moveToVault` into `_replacePartWithFinal`. In-memory mirror of the
-  /// real implementations' naming convention (`.syncversions/<dir>/<base>.
-  /// <stamp>.<ext>`) — a monotonic counter stands in for the real
+  /// real implementations' naming convention
+  /// (`.syncversions/<dir>/<base>.<stamp>.<ext>`) — a monotonic counter stands
+  /// in for the real
   /// timestamp so vault destinations stay unique within a single test
   /// without depending on wall-clock resolution.
   int _vaultCounter = 0;
@@ -506,5 +527,25 @@ class _FailingVaultFs extends FakeFs {
   @override
   Future<String> moveToVault(String rootPath, String relPath) async {
     throw StateError('simulated vault failure');
+  }
+}
+
+class _FastFinalizeFs extends FakeFs implements TemporaryFileFinalizer {
+  _FastFinalizeFs([super.initial]);
+
+  int finalizeCalls = 0;
+
+  @override
+  Future<void> replaceFromTemporary(
+    String rootPath,
+    String temporaryRelPath,
+    String destinationRelPath,
+  ) async {
+    finalizeCalls++;
+    final bytes = files.remove(temporaryRelPath);
+    if (bytes == null) {
+      throw StateError('missing temporary file: $temporaryRelPath');
+    }
+    files[destinationRelPath] = bytes;
   }
 }

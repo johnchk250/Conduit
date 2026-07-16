@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "name": "Conduit Windows-to-Android P1 smoke run",
+  "steps": [
+    {"id": "launch_clean", "result": null},
+    {"id": "pair_devices", "result": null},
+    {"id": "create_saf_folder_pair", "result": null},
+    {"id": "transfer_small_file", "result": null},
+    {"id": "transfer_multiblock_file", "result": null},
+    {"id": "background_android_during_transfer", "result": null},
+    {"id": "disable_restore_wifi", "result": null},
+    {"id": "restart_both_apps", "result": null},
+    {"id": "verify_hash_history_deletion", "result": null},
+    {"id": "export_sanitized_diagnostics", "result": null}
+  ],
+  "artifacts": {
+    "windowsDiagnostics": null,
+    "androidDiagnostics": null,
+    "notes": null
+  }
+}

@@ -15,6 +15,7 @@ import 'package:conduit/src/storage/index_db.dart';
 import 'package:conduit/src/sync/engine.dart';
 import 'package:conduit/src/sync/manifest.dart';
 import 'package:conduit/src/sync/version_vector.dart';
+import 'package:conduit/src/sync/vault_log.dart';
 
 /// Regression tests for Bug #6: a delete on side A created a tombstone that
 /// travelled to side B and landed in B's DB, but B NEVER removed the file from
@@ -83,6 +84,47 @@ void main() {
             'disk, not just recorded in the DB.');
     final row = await h.aliceDb.get('doomed.txt');
     expect(row!.deleted, isTrue);
+    final history = await h.alice.vaultEntries(h.pair);
+    expect(history.single.reason, VaultReason.peerDelete);
+    expect(history.single.sourcePeerId, _peer);
+
+    // Restore and index resurrection happen under one scan guard.
+    final restoredBytes = h.aliceFs.files[history.single.vaultPath]!;
+    final writeStarted = Completer<void>();
+    final releaseWrite = Completer<void>();
+    h.aliceFs.pauseNextWrite(writeStarted, releaseWrite.future);
+    final restore = h.alice.restoreVaultEntry(h.pair, history.single);
+    await writeStarted.future;
+    final duringRestoreDelivery = h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': [tombstone.toJson()],
+      'fromSequence': 0,
+    });
+    releaseWrite.complete();
+    final restoreResult = await restore;
+    await duringRestoreDelivery;
+    expect(restoreResult, RestoreResult.restoredAndQueued);
+    final restoredRow = (await h.aliceDb.get('doomed.txt'))!;
+    expect(restoredRow.deleted, isFalse);
+    expect(restoredRow.version.dominates(tombstone.version), isTrue);
+    expect(restoredRow.localSha, sha256.convert(restoredBytes).toString());
+    expect(h.aliceFs.files.containsKey(history.single.vaultPath), isTrue,
+        reason: 'restore must keep the source recovery copy');
+
+    // The peer may retransmit the old tombstone before it learns about the
+    // resurrection. It is stale and must not delete the restored file again.
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': [tombstone.toJson()],
+      'fromSequence': 0,
+    });
+    await h.pump();
+    expect(h.aliceFs.files['doomed.txt'], restoredBytes);
+    expect((await h.aliceDb.get('doomed.txt'))!.deleted, isFalse);
   });
 
   test('concurrent local edit WINS over the delete (file is kept)', () async {
@@ -392,6 +434,17 @@ class FakeFs implements FileSystemAccess {
     if (initial != null) files.addAll(initial);
   }
   final Map<String, List<int>> files = {};
+  int _vaultSequence = 0;
+  Completer<void>? _nextWriteStarted;
+  Future<void>? _nextWriteRelease;
+
+  void pauseNextWrite(
+    Completer<void> started,
+    Future<void> release,
+  ) {
+    _nextWriteStarted = started;
+    _nextWriteRelease = release;
+  }
 
   @override
   bool get isAndroidSAF => false;
@@ -416,8 +469,15 @@ class FakeFs implements FileSystemAccess {
   }
 
   @override
-  Future<void> write(String rootPath, String relPath, List<int> data) async =>
-      files[relPath] = List<int>.of(data);
+  Future<void> write(String rootPath, String relPath, List<int> data) async {
+    final started = _nextWriteStarted;
+    final release = _nextWriteRelease;
+    _nextWriteStarted = null;
+    _nextWriteRelease = null;
+    started?.complete();
+    if (release != null) await release;
+    files[relPath] = List<int>.of(data);
+  }
 
   @override
   Future<void> append(String rootPath, String relPath, List<int> data) async =>
@@ -428,6 +488,11 @@ class FakeFs implements FileSystemAccess {
       files.remove(relPath) != null;
 
   @override
-  Future<String> moveToVault(String rootPath, String relPath) async =>
-      throw UnsupportedError('not used by delete-propagation tests');
+  Future<String> moveToVault(String rootPath, String relPath) async {
+    final data = files.remove(relPath);
+    if (data == null) throw StateError('source missing');
+    final vaultPath = '.syncversions/$relPath.${_vaultSequence++}';
+    files[vaultPath] = data;
+    return vaultPath;
+  }
 }

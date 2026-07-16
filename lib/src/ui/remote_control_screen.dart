@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'typography.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
+import '../core/config_store.dart';
+import '../net/transport.dart';
 import 'glass.dart';
 
 /// Remote Control screen (Roadmap Phase 4).
@@ -22,13 +24,18 @@ class RemoteControlScreen extends StatefulWidget {
 
 class _RemoteControlScreenState extends State<RemoteControlScreen> {
   String? _lastSent;
+  String? _selectedPeerId;
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
     final c = GlassColors.of(context);
     final isAndroid = state.identity.platform == 'android';
-    final hasPeer = state.connectedPeers.isNotEmpty;
+    final connectedPcs = state.connectedPeers
+        .where((peer) => peer.platform == 'windows')
+        .toList(growable: false);
+    final selectedPeer = _selectedPeer(connectedPcs);
+    final hasPeer = selectedPeer != null;
     final remoteEnabled = state.remoteControlEnabled;
     final canSend = isAndroid && hasPeer;
 
@@ -52,8 +59,10 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
       bannerIcon = Icons.phonelink_off_rounded;
       bannerAccent = c.textTertiary;
     } else {
-      bannerTitle = 'Connected to ${state.connectedPeers.first.name}';
-      bannerSubtitle = 'Remote control active';
+      bannerTitle = 'Controlling ${selectedPeer.name}';
+      bannerSubtitle = connectedPcs.length > 1
+          ? 'Commands are sent only to the selected PC'
+          : 'Commands are sent only to this PC';
       bannerIcon = Icons.phonelink_rounded;
       bannerAccent = c.mint;
     }
@@ -76,6 +85,49 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
             ),
             const SizedBox(height: 10),
 
+            if (isAndroid && connectedPcs.isNotEmpty) ...[
+              GlassPanel(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      'Command destination',
+                      style: AppTypography.manrope(
+                        textStyle: TextStyle(
+                          color: c.textPrimary,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    DropdownButtonFormField<String>(
+                      key: ValueKey(selectedPeer!.deviceId),
+                      initialValue: selectedPeer.deviceId,
+                      decoration: const InputDecoration(
+                        labelText: 'Selected PC',
+                        prefixIcon: Icon(Icons.computer_rounded),
+                      ),
+                      items: connectedPcs
+                          .map(
+                            (peer) => DropdownMenuItem(
+                              value: peer.deviceId,
+                              child: Text(peer.name),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (peerId) =>
+                          setState(() => _selectedPeerId = peerId),
+                    ),
+                    const SizedBox(height: 10),
+                    _SelectedPcDetails(peer: selectedPeer, state: state),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+
             // ---- PC-only toggle (Windows only) -----------------------------
             if (!isAndroid) ...[
               GlassListTile(
@@ -88,7 +140,7 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                 trailing: Switch(
                   value: remoteEnabled,
                   onChanged: (v) => state.setRemoteControlEnabled(v),
-                  activeColor: c.violet,
+                  activeThumbColor: c.violet,
                 ),
               ),
               const SizedBox(height: 10),
@@ -105,7 +157,13 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                   Row(
                     children: [
                       for (final min in [10, 20, 30, 40, 50, 60]) ...[
-                        _minuteButton(context, min, canSend, c),
+                        _minuteButton(
+                          context,
+                          min,
+                          canSend,
+                          c,
+                          selectedPeer?.deviceId,
+                        ),
                         if (min != 60) const SizedBox(width: 4),
                       ],
                     ],
@@ -122,7 +180,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                           compact: true,
                           enabled: canSend,
                           selected: _lastSent == 'sleep',
-                          onTap: () => _send(state, 'sleep'),
+                          onTap: () =>
+                              _send(state, 'sleep', selectedPeer!.deviceId),
                         ),
                       ),
                       const SizedBox(width: 6),
@@ -134,7 +193,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                           compact: true,
                           enabled: canSend,
                           selected: _lastSent == 'hibernate',
-                          onTap: () => _send(state, 'hibernate'),
+                          onTap: () =>
+                              _send(state, 'hibernate', selectedPeer!.deviceId),
                         ),
                       ),
                       const SizedBox(width: 6),
@@ -147,7 +207,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                           style: GlassButtonStyle.outline,
                           enabled: canSend,
                           selected: _lastSent == 'shutdown_cancel',
-                          onTap: () => _send(state, 'shutdown_cancel'),
+                          onTap: () => _send(
+                              state, 'shutdown_cancel', selectedPeer!.deviceId),
                         ),
                       ),
                     ],
@@ -172,7 +233,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                       compact: true,
                       enabled: canSend,
                       selected: _lastSent == 'media_prev',
-                      onTap: () => _send(state, 'media_prev'),
+                      onTap: () =>
+                          _send(state, 'media_prev', selectedPeer!.deviceId),
                     ),
                   ),
                   const SizedBox(width: 6),
@@ -186,7 +248,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                       compact: true,
                       enabled: canSend,
                       selected: _lastSent == 'media_play_pause',
-                      onTap: () => _send(state, 'media_play_pause'),
+                      onTap: () => _send(
+                          state, 'media_play_pause', selectedPeer!.deviceId),
                     ),
                   ),
                   const SizedBox(width: 6),
@@ -199,7 +262,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                       compact: true,
                       enabled: canSend,
                       selected: _lastSent == 'media_next',
-                      onTap: () => _send(state, 'media_next'),
+                      onTap: () =>
+                          _send(state, 'media_next', selectedPeer!.deviceId),
                     ),
                   ),
                 ],
@@ -221,7 +285,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                       compact: true,
                       enabled: canSend,
                       selected: _lastSent == 'volume_down',
-                      onTap: () => _send(state, 'volume_down'),
+                      onTap: () =>
+                          _send(state, 'volume_down', selectedPeer!.deviceId),
                     ),
                   ),
                   const SizedBox(width: 6),
@@ -234,7 +299,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                       compact: true,
                       enabled: canSend,
                       selected: _lastSent == 'volume_mute',
-                      onTap: () => _send(state, 'volume_mute'),
+                      onTap: () =>
+                          _send(state, 'volume_mute', selectedPeer!.deviceId),
                     ),
                   ),
                   const SizedBox(width: 6),
@@ -246,7 +312,8 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                       compact: true,
                       enabled: canSend,
                       selected: _lastSent == 'volume_up',
-                      onTap: () => _send(state, 'volume_up'),
+                      onTap: () =>
+                          _send(state, 'volume_up', selectedPeer!.deviceId),
                     ),
                   ),
                 ],
@@ -260,8 +327,20 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
 
   // ---- Actions ---------------------------------------------------------------
 
-  Future<void> _send(AppState state, String name) async {
-    await state.sendRemoteCommand(name);
+  PairedPeer? _selectedPeer(List<PairedPeer> connectedPcs) {
+    if (connectedPcs.isEmpty) return null;
+    for (final peer in connectedPcs) {
+      if (peer.deviceId == _selectedPeerId) return peer;
+    }
+    return connectedPcs.first;
+  }
+
+  Future<void> _send(
+    AppState state,
+    String name,
+    String targetPeerId,
+  ) async {
+    await state.sendRemoteCommand(name, targetPeerId: targetPeerId);
     if (!mounted) return;
     setState(() => _lastSent = name);
     Future.delayed(const Duration(seconds: 2), () {
@@ -269,7 +348,11 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
     });
   }
 
-  Future<void> _confirmShutdown(AppState state, int minutes) async {
+  Future<void> _confirmShutdown(
+    AppState state,
+    int minutes,
+    String targetPeerId,
+  ) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (dctx) => AlertDialog(
@@ -296,17 +379,31 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
         ],
       ),
     );
-    if (ok == true && mounted) await _send(state, 'shutdown_$minutes');
+    if (ok == true && mounted) {
+      await _send(state, 'shutdown_$minutes', targetPeerId);
+    }
   }
 
   // ---- Local helpers -----------------------------------------------------------
 
-  Widget _minuteButton(BuildContext context, int min, bool enabled, GlassColors c) {
+  Widget _minuteButton(
+    BuildContext context,
+    int min,
+    bool enabled,
+    GlassColors c,
+    String? targetPeerId,
+  ) {
     final selected = _lastSent == 'shutdown_$min';
     final color = c.amber;
     return Expanded(
       child: InkWell(
-        onTap: enabled ? () => _confirmShutdown(context.read<AppState>(), min) : null,
+        onTap: enabled
+            ? () => _confirmShutdown(
+                  context.read<AppState>(),
+                  min,
+                  targetPeerId!,
+                )
+            : null,
         borderRadius: BorderRadius.circular(8),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 200),
@@ -325,7 +422,7 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
           ),
           child: Text(
             selected ? '✓' : '${min}m',
-            style: GoogleFonts.manrope(
+            style: AppTypography.manrope(
               textStyle: TextStyle(
                 color: enabled ? color : c.textTertiary,
                 fontWeight: FontWeight.w700,
@@ -335,6 +432,48 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _SelectedPcDetails extends StatelessWidget {
+  const _SelectedPcDetails({required this.peer, required this.state});
+
+  final PairedPeer peer;
+  final AppState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = GlassColors.of(context);
+    final connection = state.connectionStateFor(peer.deviceId);
+    final folderCount = state.config.folderPairs
+        .where((pair) => pair.peerDeviceId == peer.deviceId)
+        .length;
+    return Row(
+      children: [
+        Icon(Icons.verified_user_outlined, color: c.mint, size: 20),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                peer.name,
+                style: TextStyle(
+                  color: c.textPrimary,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              Text(
+                '${connection.transport?.label ?? 'Connected'} · '
+                '${peer.deviceId} · '
+                '$folderCount folder pair${folderCount == 1 ? '' : 's'}',
+                style: TextStyle(color: c.textSecondary, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }

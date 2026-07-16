@@ -11,6 +11,7 @@ import 'package:conduit/src/notifications/notifier.dart';
 import 'package:conduit/src/protocol/wire.dart';
 import 'package:conduit/src/sync/file_send.dart';
 import 'package:conduit/src/sync/manifest.dart';
+import 'package:conduit/src/transfers/transfer_receipt.dart';
 
 const _bobDeviceId = 'BBBB-2222';
 
@@ -160,6 +161,51 @@ void main() {
       expect(notifier.receivedName, fileName);
     });
 
+    test('supported receiver confirms only after verified local commit',
+        () async {
+      final repo = await TransferReceiptRepository.open(tmpDir);
+      session = _FakeSession(features: const ['transfer_receipt_v1']);
+      final adHoc = AdHocFileSend(
+        fs: mockFs,
+        notifier: notifier,
+        getReceivedFilesPath: () => tmpDir.path,
+        getPeerName: (_) => 'Bob',
+        receipts: repo,
+        onLog: (_, {bool isError = false}) {},
+      );
+      final bytes = [1, 2, 3, 4];
+      final sha = sha256.convert(bytes).toString();
+      adHoc.handleFileOffer(session, {
+        't': Msg.fileOffer,
+        'offerId': 'confirmed-offer',
+        'name': 'confirmed.bin',
+        'size': bytes.length,
+        'sha256': sha,
+        'blockHashes': [sha],
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(
+          session.sent.any((msg) => msg['t'] == Msg.fileOfferReceipt), isFalse);
+      adHoc.handleFileOfferData(session, {
+        't': Msg.fileOfferData,
+        'offerId': 'confirmed-offer',
+        'name': 'confirmed.bin',
+        'offset': 0,
+        'length': bytes.length,
+        'sha256': sha,
+        'data': base64.encode(bytes),
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final receiptFrame =
+          session.sent.lastWhere((msg) => msg['t'] == Msg.fileOfferReceipt);
+      expect(receiptFrame['status'], 'stored');
+      expect(receiptFrame.containsKey('name'), isFalse);
+      expect(receiptFrame.keys.any((key) => key.toLowerCase().contains('path')),
+          isFalse);
+      expect((await repo.recent()).single.status, TransferStatus.completed);
+      await repo.close();
+    });
+
     test('onSessionLost cancels in-flight transfers', () async {
       final logLines = <String>[];
       final adHoc = AdHocFileSend(
@@ -233,8 +279,8 @@ class _FakeNotifier implements AppNotifier {
   }
 
   @override
-  Future<void> showReceiveProgress(
-      String name, int received, int total, {required String offerId}) async {}
+  Future<void> showReceiveProgress(String name, int received, int total,
+      {required String offerId}) async {}
 
   @override
   Future<void> showSendProgress(String name, int sent, int total) async {}
@@ -302,6 +348,10 @@ class _MockFs implements FileSystemAccess {
 }
 
 class _FakeSession implements PeerSession {
+  _FakeSession({this.features = const []});
+
+  @override
+  final List<String> features;
   @override
   final PairedPeer peer = PairedPeer(
     deviceId: _bobDeviceId,

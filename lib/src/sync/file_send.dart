@@ -1,3 +1,5 @@
+// ignore_for_file: unintended_html_in_doc_comment
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -13,6 +15,7 @@ import '../net/transport.dart';
 import '../protocol/wire.dart';
 import '../sync/block_transfer.dart';
 import '../sync/manifest.dart';
+import '../transfers/transfer_receipt.dart';
 
 /// How many blocks [_receiveOffer] keeps outstanding at once when pulling an
 /// ad-hoc send (see [fetchFileBlockLevel]'s `pipelineDepth`).
@@ -75,6 +78,7 @@ class _OutboundOffer {
   final int fileSize;
   final String peerId;
   final PeerSession session;
+  final Completer<String?> receipt = Completer<String?>();
 
   bool paused = false;
   bool canceled = false;
@@ -228,6 +232,7 @@ class AdHocFileSend {
     required this.getReceivedFilesPath,
     required this.getPeerName,
     required this.onLog,
+    this.receipts,
   }) {
     notifier.onCancelReceiveTap = (offerId) {
       cancelInboundOffer(offerId);
@@ -250,6 +255,7 @@ class AdHocFileSend {
 
   /// Structured log callback — same pattern as ClipboardSync.
   final void Function(String msg, {bool isError}) onLog;
+  final TransferReceiptRepository? receipts;
 
   // Outbound offers waiting for block requests from the receiver.
   // keyed by offerId.
@@ -397,6 +403,21 @@ class AdHocFileSend {
       readBlock: readBlock,
     );
     _outbound[offerId] = offer;
+    await _writeReceipt(TransferReceipt(
+      receiptId: 'out:$offerId',
+      correlationId: offerId,
+      kind: TransferKind.adHoc,
+      direction: TransferDirection.outgoing,
+      peerId: session.peer.deviceId,
+      peerNameSnapshot: session.peer.name,
+      displayName: fileName,
+      sizeBytes: fileSize,
+      startedAt: DateTime.now(),
+      status: TransferStatus.offered,
+      confirmation: session.features.contains('transfer_receipt_v1')
+          ? TransferConfirmation.receiverConfirmed
+          : TransferConfirmation.unsupportedByPeer,
+    ));
 
     if (fileSize == 0) {
       scheduleMicrotask(() => offer.serveCtrl.close());
@@ -480,18 +501,79 @@ class AdHocFileSend {
           });
         }
       }
-      _outbound.remove(offer.offerId);
-      onSendComplete?.call(completed);
       if (completed) {
-        notifier.showFileSent(fileName, session.peer.name);
-        onLog('Ad-hoc send complete: $fileName -> ${session.peer.name}');
+        final supportsReceipt =
+            session.features.contains('transfer_receipt_v1');
+        var successful = true;
+        if (supportsReceipt) {
+          await _updateReceipt(
+            offer.offerId,
+            TransferDirection.outgoing,
+            status: TransferStatus.awaitingPeerConfirmation,
+          );
+          final receivedStatus = await offer.receipt.future.timeout(
+            const Duration(seconds: 10),
+            onTimeout: () => null,
+          );
+          final confirmed = receivedStatus == 'stored';
+          final terminalStatus = switch (receivedStatus) {
+            'rejected' => TransferStatus.rejected,
+            'cancelled' => TransferStatus.cancelled,
+            'failed' => TransferStatus.failed,
+            null => TransferStatus.completedUnconfirmed,
+            _ => TransferStatus.completed,
+          };
+          successful = receivedStatus == null || confirmed;
+          await _updateReceipt(
+            offer.offerId,
+            TransferDirection.outgoing,
+            status: terminalStatus,
+            confirmation: confirmed
+                ? TransferConfirmation.receiverConfirmed
+                : TransferConfirmation.unsupportedByPeer,
+            failureCode: successful ? null : TransferFailureCode.unknown,
+            completed: true,
+          );
+        } else {
+          await _updateReceipt(
+            offer.offerId,
+            TransferDirection.outgoing,
+            status: TransferStatus.completedUnconfirmed,
+            confirmation: TransferConfirmation.unsupportedByPeer,
+            completed: true,
+          );
+        }
+        onSendComplete?.call(successful);
+        if (successful) {
+          notifier.showFileSent(fileName, session.peer.name);
+          onLog('Ad-hoc send complete: $fileName -> ${session.peer.name}');
+        } else {
+          await notifier.cancelSendProgress(fileName);
+          onLog('Ad-hoc send rejected or failed: $fileName', isError: true);
+        }
       } else {
+        onSendComplete?.call(false);
+        await _updateReceipt(
+          offer.offerId,
+          TransferDirection.outgoing,
+          status: TransferStatus.interrupted,
+          failureCode: TransferFailureCode.sessionLost,
+          completed: true,
+        );
         await notifier.cancelSendProgress(fileName);
         onLog('Ad-hoc send interrupted for $fileName', isError: true);
       }
+      _outbound.remove(offer.offerId);
     } catch (e) {
       _outbound.remove(offer.offerId);
       onSendComplete?.call(false);
+      await _updateReceipt(
+        offer.offerId,
+        TransferDirection.outgoing,
+        status: TransferStatus.failed,
+        failureCode: TransferFailureCode.sourceMissing,
+        completed: true,
+      );
       await notifier.cancelSendProgress(fileName);
       onLog('Ad-hoc send error for $fileName: $e', isError: true);
     }
@@ -524,10 +606,32 @@ class AdHocFileSend {
         'action': 'cancel',
         'reason': 'large_transfer_paused_on_bluetooth',
       });
+      _sendReceipt(
+        session,
+        offerId,
+        'rejected',
+        0,
+        TransferFailureCode.bluetoothSizeLimit,
+      );
       onLog(
         'Bluetooth deferred $name: files larger than 10 MiB require LAN',
         isError: true,
       );
+      unawaited(_writeReceipt(TransferReceipt(
+        receiptId: 'in:$offerId',
+        correlationId: offerId,
+        kind: TransferKind.adHoc,
+        direction: TransferDirection.incoming,
+        peerId: session.peer.deviceId,
+        peerNameSnapshot: session.peer.name,
+        displayName: name,
+        sizeBytes: size,
+        startedAt: DateTime.now(),
+        completedAt: DateTime.now(),
+        status: TransferStatus.deferred,
+        confirmation: TransferConfirmation.localVerified,
+        failureCode: TransferFailureCode.bluetoothSizeLimit,
+      )));
       return;
     }
     if (_inbound.containsKey(offerId)) return; // duplicate, ignore
@@ -541,6 +645,19 @@ class AdHocFileSend {
       session: session,
     );
     _inbound[offerId] = offer;
+    unawaited(_writeReceipt(TransferReceipt(
+      receiptId: 'in:$offerId',
+      correlationId: offerId,
+      kind: TransferKind.adHoc,
+      direction: TransferDirection.incoming,
+      peerId: session.peer.deviceId,
+      peerNameSnapshot: session.peer.name,
+      displayName: name,
+      sizeBytes: size,
+      startedAt: DateTime.now(),
+      status: TransferStatus.offered,
+      confirmation: TransferConfirmation.localVerified,
+    )));
     onLog('Ad-hoc offer received: $name (${size}B) offerId=$offerId');
 
     // Start auto-receive in the background.
@@ -555,10 +672,29 @@ class AdHocFileSend {
         isError: true,
       );
       _inbound.remove(offer.offerId);
+      await _updateReceipt(
+        offer.offerId,
+        TransferDirection.incoming,
+        status: TransferStatus.rejected,
+        failureCode: TransferFailureCode.noDestination,
+        completed: true,
+      );
+      _sendReceipt(
+        offer.session,
+        offer.offerId,
+        'rejected',
+        0,
+        TransferFailureCode.noDestination,
+      );
       return;
     }
 
     try {
+      await _updateReceipt(
+        offer.offerId,
+        TransferDirection.incoming,
+        status: TransferStatus.transferring,
+      );
       await fetchFileBlockLevel(
         fs: fs,
         rootPath: destPath,
@@ -592,11 +728,40 @@ class AdHocFileSend {
 
       onLog(
           'Ad-hoc receive complete: ${offer.name} ← ${offer.session.peer.name}');
+      await _updateReceipt(
+        offer.offerId,
+        TransferDirection.incoming,
+        status: TransferStatus.completed,
+        confirmation: TransferConfirmation.localVerified,
+        completed: true,
+        localDestinationAvailable: true,
+      );
+      _sendReceipt(
+        offer.session,
+        offer.offerId,
+        'stored',
+        offer.size,
+        null,
+      );
       final peerName = offer.session.peer.name;
       notifier.showFileReceived(offer.name, peerName, treeUri: destPath);
     } catch (e) {
       onLog('Ad-hoc receive failed for ${offer.name}: $e', isError: true);
       await notifier.cancelReceiveProgress(offer.name);
+      await _updateReceipt(
+        offer.offerId,
+        TransferDirection.incoming,
+        status: TransferStatus.failed,
+        failureCode: TransferFailureCode.writeFailed,
+        completed: true,
+      );
+      _sendReceipt(
+        offer.session,
+        offer.offerId,
+        'failed',
+        0,
+        TransferFailureCode.writeFailed,
+      );
     } finally {
       offer._sink.close();
       _inbound.remove(offer.offerId);
@@ -676,6 +841,13 @@ class AdHocFileSend {
         'offerId': offerId,
         'action': 'cancel',
       });
+      _sendReceipt(
+        offer.session,
+        offerId,
+        'cancelled',
+        0,
+        TransferFailureCode.cancelledByReceiver,
+      );
     } catch (_) {}
 
     onLog('Ad-hoc receive cancelled locally: ${offer.name}');
@@ -725,6 +897,84 @@ class AdHocFileSend {
     final offer = _inbound[offerId];
     if (offer == null) return; // unknown or already completed
     offer._sink.add(msg);
+  }
+
+  void handleFileOfferReceipt(
+    PeerSession session,
+    Map<String, dynamic> msg,
+  ) {
+    final offerId = msg['offerId'];
+    final status = msg['status'];
+    final receivedBytes = (msg['receivedBytes'] as num?)?.toInt();
+    if (offerId is! String ||
+        offerId.length > 128 ||
+        status is! String ||
+        status.length > 32 ||
+        receivedBytes == null ||
+        receivedBytes < 0) {
+      return;
+    }
+    final offer = _outbound[offerId];
+    if (offer == null ||
+        offer.peerId != session.peer.deviceId ||
+        !identical(offer.session, session) ||
+        offer.receipt.isCompleted) {
+      return;
+    }
+    if (!const {'stored', 'rejected', 'cancelled', 'failed'}.contains(status)) {
+      return;
+    }
+    offer.receipt.complete(status);
+  }
+
+  void _sendReceipt(
+    PeerSession session,
+    String offerId,
+    String status,
+    int receivedBytes,
+    TransferFailureCode? failureCode,
+  ) {
+    if (!session.features.contains('transfer_receipt_v1') || session.isClosed) {
+      return;
+    }
+    session.send({
+      't': Msg.fileOfferReceipt,
+      'offerId': offerId,
+      'status': status,
+      'receivedBytes': receivedBytes,
+      if (failureCode != null) 'failureCode': failureCode.name,
+    });
+  }
+
+  Future<void> _writeReceipt(TransferReceipt receipt) async {
+    try {
+      await receipts?.upsert(receipt);
+    } catch (_) {}
+  }
+
+  Future<void> _updateReceipt(
+    String correlationId,
+    TransferDirection direction, {
+    required TransferStatus status,
+    TransferConfirmation? confirmation,
+    TransferFailureCode? failureCode,
+    bool completed = false,
+    bool? localDestinationAvailable,
+  }) async {
+    try {
+      final current = await receipts?.byCorrelation(
+        correlationId,
+        direction: direction,
+      );
+      if (current == null) return;
+      await receipts?.upsert(current.copyWith(
+        status: status,
+        confirmation: confirmation,
+        failureCode: failureCode,
+        completedAt: completed ? DateTime.now() : null,
+        localDestinationAvailable: localDestinationAvailable,
+      ));
+    } catch (_) {}
   }
 
   // ---- Session lifecycle --------------------------------------------------

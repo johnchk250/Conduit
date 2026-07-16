@@ -1,187 +1,189 @@
 # Conduit
 
-Peer-to-peer folder sync between your **PC and phone**, using the fastest direct
-connection currently available. Conduit prefers LAN and automatically falls
-back to Bluetooth when LAN is unavailable. No cloud, account, or third-party
-relay is involved.
+Conduit is a direct, local-first file synchronization app for Windows and
+Android. It keeps selected folders in sync, sends individual files, and offers
+small cross-device tools without accounts, cloud storage, or a relay service.
 
-```
-PC folder  <==== LAN (preferred) ====>  Phone folder
-           <== Bluetooth fallback ==>
-```
+**Current version:** 2.0.0+2
 
-## Features
+**Supported platforms:** Windows and Android
 
-- **Automatic two-way sync** of any folder pair you define.
-- **Per-pair direction**: two-way, receive-only, or send-only.
-- **Seamless across networks**: paired devices auto-reconnect on any Wi-Fi
-  (home ↔ office) with no re-pairing — UDP auto-discovery finds them.
-- **Bluetooth fallback**: Windows and Android can connect over Bluetooth
-  Classic RFCOMM when LAN is unavailable. The UI always shows the active
-  transport and automatically upgrades back to LAN when it becomes reachable.
-- **Bandwidth-aware behavior**: clipboard, remote commands, status, and small
-  sync operations continue over Bluetooth. Files larger than 10 MiB are paused
-  until LAN returns.
-- **Manual fallback**: scan a QR code if a network blocks auto-discovery
-  (including a Bluetooth-only QR when no LAN address is available).
-- **Secure**: self-signed TLS transport, ed25519 public-key pinning, single-
-  use first-pair code (embedded in the QR for the scan flow, or typed for the
-  manual fallback). The code is consumed on successful pair.
-- **Safe conflicts**: when both sides edit the same file, the newer version
-  wins and the loser is backed up to `.syncversions/` (kept 14 days).
-- **Resumable transfers**: 1 MiB chunks, each SHA-256 verified; survives
-  dropped connections mid-transfer.
-- **Clipboard sync**: optional cross-device clipboard — PC→phone automatically,
-  phone→PC via a one-tap floating chip (honors Android 10+ background rules).
-- **Ad-hoc file send**: send any file directly to a paired peer without
-  defining a sync folder (right-click → "Send to Conduit" on Windows).
-- **One codebase → two apps**: built from a single Flutter/Dart project.
+## What it does
 
-## Build it yourself
+- Synchronizes folder pairs in two-way, send-only, or receive-only mode.
+- Connects over LAN when possible and falls back to Bluetooth Classic when LAN
+  is unavailable.
+- Automatically upgrades an authenticated Bluetooth session back to LAN.
+- Pairs devices with a QR code or one-time secret and pins their identities.
+- Encrypts every application message with Secure Transport v1.
+- Resumes large files in verified 1 MiB blocks after an interrupted connection.
+- Preserves overwritten, conflicted, and peer-deleted versions for 14 days.
+- Shows an informational sync preview based on the same decisions as real sync.
+- Provides reusable Camera, Screenshots, Downloads, Documents, and Inbox
+  folder presets.
+- Sends individual files without creating a folder pair.
+- Stores a local, clearable 30-day transfer-receipt history.
+- Optionally synchronizes clipboard content.
+- Exposes allowlisted remote-PC actions and phone status/alert tools.
+- Includes onboarding and a Connection Doctor for setup and troubleshooting.
 
-### Prerequisites
+Conduit has no account system, analytics, advertising, or runtime dependency on
+an internet service. Devices must be reachable over a local network or paired
+through the operating system's Bluetooth settings.
 
-- **Flutter 3.27+** (`flutter doctor` must pass)
-- **Windows build**: Visual Studio 2022 Build Tools with the
-  `Desktop development with C++` workload (CMake + MSVC).
-- **Android build**: Android Studio + Android SDK (API 24+), JDK 17–21.
+## Quick start
 
-### Commands
+### 1. Install and open Conduit
 
-```bash
-cd conduit
+Run Conduit on both devices. The first-run guide explains permissions,
+background operation, pairing, and optional folder presets.
 
-# Verify toolchain
-flutter doctor
+On Windows, allow inbound private-network traffic when prompted. Conduit uses
+TCP port `41828` by default. The Connection Doctor can identify a missing
+firewall rule or an unreachable peer.
 
-# Static analysis (should report 0 errors)
-flutter analyze
-
-# Windows standalone app (.exe + DLLs)
-flutter build windows --release
-# → build\windows\x64\runner\Release\conduit.exe
-
-# Android APK
-flutter build apk --release
-# → build\app\outputs\flutter-apk\app-release.apk
-```
-
-## First-run setup
-
-### One-time PC firewall rule (Windows)
-
-Windows Firewall blocks inbound connections to `conduit.exe` by default,
-which prevents the phone from reaching the PC. Open **an Administrator
-Command Prompt** and run this once:
+If a manual rule is required, run this from an Administrator Command Prompt:
 
 ```cmd
 netsh advfirewall firewall add rule name="Conduit" dir=in action=allow protocol=TCP localport=41828
 ```
 
-Conduit listens on **TCP 41828** by default. If you skip this step, the
-phone will report `Connection timed out` when pairing. (You can alternatively
-launch the app once and click "Allow access" on the Windows prompt, but the
-`netsh` rule is stable across reinstalls.)
+### 2. Pair the devices
 
-For LAN operation, both devices must be on the **same Wi-Fi or reachable local
-network**. If LAN is blocked or unavailable, Conduit can use Bluetooth after
-the devices have been paired in the operating system's Bluetooth settings.
+Open **Devices** on both devices:
 
-### Bluetooth fallback setup
+1. Generate a pairing QR code on one device.
+2. Scan it from the other device.
+3. Confirm that both devices show as paired and connected.
 
-1. Turn on Bluetooth on Windows and Android.
-2. Pair the PC and phone once in their native Bluetooth settings.
-3. Open Conduit on both devices and allow the Android Nearby devices /
-   Bluetooth permission when prompted.
-4. Pair the devices inside Conduit as usual. OS Bluetooth pairing establishes
-   the radio trust; Conduit pairing separately authenticates the app identity.
+The QR contains a random, single-use pairing secret. Pairing is separate from
+operating-system Bluetooth pairing.
 
-LAN remains preferred. The Windows app checks for LAN availability while a
-Bluetooth session is active and performs an authenticated, seamless takeover
-when LAN becomes reachable. The phone only answers these probes, avoiding a
-continuous mobile-side watcher.
+### 3. Create a folder pair
 
-### Pair the devices
+Open **Folders**, choose a preset or **Custom**, select the peer and local
+folder, then create the pair. The peer receives an invitation and chooses its
+corresponding local folder.
 
-The easiest flow is the **QR connect** (no typing):
+Direction meanings:
 
-1. On one device, open **Devices → Manual connect** — a QR is shown that
-   embeds a one-time pairing code.
-2. On the other device, open **Devices → Manual connect → Scan code** and
-   point the camera at the QR. Pairing completes automatically — no code to
-   type.
+- **Two-way:** edits and deletions can propagate in both directions.
+- **Send only:** this device advertises its changes to the peer.
+- **Receive only:** this device receives changes from the peer.
 
-Alternatively, **auto-discovery**:
+These modes synchronize state; they are not append-only archive policies.
 
-1. On the phone, open **Devices → On this network**.
-2. Tap your PC when it appears; enter the 6-digit code shown on the PC's
-   **Devices → Manual connect → Generate pairing code**.
+## Connections
 
-### Sync a folder
+LAN is preferred because it provides the best throughput. UDP discovery finds
+peers on reachable local networks, while saved identity pins allow reconnection
+after addresses change.
 
-1. Go to **Folders → Add folder**.
-2. Pick a folder (Windows: any path; Android: a folder via the system picker).
-3. Choose direction (two-way by default).
-4. Do the same on the other device pointing at the corresponding folder.
+Bluetooth fallback requires:
 
-That's it. Files now mirror automatically whenever a supported direct
-connection is available.
+1. Bluetooth enabled on Windows and Android.
+2. The devices paired once in their operating-system Bluetooth settings.
+3. Android Nearby devices/Bluetooth permission granted to Conduit.
 
-## If pairing fails
+Large transfers over 10 MiB are deferred while the active transport is
+Bluetooth and resume when LAN returns. Control messages and small operations
+remain available.
 
-- **`Connection timed out` / `Connection refused`** → firewall on the PC, or
-  the devices are not on the same Wi-Fi. Apply the `netsh` rule above.
-- **`pairing rejected: wrong or expired code`** → the code was consumed or is
-  from a previous attempt. Generate a fresh QR / code on the other device.
-- **Guest / corporate Wi-Fi with client isolation** → device-to-device
-  traffic is blocked at the network level. Use the Bluetooth fallback or
-  switch to a network that permits peer-to-peer traffic.
-- **Bluetooth ready, but no device appears** → pair the devices first in
-  Windows and Android Bluetooth settings, keep Conduit open on both devices,
-  and grant Android's Nearby devices permission.
-- **Large transfer paused on Bluetooth** → this is intentional. Transfers
-  larger than 10 MiB resume when LAN reconnects.
+## Recovery and receipts
 
-## Architecture
+Conduit keeps local recovery copies under `.syncversions` before it overwrites a
+file or applies a winning peer deletion, when storage access permits. Version
+History can restore a copy through the normal scanner and version-vector path.
+Recovery copies expire after 14 days.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design reference.
-The codebase is organised as:
+A file manually deleted on the same device cannot always be recovered because
+its bytes may be gone before Conduit observes the deletion. A prior vaulted
+version can still be restored.
 
-```
-lib/src/
-  core/           identity (ed25519), config store (folder pairs, pinned peers)
-  protocol/       wire message types, folder-pair model
-  net/            LAN discovery, Bluetooth bridge, transport policy,
-                  peer sessions, secure framing, connection supervisor
-  storage/        per-folder SQLite Index DB (durable source of truth)
-  sync/           V2 engine: version vectors, scanner, index diff, block transfer
-  clipboard/      clipboard sync controller
-  platform/       Android SAF adapter
-  ui/             dashboard, folders, devices, activity, clipboard screens
-  app_state.dart  central ChangeNotifier wiring everything together
-android/app/src/main/kotlin/.../
-  MainActivity.kt   platform-channel host
-  BluetoothProxy.kt Bluetooth Classic RFCOMM <-> loopback TCP bridge
-  SafOps.kt         SAF read/write/list/delete/moveToVault
-  SyncService.kt    foreground sync service with partial wake lock
-windows/runner/
-  bluetooth_proxy_win.cpp  Win32 RFCOMM listener, discovery, and TCP proxy
+Transfer receipts are stored only on the local device for up to 30 days and
+1,000 rows. A supported peer can confirm an ad-hoc file only after it has
+verified and committed the file. Older peers remain compatible and are shown
+as unconfirmed rather than failed.
+
+## Build from source
+
+### Requirements
+
+- Flutter with Dart 3.6 or newer
+- Windows: Visual Studio 2022 with **Desktop development with C++**
+- Android: Android Studio, Android SDK, and JDK 17 or newer
+
+### Validate
+
+```powershell
+flutter pub get
+flutter analyze
+flutter test
 ```
 
-## Storage locations
+### Build
 
-- **Windows:** `%APPDATA%\Conduit\` — identity.json, config.json
-- **Android:** app support directory — identity.json, config.json
-- **Per synced folder:** `.syncstate/` (manifests), `.syncversions/` (conflict
-  backups, 14-day retention)
+```powershell
+flutter build windows --release
+flutter build apk --release
+```
 
-## Privacy
+Outputs:
 
-All data stays on your devices. Nothing is sent to any server. LAN discovery
-beacons and Bluetooth service discovery expose only connection metadata, never
-file contents. Conduit still performs its authenticated pinned-key handshake
-over either transport; OS Bluetooth pairing alone does not authorize access.
+```text
+build/windows/x64/runner/Release/
+build/app/outputs/flutter-apk/app-release.apk
+```
+
+The repository also includes PowerShell and batch wrappers for the locally
+configured toolchain.
+
+## Project layout
+
+```text
+lib/
+  main.dart                 Flutter entry point and provider composition
+  l10n/                     localization resources
+  src/
+    controllers/            scoped application snapshots and commands
+    core/                   identity and persistent configuration
+    diagnostics/            Connection Doctor and sanitized diagnostics
+    net/                    discovery, sessions, encryption, transport policy
+    platform/               Android SAF adapter
+    protocol/               wire messages and folder-pair models
+    runtime/                dependency and application composition
+    storage/                per-pair SQLite indexes
+    sync/                   scanner, versioning, preview, transfer engine
+    transfers/              durable transfer receipts
+    ui/                     responsive Windows/Android interface
+android/                    Android host, SAF, Bluetooth, background service
+windows/                    Windows runner and Bluetooth bridge
+test/                       unit, widget, and two-node integration tests
+```
+
+## Local data
+
+Application support storage contains:
+
+- `identity.json`: persistent device identity;
+- `config.json`: paired peers, folder pairs, and preferences;
+- `index/*.db`: durable per-folder sync indexes;
+- `vault_log/*.json`: version-history catalogs;
+- `transfer_history.db`: bounded transfer receipts.
+
+Windows stores this under `%APPDATA%\Conduit`. Android uses the app's private
+support directory. Vaulted file bytes live under `.syncversions` inside the
+associated folder tree and are excluded from synchronization.
+
+## Documentation
+
+- [Architecture](ARCHITECTURE.md)
+- [Version history](CHANGELOG.md)
+- [Roadmap](Roadmap.md)
+- [Security](SECURITY.md)
+- [Privacy](PRIVACY.md)
+- [Windows/Android smoke checklist](docs/windows-android-smoke-checklist.json)
 
 ## License
 
-Personal project. Not for redistribution.
+Personal project. Not licensed for redistribution.

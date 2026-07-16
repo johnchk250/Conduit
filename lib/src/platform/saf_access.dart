@@ -13,7 +13,7 @@ const _chSaf = MethodChannel('conduit/saf');
 /// The [rootPath] passed in by a folder pair is the persisted tree URI string
 /// (e.g. content://com.android.externalstorage.documents/tree/primary%3A...).
 /// We resolve relative paths within it via the Kotlin SafOps handler.
-class SafFileSystemAccess implements FileSystemAccess {
+class SafFileSystemAccess implements FileSystemAccess, TemporaryFileFinalizer {
   const SafFileSystemAccess();
 
   @override
@@ -21,9 +21,12 @@ class SafFileSystemAccess implements FileSystemAccess {
 
   /// Launch the system folder picker. Returns the granted tree URI, or null
   /// if the user cancelled. The permission is persisted on the Kotlin side.
-  static Future<String?> pickTree() async {
+  static Future<String?> pickTree({String? initialHint}) async {
     try {
-      return await _chPick.invokeMethod<String>('pick');
+      return await _chPick.invokeMethod<String>(
+        'pick',
+        {if (initialHint != null) 'initialHint': initialHint},
+      );
     } on PlatformException {
       return null;
     }
@@ -107,6 +110,19 @@ class SafFileSystemAccess implements FileSystemAccess {
       'treeUri': rootPath,
       'relPath': relPath,
       'data': Uint8List.fromList(data),
+    });
+  }
+
+  @override
+  Future<void> replaceFromTemporary(
+    String rootPath,
+    String temporaryRelPath,
+    String destinationRelPath,
+  ) async {
+    await _chSaf.invokeMethod('replaceFromTemporary', {
+      'treeUri': rootPath,
+      'temporaryRelPath': temporaryRelPath,
+      'destinationRelPath': destinationRelPath,
     });
   }
 

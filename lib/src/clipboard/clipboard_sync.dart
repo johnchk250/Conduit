@@ -392,9 +392,9 @@ Future<void> _defaultWriteClipboard(String text) async {
     // ClipboardManager via applicationContext — the same process that hosts the
     // foreground SyncService. Android allows clipboard writes from foreground-
     // service processes, so this path works reliably in the background.
-    const _ch = MethodChannel('conduit/clipboard');
+    const channel = MethodChannel('conduit/clipboard');
     try {
-      await _ch.invokeMethod<void>('write', {'text': text});
+      await channel.invokeMethod<void>('write', {'text': text});
     } catch (_) {
       // If the native channel fails (e.g. during cold-start before the
       // FlutterEngine registers the handler), fall through to the Flutter API.

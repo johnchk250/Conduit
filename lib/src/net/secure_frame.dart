@@ -3,7 +3,23 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
+
 import '../diag.dart';
+
+class SecureFrameKeys {
+  const SecureFrameKeys({
+    required this.sendKey,
+    required this.receiveKey,
+    required this.sendNoncePrefix,
+    required this.receiveNoncePrefix,
+  });
+
+  final SecretKey sendKey;
+  final SecretKey receiveKey;
+  final Uint8List sendNoncePrefix;
+  final Uint8List receiveNoncePrefix;
+}
 
 /// Length-prefixed JSON envelope reader/writer over an arbitrary socket.
 ///
@@ -47,6 +63,21 @@ class FrameCodec {
   /// Has the underlying socket been closed? Set true in the onDone handler.
   bool _closed = false;
   bool get isClosed => _closed;
+  SecureFrameKeys? _secureKeys;
+  int _sendSequence = 0;
+  int _receiveSequence = 0;
+  Future<void> _sendChain = Future.value();
+  Future<void> _receiveChain = Future.value();
+  static final _aead = Chacha20.poly1305Aead();
+
+  void enableSecurity(SecureFrameKeys keys) {
+    if (_secureKeys != null) throw StateError('secure framing already enabled');
+    if (keys.sendNoncePrefix.length != 4 ||
+        keys.receiveNoncePrefix.length != 4) {
+      throw ArgumentError('nonce prefixes must be four bytes');
+    }
+    _secureKeys = keys;
+  }
 
   void listen() {
     _socket.listen(
@@ -83,7 +114,8 @@ class FrameCodec {
         final b = Uint8List.fromList(_raw.sublist(0, 4));
         final len = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
         _raw.removeRange(0, 4);
-        if (len < 0 || len > _maxEnvelopeBytes) {
+        final cap = _secureKeys == null ? 64 * 1024 : _maxEnvelopeBytes;
+        if (len < 0 || len > cap) {
           _closed = true;
           onError?.call(
             FormatException('bad envelope length: $len (stream desynced?)'),
@@ -98,15 +130,43 @@ class FrameCodec {
       final raw = _raw.sublist(0, len);
       _raw.removeRange(0, len);
       _pendingLen = null;
-      try {
-        final payload = utf8.decode(raw);
-        final msg = jsonDecode(payload) as Map<String, dynamic>;
-        Diag.recv(msg);
-        onMessage?.call(msg);
-      } catch (e) {
-        onError?.call(FormatException('bad envelope: $e'));
-      }
+      _receiveChain = _receiveChain.then((_) => _decodeFrame(raw)).catchError(
+        (Object e) {
+          _closed = true;
+          onError?.call(e);
+          _socket.destroy();
+        },
+      );
     }
+  }
+
+  Future<void> _decodeFrame(List<int> raw) async {
+    final keys = _secureKeys;
+    List<int> clear;
+    if (keys == null) {
+      clear = raw;
+    } else {
+      if (raw.length < 1 + 8 + 16 || raw.first != 1) {
+        throw const FormatException('invalid secure record');
+      }
+      final header = Uint8List.fromList(raw.sublist(0, 9));
+      final sequence = ByteData.sublistView(header).getUint64(1);
+      if (sequence != _receiveSequence) {
+        throw FormatException('unexpected secure sequence: $sequence');
+      }
+      final cipherText = raw.sublist(9, raw.length - 16);
+      final mac = Mac(raw.sublist(raw.length - 16));
+      clear = await _aead.decrypt(
+        SecretBox(cipherText,
+            nonce: _nonce(keys.receiveNoncePrefix, sequence), mac: mac),
+        secretKey: keys.receiveKey,
+        aad: _aad(keys.receiveNoncePrefix, sequence, cipherText.length),
+      );
+      _receiveSequence++;
+    }
+    final msg = jsonDecode(utf8.decode(clear)) as Map<String, dynamic>;
+    Diag.recv(msg);
+    onMessage?.call(msg);
   }
 
   void send(Map<String, dynamic> msg) {
@@ -119,10 +179,57 @@ class FrameCodec {
     msg['msgId'] ??= Diag.nextMsgId();
     Diag.send(msg);
     final payload = utf8.encode(jsonEncode(msg));
-    final len = payload.length;
-    final header = ByteData(4)..setUint32(0, len);
+    final keys = _secureKeys;
+    if (keys == null) {
+      _writeFrame(payload);
+      return;
+    }
+    _sendChain = _sendChain.then((_) async {
+      if (_closed) return;
+      if (_sendSequence == 0xFFFFFFFFFFFFFFFF) {
+        throw StateError('secure sequence exhausted');
+      }
+      final sequence = _sendSequence;
+      final box = await _aead.encrypt(
+        payload,
+        secretKey: keys.sendKey,
+        nonce: _nonce(keys.sendNoncePrefix, sequence),
+        aad: _aad(keys.sendNoncePrefix, sequence, payload.length),
+      );
+      final record = BytesBuilder(copy: false)
+        ..addByte(1)
+        ..add((ByteData(8)..setUint64(0, sequence)).buffer.asUint8List())
+        ..add(box.cipherText)
+        ..add(box.mac.bytes);
+      _writeFrame(record.takeBytes());
+      _sendSequence++;
+    }).catchError((Object e) {
+      _closed = true;
+      onError?.call(e);
+      _socket.destroy();
+    });
+  }
+
+  void _writeFrame(List<int> payload) {
+    final header = ByteData(4)..setUint32(0, payload.length);
     _socket.add(header.buffer.asUint8List());
     _socket.add(payload);
+  }
+
+  static Uint8List _nonce(Uint8List prefix, int sequence) {
+    final nonce = Uint8List(12)..setRange(0, 4, prefix);
+    ByteData.sublistView(nonce).setUint64(4, sequence);
+    return nonce;
+  }
+
+  static Uint8List _aad(Uint8List direction, int sequence, int length) {
+    final data = ByteData(18)
+      ..setUint8(0, 1)
+      ..setUint8(1, 1)
+      ..setUint64(6, sequence)
+      ..setUint32(14, length);
+    final bytes = data.buffer.asUint8List()..setRange(2, 6, direction);
+    return bytes;
   }
 
   Future<void> close() async {
