@@ -59,8 +59,8 @@ class SafFileSystemAccess implements FileSystemAccess {
   /// (writes, deletes, one-off lookups) is unaffected and keeps using
   /// [listFiles]/[stat] directly.
   Future<List<FileEntry>> listFilesWithStat(String rootPath) async {
-    final res = await _chSaf
-        .invokeMethod('listFilesWithStat', {'treeUri': rootPath});
+    final res =
+        await _chSaf.invokeMethod('listFilesWithStat', {'treeUri': rootPath});
     final list = (res as List).cast<Map>();
     return list.map((raw) {
       final m = raw.cast<String, dynamic>();
@@ -71,6 +71,13 @@ class SafFileSystemAccess implements FileSystemAccess {
         sha256: '',
       );
     }).toList();
+  }
+
+  Future<String> hashFile(String rootPath, String relPath) async {
+    return (await _chSaf.invokeMethod<String>('hashFile', {
+      'treeUri': rootPath,
+      'relPath': relPath,
+    }))!;
   }
 
   @override

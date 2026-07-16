@@ -5,11 +5,11 @@
 > is already in place to make the sync feature reliable*. Every claim below is
 > traceable to a source file; read this first, then drill into the files it cites.
 >
-> **Status as written:** Sync engine stable through Bug #9 (received-file delete
-> propagation) + clipboard hardening (2026-07-06) + false "clipboard blocked"
-> notification fix (2026-07-11). **155 tests (154 prior + 1 new); not
-> independently re-run in the current reviewing environment — no Flutter
-> toolchain available, see Appendix B 2026-07-11.**
+> **Status as written:** LAN-preferred dual transport with Bluetooth Classic
+> fallback, deterministic session arbitration, Windows-owned LAN upgrade
+> probing, bandwidth-aware Bluetooth behavior, and SAF scan hashing
+> optimization (2026-07-16). **202 tests pass; Android release APK and Windows
+> release application both build successfully.**
 >
 > **Maintained by:** append a dated section to *Appendix B — Change log* when you
 > change anything the document describes.
@@ -20,7 +20,8 @@
 
 A **peer-to-peer folder sync** application for **two devices that you own** — a
 Windows PC and an Android phone. It mirrors the contents of paired folders in
-**both directions over your local Wi-Fi**.
+**both directions over LAN when possible, with Bluetooth Classic as a direct
+fallback transport**.
 
 ```
 ┌─── PC (Windows) ───┐              ┌── Phone (Android) ──┐
@@ -34,8 +35,8 @@ Windows PC and an Android phone. It mirrors the contents of paired folders in
 
 | Property | How |
 |---|---|
-| No cloud, no account, no relay | Everything happens LAN-side between your two devices. |
-| Private | File bytes never leave your LAN. Discovery beacons carry only public identity (name, id, public key, listen port) — never file contents. |
+| No cloud, no account, no relay | Everything happens directly between your two devices over LAN or Bluetooth. |
+| Private | File bytes never go to a server. Discovery exposes only public connection metadata; every transport still uses Conduit's authenticated pinned-key handshake. |
 | Cross-network auto-reconnect | Pairing is identity-based (pinned ed25519 keys), so home ↔ office Wi-Fi needs no re-pairing. |
 | One codebase | A single Flutter/Dart project compiles to a Windows `.exe` and an Android `.apk`. |
 
@@ -60,6 +61,12 @@ Windows PC and an Android phone. It mirrors the contents of paired folders in
   connection mid-transfer resumes from the last verified block.
 - **Pairing.** QR-code scan (code embedded in the QR) or 6-digit code entry. The
   code is **single-use** — consumed on successful pair.
+- **Transport selection.** LAN has higher priority than Bluetooth. The live
+  session registry drives both connection behavior and UI state, so phase,
+  transport, and link quality cannot contradict each other.
+- **Bluetooth bandwidth policy.** Control messages, clipboard, status, and
+  small files remain available. Sync and ad-hoc files over 10 MiB are deferred
+  until a LAN session becomes available.
 
 **UI (Material 3):** four destinations — Overview, Folders, Devices, Activity.
 Adaptive: `NavigationRail` on wide screens, `BottomNav` on phones.
@@ -98,6 +105,8 @@ lib/src/
     wire.dart            length-prefixed JSON wire messages + FolderPair/SyncDirection models
   net/
     discovery.dart       UDP broadcast auto-discovery of paired peers on the LAN
+    bluetooth_bridge.dart native RFCOMM bridge exposed to Dart as loopback TCP
+    transport.dart       transport priority, connection phase, and quality model
     peer_registry.dart   PeerConnectionRegistry: THE source of truth for "live session for peer X"
     peer_session.dart    one persistent TLS session per peer; send()/onMessage
     secure_frame.dart    FrameCodec: [4-byte len][JSON] envelope, single-owner (no silent drops)
@@ -125,10 +134,15 @@ lib/src/
 
 android/app/src/main/kotlin/.../
   MainActivity.kt        SAF tree-picker channel
+  BluetoothProxy.kt      Android RFCOMM server/client and loopback TCP proxy
   SafOps.kt              SAF read/write/list/delete/moveToVault (native)
   SyncService.kt         foreground service (wake lock, dataSync)
 
-test/                    192 tests — see Appendix A
+windows/runner/
+  bluetooth_proxy_win.*  Win32 RFCOMM service, paired-device enumeration,
+                         bounded connect, and loopback TCP proxy
+
+test/                    202 tests — see Appendix A
 ```
 
 ★ = the heart of the V2 sync engine.
@@ -150,6 +164,34 @@ that each stay correct on their own**, so a failure in one can't corrupt another
 Plus: **scanner decoupled from sync** (`scanner.dart` writes rows independently),
 **block-level transfer** (`block_transfer.dart`), and a **dumb persistent
 connection** that just delivers frames.
+
+---
+
+### 3.4 Connection and transport lifecycle
+
+The application has one authoritative connection view per paired peer:
+`PeerConnectionSnapshot` in `net/transport.dart`. It separates:
+
+- **phase** — offline, connecting, or connected;
+- **transport** — LAN or Bluetooth;
+- **quality** — healthy, degraded, or unstable, derived from RTT and missed
+  heartbeats without mislabeling a live session as "reconnecting."
+
+Both native Bluetooth implementations expose RFCOMM as a loopback TCP socket.
+The existing secure framing, pinned public-key validation, ready handshake,
+heartbeat, generation guard, sync engine, clipboard, and remote-command paths
+therefore remain transport-independent.
+
+LAN always has higher priority. While Windows is connected through Bluetooth,
+it sends a lightweight `lan_probe` every 10 seconds. Android responds with its
+current IPv4 candidates and Conduit TCP port; it does not run a periodic
+mobile-side watcher. Windows establishes an authenticated LAN session and
+atomically supersedes Bluetooth. If LAN later disappears, the persisted
+Bluetooth endpoint is retried as the fallback.
+
+Healthy duplicate sessions are rejected. A replacement is accepted only when
+it is a transport upgrade or the existing session is demonstrably stale. This
+prevents competing automatic dials from creating a reconnect loop.
 
 ---
 
@@ -484,15 +526,11 @@ follow-up: an instrumented Android test (`androidTest/`) exercising
 
 ## 10. Testing
 
-- **`flutter analyze lib test`** — 0 errors as of 2026-07-08; not independently
-  re-run since (no Flutter/Dart SDK available in the reviewing environment for
-  every session after that one — see Appendix B).
-- **`flutter test`** — 192 tests as of this snapshot (154/154 last
-  independently run and confirmed passing 2026-07-08; every session since,
-  including this one, added tests but had no SDK available to execute them —
-  verification has been manual read-through + hand-traced test cases instead,
-  flagged per-session in Appendix B). Recommend running the full suite before
-  merging.
+- **Targeted analysis** — no new errors on the Bluetooth/transport lifecycle
+  paths as of 2026-07-16. Existing unrelated lint warnings remain.
+- **`flutter test`** — **202/202 passed** on 2026-07-16.
+- **Release builds** — `flutter build apk` and `flutter build windows` both
+  passed on 2026-07-16.
 - Tests are **deterministic and logic-only**: they use real `IndexDb`s (SQLite via
   `sqflite_common_ffi`) and the real scanner/diff/block-transfer code paths. No
   hardware, no SAF, no sockets. This is why the V2 bugs were caught and fixed
@@ -512,7 +550,7 @@ both binaries → hardware confirmation. (See Appendix B.)
 cd conduit
 flutter doctor        # toolchain check
 flutter analyze       # 0 errors expected
-flutter test          # 192 expected (not independently re-run since 2026-07-08 — see §10)
+flutter test          # 202 expected
 
 # Windows (profile mode keeps the Diag log; release strips it)
 flutter build windows --profile
@@ -539,6 +577,9 @@ No DB migration is ever needed for the index DB: every fix so far has been runti
 | `smoke3_revert_test.dart` | smoke #3: indexDiff never reverts a higher-version local edit; idle scans burn no sequence |
 | `smoke3_twodb_cycle_test.dart` | two-way edit cycle survives reconcile (convergence via localSha) |
 | `engine_v2_test.dart` | reconcile phases: no-peer seed, advertise, index exchange, empty-update no-kick, session-lost clear, unknown-pair error |
+| `connect_token_test.dart` | Bluetooth-only QR/connect tokens are accepted; tokens with no usable transport are rejected |
+| `connection_arbitration_test.dart` | healthy sessions reject automatic duplicate takeovers |
+| `transport_metadata_test.dart` | transport priority, Bluetooth bandwidth policy, connection phase/quality separation, Bluetooth-to-LAN lifecycle |
 | `block_transfer_test.dart` | single/multi-block fetch, verify, resume from `.syncpart`; Phase 6.4 — existing file vaulted before overwrite, vault failure never blocks the transfer |
 | `index_db_test.dart` | open/schema, upsertLocal no-op guard, snapshot methods |
 | `index_diff_test.dart` | needs-queue cases |
@@ -575,6 +616,7 @@ ull session. Added config_store_test.dart; full suite 154/154 passing. |
 | 2026-07-11 | **Fixed battery-saver disconnect cycling.** Diagnosed a repeating disconnect → heartbeat-timeout → reconnect cycle (~72–90s) reported while the Android phone was idle with both OS Doze and Conduit's own **Battery saver mode** active. Root cause: `_applyBeaconMode()` in `app_state.dart` computed the connection wake lock as `anyLive && !_config.batterySaverMode` — battery-saver mode unconditionally prevented the lock even while a peer session was already live, letting Doze stall the Dart-side heartbeat mid-session (Windows peer eventually surfaces `SocketException: semaphore timeout period has expired`, errno 121; Conduit's own 72s heartbeat-dead timer then tears the session down). **Fix:** decoupled the two concerns — the lock is now held whenever `anyLive` is true, independent of battery-saver mode (`_setConnectionWakeLockEnabled(anyLive)`). Battery-saver's idle-battery savings are unaffected: they come entirely from the separate watcher-polling-interval path (`_engine.setBatterySaverMode`) and the discovery-lock toggle just below this line in the same function, neither of which reads `batterySaverMode` for the connection lock. The existing "Battery saver mode" toggle subtitle in `dashboard_screen.dart` only ever described the watcher-polling behavior, so no UI copy change was needed once the undisclosed side effect was removed. See `PROGRESS.md` / `THINKING.md` (2026-07-11 entries) for the full investigation and reasoning trail. **Not yet verified:** no `flutter analyze`/`flutter test`/device test run in the reviewing environment (no Flutter toolchain available) — recommend running the existing suite plus a real-device idle/Doze soak test before merging. |
 | 2026-07-11 | **Fixed false "clipboard couldn't be written" notification.** Diagnosed inconsistent firing of the Android "clipboard ready to paste" notification (`AppNotifier.showClipboardSyncReceived`) — appearing even when the PC→phone write genuinely succeeded and synced. Root cause: `ClipboardSync.onPushReceived` writes via the native `conduit/clipboard` channel (`applicationContext`-based, built to survive a backgrounded Activity — see `MainActivity.kt` `CH_CLIPBOARD`), but then verified that write by reading back through Flutter's own Activity-bound `Clipboard.getData()`. Android 10+ restricts clipboard *reads* to whichever app currently has window focus or the default IME — with no exception for the app that just wrote the data, and a foreground service does not count as focus — so the verify-read was denied by the OS independent of whether the write succeeded, essentially every time this path is actually used (a backgrounded receive). `app_state.dart`'s `_onClipboardPushReceived` treats a non-null `ClipboardSync.pendingRemoteText` after the attempt as "OS blocked it" and fires the notification, so a genuinely successful write was misreported as blocked whenever the app lacked focus at that instant — matching the reported "inconsistent" symptom exactly. The native write path already surfaces real failures correctly (it throws, and `onPushReceived`'s existing `catch` already handles that). **Fix:** on phone (`!isDesktopPlatform`), `onPushReceived` now treats "the write call returned without throwing" as the success signal and skips the readback comparison entirely; the readback-based verify remains for desktop, where no such OS read restriction exists. `test/clipboard_sync_test.dart`'s three background-write tests were re-based off a corrected fake (`_FailingWriteClipboard`, modeling a genuine thrown write failure, replacing `_BlockedWriteClipboard`'s inaccurate "write silently no-ops" model) plus one new fake (`_FocusRestrictedReadClipboard`) and a new regression test asserting `pendingRemoteText` clears on a successful write even when the readback is denied. See `PROGRESS.md` / `THINKING.md` (2026-07-11 entries) for the full investigation. **Not yet verified:** no `flutter analyze`/`flutter test`/device test run in the reviewing environment (no Flutter toolchain available) — manual review only (balanced-delimiter check on the two touched Dart files, and every call site of the touched functions read by hand). Test count in this snapshot: 155 (154 prior + 1 new), not independently re-run. Recommend running the suite and a real-device backgrounded-receive test (screen off, push from PC, phone not focused) before merging. |
 | 2026-07-14 | **File Transfer Cancel Option on Receiving Device.** Added a "Cancel" action button to the file receive progress notification on Android. Implemented port-based background notification response routing (`conduit_notification_port`) in `AppNotifier` (`notifier.dart`) using `IsolateNameServer` and `ReceivePort` to deliver action taps from the background isolate to the main isolate without forcing the user interface to open. Integrated the "Cancel" action tap to trigger `cancelInboundOffer` in `AdHocFileSend` (`file_send.dart`), which stops the local block-pull loop, notifies the sender with `Msg.fileOfferControl` (`action: 'cancel'`), logs the action, and dismisses the local notification. Updated the sender's `handleFileOfferControl` to process receiver cancellation messages by cleanly terminating the block serving loop. Added public notification dismissal helpers `cancelReceiveProgress`/`cancelSendProgress` and wired them to clean up progress notifications on all transfer error/interrupt paths. Updated the `_FakeNotifier` mock class in `test/file_send_test.dart` to match the updated `AppNotifier` interface signature. Verified all 193 unit tests passing. |
+| 2026-07-16 | **Bluetooth Classic fallback + deterministic transport lifecycle.** Added Android and Windows RFCOMM bridges that proxy Bluetooth through loopback TCP so the existing authenticated Conduit protocol is reused unchanged. Added persisted Bluetooth endpoints, OS-paired candidate discovery, Bluetooth-only QR tokens, LAN-over-Bluetooth upgrade probes, Windows-only active LAN monitoring, transport-aware UI, and a single connection phase/quality snapshot. LAN always supersedes Bluetooth; healthy duplicate sessions are rejected; heartbeat pong IDs are echoed; files over 10 MiB and deep transfer pipelines are suspended/reduced on Bluetooth. Also added persisted local size/mtime fingerprints and native Android SAF hashing to avoid re-reading unchanged files, prevented overlapping watcher scans, and updated the Android Gradle toolchain/desugaring configuration. Verification: 202/202 tests passed; Android and Windows release builds passed. |
 
 ---
 

@@ -38,6 +38,8 @@ class IndexEntry {
   /// do NOT bump, or we'd stamp stale bytes as authorship and revert the peer's
   /// edit).
   final String localSha;
+  final int localSize;
+  final int localMtime;
 
   IndexEntry({
     required this.relPath,
@@ -49,6 +51,8 @@ class IndexEntry {
     this.deleted = false,
     this.blockHashes = const <String>[],
     this.localSha = '',
+    this.localSize = 0,
+    this.localMtime = 0,
   });
 
   /// Copy with an updated [localSha] (preserving everything else). Used by the
@@ -63,6 +67,8 @@ class IndexEntry {
         deleted: deleted,
         blockHashes: blockHashes,
         localSha: sha,
+        localSize: localSize,
+        localMtime: localMtime,
       );
 
   /// Copy with an updated [version] (preserving everything else). Used by
@@ -79,6 +85,8 @@ class IndexEntry {
         deleted: deleted,
         blockHashes: blockHashes,
         localSha: localSha,
+        localSize: localSize,
+        localMtime: localMtime,
       );
 
   /// True if this entry has a usable whole-file digest. The legacy
@@ -274,7 +282,9 @@ class IndexDb {
         sequence     INTEGER NOT NULL,
         deleted      INTEGER NOT NULL,
         block_hashes TEXT,
-        local_sha    TEXT NOT NULL DEFAULT ''
+        local_sha    TEXT NOT NULL DEFAULT '',
+        local_size   INTEGER NOT NULL DEFAULT 0,
+        local_mtime  INTEGER NOT NULL DEFAULT 0
       )
     ''');
     await db.execute('CREATE INDEX seq_index ON files(sequence)');
@@ -290,6 +300,30 @@ class IndexDb {
       await db.execute(
           "ALTER TABLE files ADD COLUMN local_sha TEXT NOT NULL DEFAULT ''");
     }
+    if (!cols.any((c) => (c['name'] as String?) == 'local_size')) {
+      await db.execute(
+          'ALTER TABLE files ADD COLUMN local_size INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!cols.any((c) => (c['name'] as String?) == 'local_mtime')) {
+      await db.execute(
+          'ALTER TABLE files ADD COLUMN local_mtime INTEGER NOT NULL DEFAULT 0');
+    }
+  }
+
+  Future<Map<String, ({String sha, int size, int mtime})>>
+      localFingerprints() async {
+    final rows = await _db.rawQuery('''
+      SELECT path, local_sha, local_size, local_mtime
+      FROM files WHERE deleted = 0 AND local_sha != ''
+    ''');
+    return {
+      for (final row in rows)
+        row['path'] as String: (
+          sha: row['local_sha'] as String,
+          size: row['local_size'] as int,
+          mtime: row['local_mtime'] as int,
+        ),
+    };
   }
 
   /// Highest sequence number this folder has assigned. Starts at 0 for an
@@ -502,6 +536,10 @@ class IndexDb {
       // bytes; re-scanning those bytes must NOT be recorded as authorship or
       // it creates a concurrent version that reverts the peer's edit.
       if (sha256 == priorLocalSha && sha256.isNotEmpty) {
+        if (prior!.localSize != size || prior.localMtime != mtime) {
+          await txn.update('files', {'local_size': size, 'local_mtime': mtime},
+              where: 'path = ?', whereArgs: [relPath]);
+        }
         return false;
       }
 
@@ -524,6 +562,8 @@ class IndexDb {
           deleted: false,
           blockHashes: blockHashes,
           localSha: sha256,
+          localSize: size,
+          localMtime: mtime,
         )),
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
@@ -726,6 +766,8 @@ class IndexDb {
               deleted: remote.deleted,
               blockHashes: remote.blockHashes,
               localSha: priorLocalSha,
+              localSize: prior.localSize,
+              localMtime: prior.localMtime,
             );
       await txn.insert('files', _entryToRow(merged),
           conflictAlgorithm: ConflictAlgorithm.replace);
@@ -794,6 +836,8 @@ class IndexDb {
       deleted: (row['deleted'] as int) != 0,
       blockHashes: blocks,
       localSha: localSha,
+      localSize: (row['local_size'] as int?) ?? 0,
+      localMtime: (row['local_mtime'] as int?) ?? 0,
     );
   }
 
@@ -808,6 +852,8 @@ class IndexDb {
       'deleted': e.deleted ? 1 : 0,
       'block_hashes': e.blockHashes.isEmpty ? null : jsonEncode(e.blockHashes),
       'local_sha': e.localSha,
+      'local_size': e.localSize,
+      'local_mtime': e.localMtime,
     };
   }
 

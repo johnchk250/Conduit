@@ -7,6 +7,7 @@ import '../core/config_store.dart';
 import '../diag.dart';
 import '../net/peer_registry.dart';
 import '../net/peer_session.dart';
+import '../net/transport.dart';
 import '../protocol/wire.dart';
 import '../storage/index_db.dart';
 import 'block_transfer.dart';
@@ -112,7 +113,10 @@ class SyncEngine {
     this.onDeviceStatus,
     this.onPhoneAction,
     this.onPhoneActionResult,
+    this.onLanProbe,
+    this.onLanCandidates,
     this.batchListWithStat,
+    this.hashFileOverride,
   });
 
   final FileSystemAccess fs;
@@ -165,10 +169,16 @@ class SyncEngine {
   final void Function(String peerId, Map<String, dynamic> msg)? onDeviceStatus;
 
   /// Notifies the host when a peer requests a phone action (Roadmap P2).
-  final void Function(String peerId, String requestId, String action)? onPhoneAction;
+  final void Function(String peerId, String requestId, String action)?
+      onPhoneAction;
 
   /// Notifies the host of a phone action result (Roadmap P2).
-  final void Function(String peerId, String requestId, String action, String result)? onPhoneActionResult;
+  final void Function(
+          String peerId, String requestId, String action, String result)?
+      onPhoneActionResult;
+  final void Function(String peerId)? onLanProbe;
+  final void Function(String peerId, List<String> hosts, int port)?
+      onLanCandidates;
 
   /// Optional fast-path metadata lister (Roadmap Phase 0.6 — battery). Passed
   /// straight through to every [FolderWatcher] this engine starts and to
@@ -178,6 +188,8 @@ class SyncEngine {
   /// Null on every other platform, which leaves [FolderWatcher] and
   /// [IndexScanner] behaving exactly as they did before this field existed.
   final Future<List<FileEntry>> Function(String rootPath)? batchListWithStat;
+  final Future<String> Function(String rootPath, String relPath)?
+      hashFileOverride;
 
   /// Ad-hoc file send / auto-receive handler (Roadmap Phase 3a). Set by
   /// [AppState] after construction. Null until initialised. The three
@@ -278,6 +290,12 @@ class SyncEngine {
   /// on session loss. Keyed per-file rather than per-pair so two concurrent
   /// fetches of different files don't interleave on one stream.
   final _serveStreams = <String, StreamController<Map<String, dynamic>>>{};
+
+  /// Session currently driving each pair's reconcile, plus pairs that need one
+  /// retry because a replacement session became ready before the old
+  /// reconcile had released its scanning lock.
+  final _activeReconcileSessions = <String, PeerSession?>{};
+  final _pendingReconnectReconciles = <String>{};
 
   Stream<PairSyncState> get stateChanges => _stateController.stream;
   Stream<SyncEvent> get events => _eventController.stream;
@@ -398,27 +416,12 @@ class SyncEngine {
     });
 
     log(pair.id, 'Watching "${pair.localPath}"', SyncEventLevel.info);
-    // Open the Index DB eagerly and seed it with one full scan so the
-    // durable source of truth exists before any peer connects.
-    final db = await _indexDbFor(pair);
-    await _scanner.scan(
-      fs: fs,
-      db: db,
-      rootPath: pair.localPath,
-      deviceId: deviceId,
-      batchListWithStat: batchListWithStat,
-      ignoreGlobs: pair.ignoreGlobs,
-      ignoreExtensions: pair.ignoreExtensions,
-      maxFileSizeBytes: pair.maxFileSizeBytes,
-    );
-    log(pair.id, 'Index seeded', SyncEventLevel.info);
-    // If a peer is already connected, kick the first reconcile; otherwise
-    // the next onPeerConnected (or local change) will.
     final peerId = pair.peerDeviceId;
-    final session = peerId == null ? null : registry.openSessionFor(peerId);
-    if (session != null && session.isLinkReady) {
-      await reconcile(pair, session);
-    }
+    final candidate = peerId == null ? null : registry.openSessionFor(peerId);
+    final session = candidate?.isLinkReady == true ? candidate : null;
+    // Use reconcile's per-pair guard for the initial seed as well.
+    await reconcile(pair, session);
+    log(pair.id, 'Index seeded', SyncEventLevel.info);
   }
 
   /// One tick of the periodic reconcile safety-net (Roadmap Phase 0.1).
@@ -456,6 +459,8 @@ class SyncEngine {
     _peerLive.remove(pairId);
     _peerSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _sentSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
+    _activeReconcileSessions.remove(pairId);
+    _pendingReconnectReconciles.remove(pairId);
     // Drop any in-flight block fetches/serve streams for this pair.
     final blockKeys =
         _blockSinks.keys.where((k) => k.startsWith('$pairId|')).toList();
@@ -646,6 +651,7 @@ class SyncEngine {
   void onPeerDisconnected(String deviceId) {
     log('', 'Peer disconnected ($deviceId)', SyncEventLevel.warn);
     for (final pair in config.folderPairs) {
+      if (pair.peerDeviceId != deviceId) continue;
       _setStatus(pair.id, 'Peer offline');
     }
     // Phase 0.2: the peer went offline — stretch that peer's watchers back to
@@ -764,7 +770,19 @@ class SyncEngine {
 
   Future<void> reconcile(FolderPair pair, PeerSession? session) async {
     final st = _states[pair.id] ??= PairSyncState(pairId: pair.id);
-    if (st.scanning) return; // already busy
+    if (st.scanning) {
+      // A reconnect can complete while the reconcile tied to the dead session
+      // is still unwinding. Do not lose that reconnect trigger: coalesce one
+      // retry for the replacement session and run it as soon as the old scan
+      // releases the lock. Same-session duplicate triggers remain no-ops.
+      final activeSession = _activeReconcileSessions[pair.id];
+      if (session != null &&
+          session.isLinkReady &&
+          !identical(activeSession, session)) {
+        _pendingReconnectReconciles.add(pair.id);
+      }
+      return;
+    }
     // Phase 1 pause: don't START a new reconcile while paused. In-flight work
     // is allowed to finish (this returns before taking the scanning lock only
     // when nothing is running). Serving inbound block requests is unaffected —
@@ -776,6 +794,7 @@ class SyncEngine {
       return;
     }
     st.scanning = true;
+    _activeReconcileSessions[pair.id] = session;
     st.status = 'Scanning';
     _stateController.add(st);
     try {
@@ -786,7 +805,20 @@ class SyncEngine {
     } finally {
       st.scanning = false;
       st.transferring = false;
+      _activeReconcileSessions.remove(pair.id);
       if (!_disposed) _stateController.add(st);
+
+      if (_pendingReconnectReconciles.remove(pair.id) &&
+          !_disposed &&
+          !_paused &&
+          config.folderPairs.any((p) => p.id == pair.id)) {
+        final peerId = pair.peerDeviceId;
+        final retrySession =
+            peerId == null ? null : registry.openSessionFor(peerId);
+        if (retrySession != null && retrySession.isLinkReady) {
+          unawaited(reconcile(pair, retrySession));
+        }
+      }
     }
   }
 
@@ -837,6 +869,7 @@ class SyncEngine {
       rootPath: pair.localPath,
       deviceId: deviceId,
       batchListWithStat: batchListWithStat,
+      hashFileOverride: hashFileOverride,
       ignoreGlobs: pair.ignoreGlobs,
       ignoreExtensions: pair.ignoreExtensions,
       maxFileSizeBytes: pair.maxFileSizeBytes,
@@ -951,14 +984,36 @@ class SyncEngine {
       return;
     }
 
+    final deferred = session.isBandwidthConstrained
+        ? needs
+            .where((need) => need.peer.size > bluetoothLargeTransferLimitBytes)
+            .toList(growable: false)
+        : const <Need>[];
+    final transferable = deferred.isEmpty
+        ? needs
+        : needs
+            .where((need) => need.peer.size <= bluetoothLargeTransferLimitBytes)
+            .toList(growable: false);
+    if (transferable.isEmpty) {
+      st.status = 'Bluetooth · ${deferred.length} large file(s) paused';
+      st.progress = null;
+      _stateController.add(st);
+      log(
+        pair.id,
+        'Bluetooth deferred ${deferred.length} file(s) larger than 10 MiB',
+        SyncEventLevel.info,
+      );
+      return;
+    }
+
     st.transferring = true;
     st.progress = 0;
     _stateController.add(st);
     _beginTransfer(); // Phase 0.4: hold a wake lock only while bytes move
     var done = 0;
-    final total = needs.length;
+    final total = transferable.length;
     try {
-      for (final need in needs) {
+      for (final need in transferable) {
         // Skip if this direction never pulls. sendOnly = push only; receiveOnly
         // = pull only; twoWay = both. (Push happens implicitly: our advertise
         // above lets the peer compute its own need for the same file.)
@@ -974,7 +1029,8 @@ class SyncEngine {
             blockHashes: need.peer.blockHashes,
             sendRequest: (req) =>
                 _sendBlockRequest(session, pair.id, need.relPath, req),
-            pipelineDepth: _syncPipelineDepth,
+            pipelineDepth:
+                session.isBandwidthConstrained ? 1 : _syncPipelineDepth,
             onProgress: (recv, tot) {
               st.progress = total == 0 ? null : (done + recv / tot) / total;
               if (!_disposed) _stateController.add(st);
@@ -1032,9 +1088,16 @@ class SyncEngine {
     st.transferring = false;
     st.progress = null;
     st.lastSyncedAt = DateTime.now();
-    st.status = 'Idle';
+    st.status = deferred.isEmpty
+        ? 'Idle'
+        : 'Bluetooth · ${deferred.length} large file(s) paused';
     if (!_disposed) _stateController.add(st);
-    log(pair.id, 'V2 synced: $done/$total fetched', SyncEventLevel.info);
+    log(
+      pair.id,
+      'V2 synced: $done/$total fetched'
+      '${deferred.isEmpty ? '' : ', ${deferred.length} deferred on Bluetooth'}',
+      SyncEventLevel.info,
+    );
   }
 
   /// Reference-counted transfer tracking for the wake lock (Roadmap Phase 0.4).
@@ -1387,7 +1450,10 @@ class SyncEngine {
         // with pong so it doesn't drop us; (b) a reconcile nudge when the
         // peer has a file to push (the push step sends ping for that). Both
         // are handled here.
-        session.send({'t': Msg.pong});
+        session.send({
+          't': Msg.pong,
+          if (msg['hb'] != null) 'hb': msg['hb'],
+        });
         final pairId = msg['pairId'] as String?;
         if (pairId != null) {
           final pair = _pairById(pairId);
@@ -1518,7 +1584,22 @@ class SyncEngine {
         final requestId = msg['requestId'] as String? ?? '';
         final action = msg['action'] as String? ?? '';
         final result = msg['result'] as String? ?? '';
-        onPhoneActionResult?.call(session.peer.deviceId, requestId, action, result);
+        onPhoneActionResult?.call(
+            session.peer.deviceId, requestId, action, result);
+        break;
+      case Msg.lanProbe:
+        onLanProbe?.call(session.peer.deviceId);
+        break;
+      case Msg.lanCandidates:
+        final hosts = (msg['hosts'] as List?)
+                ?.map((host) => host.toString())
+                .where((host) => host.isNotEmpty)
+                .toList() ??
+            const <String>[];
+        final port = (msg['port'] as num?)?.toInt() ?? 0;
+        if (hosts.isNotEmpty && port > 0) {
+          onLanCandidates?.call(session.peer.deviceId, hosts, port);
+        }
         break;
       // ---- Ad-hoc file send (Roadmap Phase 3a) -----------------------------
       //
@@ -1787,7 +1868,8 @@ class SyncEngine {
     }
   }
 
-  bool isPairAcceptedByPeer(String pairId) => _peerAcceptedPairs.contains(pairId);
+  bool isPairAcceptedByPeer(String pairId) =>
+      _peerAcceptedPairs.contains(pairId);
 
   void _markPeerAccepted(String pairId) {
     if (_peerAcceptedPairs.add(pairId)) {

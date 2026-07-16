@@ -127,6 +127,11 @@ class MainActivity : FlutterActivity() {
 
         super.configureFlutterEngine(flutterEngine)
         acquireMulticastLock()
+        BluetoothProxy.install(
+            applicationContext,
+            flutterEngine.dartExecutor.binaryMessenger,
+            this,
+        )
 
         // Channel 1: launch the system folder picker, return the granted tree URI.
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CH_PICK_TREE)
@@ -435,6 +440,7 @@ class MainActivity : FlutterActivity() {
             return
         }
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        BluetoothProxy.onPermissionResult(requestCode)
     }
     /// Open the battery-optimization screen. Prefer the direct "ignore battery
     /// optimizations" prompt for THIS app; if that isn't appropriate (we already

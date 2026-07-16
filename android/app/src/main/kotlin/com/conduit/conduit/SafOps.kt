@@ -11,6 +11,8 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.FileInputStream
+import java.security.MessageDigest
+import java.util.concurrent.Executors
 
 /**
  * SAF (Storage Access Framework) operations exposed to Dart over the
@@ -38,6 +40,8 @@ import java.io.FileInputStream
  * the FileSystemAccess.write contract.
  */
 object SafOps {
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+
 
     /**
      * The single replacement for DocumentFile.findFile(). Queries the SAF
@@ -193,6 +197,34 @@ object SafOps {
                             buf.write(tmp, 0, n)
                         }
                         result.success(buf.toByteArray())
+                    }
+                }
+                "hashFile" -> {
+                    val tree = call.argument<String>("treeUri")!!
+                    val rel = call.argument<String>("relPath")!!
+                    ioExecutor.execute {
+                        try {
+                            val uri = resolveFile(ctx, tree, rel)
+                                ?: throw IllegalArgumentException("no such file: $rel")
+                            val digest = MessageDigest.getInstance("SHA-256")
+                            ctx.contentResolver.openInputStream(uri).use { ins ->
+                                if (ins == null) {
+                                    throw IllegalStateException("cannot open input stream")
+                                }
+                                val tmp = ByteArray(256 * 1024)
+                                while (true) {
+                                    val n = ins.read(tmp)
+                                    if (n <= 0) break
+                                    digest.update(tmp, 0, n)
+                                }
+                            }
+                            val hex = digest.digest().joinToString("") {
+                                "%02x".format(it)
+                            }
+                            result.success(hex)
+                        } catch (e: Exception) {
+                            result.error("hash_error", e.message, null)
+                        }
                     }
                 }
                 "write" -> {

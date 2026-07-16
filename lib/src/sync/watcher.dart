@@ -55,6 +55,7 @@ class FolderWatcher {
   Timer? _debounceTimer;
   final _controller = StreamController<void>.broadcast();
   int _lastSignature = 0;
+  bool _scanInProgress = false;
 
   Stream<void> get changes => _controller.stream;
   bool get isRunning => _timer != null;
@@ -98,6 +99,8 @@ class FolderWatcher {
   }
 
   Future<void> _scan() async {
+    if (_scanInProgress) return;
+    _scanInProgress = true;
     try {
       final sig = await _computeSignature();
       if (sig != _lastSignature && _lastSignature != 0) {
@@ -112,6 +115,8 @@ class FolderWatcher {
       // directory might be briefly unavailable — skip this tick. (This is also
       // the path a SAF permission revocation takes: listFiles throws and we
       // hold the last good signature until access returns.)
+    } finally {
+      _scanInProgress = false;
     }
   }
 

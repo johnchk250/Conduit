@@ -12,6 +12,7 @@ add_executable(${BINARY_NAME} WIN32
   "utils.cpp"
   "win32_window.cpp"
   "send_to_shortcut.cpp"
+  "bluetooth_proxy_win.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
   "runner.exe.manifest"
@@ -37,6 +38,7 @@ target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 # Phase 3d: Shell32 + Ole32 for IShellLinkW / CoCreateInstance (Send-to shortcut).
 target_link_libraries(${BINARY_NAME} PRIVATE "Shell32.lib" "Ole32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "Bthprops.lib" "Ws2_32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

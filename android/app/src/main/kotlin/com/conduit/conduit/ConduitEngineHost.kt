@@ -60,6 +60,8 @@ object ConduitEngineHost {
         val appContext = context.applicationContext
         val messenger = engine.dartExecutor.binaryMessenger
 
+        BluetoothProxy.install(appContext, messenger)
+
         MethodChannel(messenger, "conduit/saf").setMethodCallHandler { call, result ->
             SafOps.handle(appContext, call, result)
         }

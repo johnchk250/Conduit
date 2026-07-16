@@ -8,6 +8,7 @@ import 'package:provider/provider.dart';
 import '../app_state.dart';
 import '../core/config_store.dart';
 import '../desktop/tray.dart';
+import '../net/transport.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
 import '../sync/engine.dart';
@@ -892,6 +893,20 @@ class _SettingsHubPage extends StatelessWidget {
             // ---- System (Android-only UI, but the section is always shown) ----
             const GlassSectionLabel('System'),
             const SizedBox(height: 2),
+            if (state.bluetoothSupported) ...[
+              GlassListTile(
+                leadingIcon: Icons.bluetooth_rounded,
+                accentColor: c.blue,
+                title: 'Bluetooth fallback',
+                subtitle: state.bluetoothStatus,
+                trailing: Switch(
+                  value: state.bluetoothEnabled,
+                  onChanged: (v) => state.setBluetoothEnabled(v),
+                  activeThumbColor: c.blue,
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
             // Notification visibility: show/hide the status-bar icon.
             // Android only — on Windows there is no persistent notification.
             if (Platform.isAndroid) ...[
@@ -1026,7 +1041,9 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
     final c = GlassColors.of(context);
-    final isConnected = state.isPeerConnected(widget.peer.deviceId);
+    final connection = state.connectionStateFor(widget.peer.deviceId);
+    final isConnected = connection.isConnected;
+    final transport = connection.transport;
     final dstate = state.getOrCreateDashboardState(widget.peer.deviceId);
 
     String updateTimeStr = 'Never connected';
@@ -1052,34 +1069,14 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
       }
     }
 
-    String connQuality = 'Offline';
-    Color qualityColor = c.textTertiary;
-    if (isConnected) {
-      if (dstate.missedHeartbeats >= 4) {
-        connQuality = 'Reconnecting';
-        qualityColor = c.danger;
-      } else if (dstate.missedHeartbeats >= 2) {
-        connQuality = 'Spotty';
-        qualityColor = c.amber;
-      } else {
-        final rtt = dstate.latestRttMs;
-        if (rtt != null) {
-          if (rtt < 30) {
-            connQuality = 'Excellent ($rtt ms)';
-            qualityColor = c.mint;
-          } else if (rtt < 100) {
-            connQuality = 'Good ($rtt ms)';
-            qualityColor = c.blue;
-          } else {
-            connQuality = 'Spotty ($rtt ms)';
-            qualityColor = c.amber;
-          }
-        } else {
-          connQuality = 'Connected';
-          qualityColor = c.mint;
-        }
-      }
-    }
+    final connQuality = connection.qualityLabel;
+    final qualityColor = switch (connection.quality) {
+      PeerLinkQuality.offline => c.textTertiary,
+      PeerLinkQuality.connecting => c.amber,
+      PeerLinkQuality.healthy => c.mint,
+      PeerLinkQuality.degraded => c.amber,
+      PeerLinkQuality.unstable => c.danger,
+    };
 
     Widget batteryWidget = const SizedBox.shrink();
     if (dstate.batteryPct != null) {
@@ -1311,7 +1308,9 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
                 style: TextStyle(color: c.textTertiary, fontSize: 12.5),
               ),
               Text(
-                connQuality,
+                transport == null
+                    ? connQuality
+                    : '${transport.label} · $connQuality',
                 style: TextStyle(
                     color: qualityColor,
                     fontSize: 12.5,

@@ -5,6 +5,62 @@
 
 ---
 
+## 2026-07-16 — Bluetooth fallback, seamless LAN takeover, and scan efficiency
+
+**Context:** Add a usable Bluetooth transport between Windows and Android,
+retain LAN as the preferred path, switch transports without contradictory UI
+state, and avoid battery-heavy LAN monitoring on the phone.
+
+**What was implemented:**
+
+- Added native Bluetooth Classic RFCOMM hosts on Android
+  (`BluetoothProxy.kt`) and Windows (`bluetooth_proxy_win.*`). Each native
+  bridge proxies RFCOMM to a loopback TCP socket, preserving the existing
+  Conduit framing, pairing code, pinned-key authentication, heartbeat, and sync
+  protocol.
+- Added `BluetoothBridge`, `ConnectionTransport`, transport priority,
+  `PeerConnectionSnapshot`, and persisted Bluetooth endpoint mappings.
+- Added Android Bluetooth permissions for pre-Android-12 and Android 12+
+  devices, runtime permission requests, OS-paired candidate discovery, bounded
+  5-second connects, incoming listeners, and native status reporting.
+- Extended QR/connect tokens to advertise Bluetooth availability even when no
+  LAN address is present.
+- Implemented deterministic transport arbitration:
+  - LAN is always preferred over Bluetooth.
+  - Healthy duplicate sessions are rejected rather than churned.
+  - Bluetooth is retained as fallback when LAN disappears.
+  - Windows sends a lightweight LAN probe every 10 seconds while on Bluetooth;
+    Android only responds with current candidates, keeping the periodic watcher
+    off the phone.
+- Consolidated UI connection reporting around the live session registry.
+  Connection phase, active transport, RTT quality, and missed-heartbeat quality
+  now come from one snapshot. A connected session can be labeled unstable, but
+  can no longer simultaneously appear connected and "reconnecting."
+- Corrected heartbeat correlation by echoing heartbeat IDs in pong frames and
+  resetting cached dashboard heartbeat metrics on session replacement.
+- Added Bluetooth bandwidth protections:
+  - files larger than 10 MiB are deferred until LAN is available;
+  - sync/ad-hoc pipeline depth falls back to one over Bluetooth;
+  - the send UI explains why a large transfer was paused.
+- Improved Android scan performance:
+  - Index DB now persists the locally observed size and mtime with each digest;
+  - unchanged files reuse their SHA-256 instead of being re-read;
+  - changed SAF files can be hashed natively on a dedicated I/O executor;
+  - overlapping watcher scans are suppressed.
+- Updated the Android Gradle/AGP/Kotlin versions and enabled core library
+  desugaring required by the current Flutter Android toolchain.
+
+**Verification:**
+
+- Targeted connection/transport tests passed.
+- Full `flutter test`: **202/202 passed**.
+- `flutter build apk`: passed (`app-release.apk`, 71.5 MiB).
+- `flutter build windows`: passed (`conduit.exe`).
+- Targeted analysis: no new errors; existing unrelated lint warnings remain.
+- `git diff --check`: passed (line-ending conversion notices only).
+
+---
+
 ## 2026-07-14 (session 3) — Phone Dashboard Implementation
 
 **Context:** Implement the Phone Dashboard for paired Android devices (from `docs/2026-07-14-phone-dashboard-plan.md`). This allows Windows users to monitor connected Android peers (battery status, storage metrics, connection quality via RTT, and sync health rollup) and trigger locating alerts (alarm sound + vibration) on the phone.

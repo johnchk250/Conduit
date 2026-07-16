@@ -5,6 +5,11 @@
 
 #include "flutter/generated_plugin_registrant.h"
 #include "send_to_shortcut.h"
+#include "bluetooth_proxy_win.h"
+
+namespace {
+constexpr UINT kPlatformTaskMessage = WM_APP + 73;
+}
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -37,6 +42,62 @@ bool FlutterWindow::OnCreate() {
   share_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       messenger, "conduit/share_receive",
       &flutter::StandardMethodCodec::GetInstance());
+  bluetooth_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          messenger, "conduit/bluetooth",
+          &flutter::StandardMethodCodec::GetInstance());
+  bluetooth_proxy_ = std::make_unique<BluetoothProxyWin>(
+      [this](std::function<void()> task) {
+        PostPlatformTask(std::move(task));
+      },
+      [this](const std::string& method,
+             const flutter::EncodableValue& arguments) {
+        if (!bluetooth_channel_) return;
+        bluetooth_channel_->InvokeMethod(
+            method, std::make_unique<flutter::EncodableValue>(arguments));
+      });
+
+  bluetooth_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (call.method_name() == "start") {
+          int port = 0;
+          if (args) {
+            auto it = args->find(flutter::EncodableValue("dartPort"));
+            if (it != args->end()) {
+              if (const auto* value = std::get_if<int>(&it->second)) port = *value;
+              if (const auto* value64 = std::get_if<int64_t>(&it->second))
+                port = static_cast<int>(*value64);
+            }
+          }
+          result->Success(flutter::EncodableValue(bluetooth_proxy_->Start(port)));
+        } else if (call.method_name() == "stop") {
+          bluetooth_proxy_->Stop();
+          result->Success();
+        } else if (call.method_name() == "requestPermissions") {
+          result->Success();
+        } else if (call.method_name() == "connect") {
+          std::string endpoint;
+          if (args) {
+            auto it = args->find(flutter::EncodableValue("endpointId"));
+            if (it != args->end()) {
+              if (const auto* value = std::get_if<std::string>(&it->second))
+                endpoint = *value;
+            }
+          }
+          if (endpoint.empty()) {
+            result->Error("BLUETOOTH_ENDPOINT", "Missing Bluetooth service id");
+          } else {
+            bluetooth_proxy_->Connect(
+                endpoint,
+                std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>>(
+                    std::move(result)));
+          }
+        } else {
+          result->NotImplemented();
+        }
+      });
 
   // Handle "conduit/shell" methods (e.g. creating the Send To shortcut).
   shell_channel_->SetMethodCallHandler(
@@ -73,11 +134,30 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  if (bluetooth_proxy_) bluetooth_proxy_->Stop();
+  bluetooth_proxy_.reset();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
 
   Win32Window::OnDestroy();
+}
+
+void FlutterWindow::PostPlatformTask(std::function<void()> task) {
+  {
+    std::lock_guard<std::mutex> lock(platform_tasks_mutex_);
+    platform_tasks_.push_back(std::move(task));
+  }
+  PostMessage(GetHandle(), kPlatformTaskMessage, 0, 0);
+}
+
+void FlutterWindow::DrainPlatformTasks() {
+  std::deque<std::function<void()>> tasks;
+  {
+    std::lock_guard<std::mutex> lock(platform_tasks_mutex_);
+    tasks.swap(platform_tasks_);
+  }
+  for (auto& task : tasks) task();
 }
 
 void FlutterWindow::SendPathsToDart(const std::vector<std::wstring>& paths) {
@@ -114,6 +194,9 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   switch (message) {
+    case kPlatformTaskMessage:
+      DrainPlatformTasks();
+      return 0;
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;

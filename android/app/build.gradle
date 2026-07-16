@@ -7,15 +7,13 @@ plugins {
 
 android {
     namespace = "com.conduit.conduit"
-    // Plugins require SDK 35. The android-35 core-for-system-modules.jar
-    // jlink transform only fails under JDK 21; we build with JDK 17 (see
-    // `flutter config --jdk-dir`), where it transforms cleanly.
-    compileSdk = 35
+    compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        coreLibraryDesugaringEnabled true
     }
 
     kotlinOptions {
@@ -45,6 +43,8 @@ flutter {
 }
 
 dependencies {
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:1.2.2"
+
     // Storage Access Framework helpers (DocumentFile tree access)
     implementation "androidx.documentfile:documentfile:1.0.1"
     // Core KTX for NotificationCompat etc.

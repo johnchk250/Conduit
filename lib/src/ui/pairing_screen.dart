@@ -9,6 +9,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../app_state.dart';
 import '../core/config_store.dart';
 import '../net/discovery.dart';
+import '../net/transport.dart';
 import 'glass.dart';
 
 /// Fast 180 ms fade push for the QR scan sub-screen.
@@ -141,7 +142,8 @@ class _GlassSegmentedControl extends StatelessWidget {
                           )
                         : null,
                     border: i == selectedIndex
-                        ? Border.all(color: Colors.white.withValues(alpha: 0.12))
+                        ? Border.all(
+                            color: Colors.white.withValues(alpha: 0.12))
                         : null,
                   ),
                   child: Row(
@@ -151,9 +153,8 @@ class _GlassSegmentedControl extends StatelessWidget {
                       Icon(
                         icons[i],
                         size: 16,
-                        color: i == selectedIndex
-                            ? Colors.white
-                            : c.textTertiary,
+                        color:
+                            i == selectedIndex ? Colors.white : c.textTertiary,
                       ),
                       const SizedBox(width: 6),
                       Flexible(
@@ -234,6 +235,8 @@ class _DiscoveredList extends StatelessWidget {
               peer: peer,
               connected: state.isPeerConnected(peer.deviceId),
               discovered: discovered.any((d) => d.deviceId == peer.deviceId),
+              transportLabel:
+                  state.connectionTransportFor(peer.deviceId)?.label,
               onReconnect: () => _reconnect(ctx, state, peer),
               onDisconnect: () => _confirmDisconnect(ctx, state, peer),
               onUnpair: () => _confirmUnpair(ctx, state, peer),
@@ -244,7 +247,7 @@ class _DiscoveredList extends StatelessWidget {
         GlassSectionLabel(
           unpairedDiscovered.isEmpty
               ? 'Searching for new devices…'
-              : 'New devices on this network (${unpairedDiscovered.length})',
+              : 'New nearby devices (${unpairedDiscovered.length})',
         ),
         if (unpairedDiscovered.isEmpty)
           GlassPanel(
@@ -265,11 +268,23 @@ class _DiscoveredList extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Both devices must be on the same Wi-Fi. If auto-discovery '
-                  'is blocked on this network, use the Manual connect tab.',
+                  'Conduit checks LAN and Bluetooth. LAN is preferred; '
+                  'Bluetooth is used automatically when LAN is unavailable.',
                   textAlign: TextAlign.center,
                   style: GoogleFonts.inter(
                     textStyle: TextStyle(color: c.textSecondary, fontSize: 12),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  state.bluetoothStatus,
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.inter(
+                    textStyle: TextStyle(
+                      color: state.bluetoothStatusHealthy ? c.mint : c.amber,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
               ],
@@ -278,12 +293,14 @@ class _DiscoveredList extends StatelessWidget {
         else
           for (final p in unpairedDiscovered) ...[
             GlassListTile(
-              leadingIcon:
-                  p.platform == 'android' ? Icons.phone_android : Icons.computer,
+              leadingIcon: p.platform == 'android'
+                  ? Icons.phone_android
+                  : Icons.computer,
               accentColor: c.blue,
               title: p.name,
-              subtitle:
-                  '${p.platform[0].toUpperCase()}${p.platform.substring(1)} · ${p.address.address}',
+              subtitle: p.transport == ConnectionTransport.bluetooth
+                  ? 'Bluetooth · nearby'
+                  : '${p.platform[0].toUpperCase()}${p.platform.substring(1)} · ${p.address.address}',
               subtitleMono: true,
               trailing: GlassButton(
                 icon: Icons.handshake_outlined,
@@ -439,6 +456,7 @@ class _PairedPeerTile extends StatelessWidget {
     required this.peer,
     required this.connected,
     required this.discovered,
+    required this.transportLabel,
     required this.onReconnect,
     required this.onDisconnect,
     required this.onUnpair,
@@ -447,6 +465,7 @@ class _PairedPeerTile extends StatelessWidget {
   final PairedPeer peer;
   final bool connected;
   final bool discovered;
+  final String? transportLabel;
   final VoidCallback onReconnect;
   final VoidCallback onDisconnect;
   final VoidCallback onUnpair;
@@ -458,7 +477,7 @@ class _PairedPeerTile extends StatelessWidget {
         ? 'Device'
         : '${peer.platform[0].toUpperCase()}${peer.platform.substring(1)}';
     final status = connected
-        ? 'Connected'
+        ? 'Connected${transportLabel == null ? '' : ' via $transportLabel'}'
         : discovered
             ? 'Seen on network'
             : 'Offline';
@@ -505,16 +524,16 @@ class _PairedPeerTile extends StatelessWidget {
                 title: Text('Disconnect'),
               ),
             ),
-            const PopupMenuItem(
-              value: 'unpair',
-              child: ListTile(
-                leading: Icon(Icons.delete_outline),
-                title: Text('Unpair'),
-              ),
+          const PopupMenuItem(
+            value: 'unpair',
+            child: ListTile(
+              leading: Icon(Icons.delete_outline),
+              title: Text('Unpair'),
             ),
-          ],
-        ),
-      );
+          ),
+        ],
+      ),
+    );
   }
 }
 

@@ -9,6 +9,8 @@ import '../protocol/wire.dart';
 import 'discovery.dart';
 import 'peer_registry.dart';
 import 'secure_frame.dart';
+import 'transport.dart';
+import 'bluetooth_bridge.dart';
 
 /// Callback shape for an established (post-handshake) session with a peer.
 ///
@@ -56,7 +58,14 @@ class PeerSession {
     required this.codec,
     required this.initiatedByUs,
     this.features = const [],
-  }) : generation = _nextGeneration();
+    ConnectionTransport transport = ConnectionTransport.lan,
+    String? transportEndpoint,
+  }) : generation = _nextGeneration() {
+    _sessionTransports[this] = transport;
+    if (transportEndpoint != null) {
+      _sessionTransportEndpoints[this] = transportEndpoint;
+    }
+  }
 
   final PairedPeer peer;
   final Socket socket;
@@ -270,6 +279,23 @@ class PeerSession {
   }
 }
 
+final Expando<ConnectionTransport> _sessionTransports =
+    Expando<ConnectionTransport>('connectionTransport');
+final Expando<String> _sessionTransportEndpoints =
+    Expando<String>('connectionTransportEndpoint');
+
+/// Transport metadata is kept outside the structural [PeerSession] interface.
+/// Test doubles that implement PeerSession therefore remain source-compatible
+/// and safely default to LAN unless explicitly constructed by production code.
+extension PeerSessionTransport on PeerSession {
+  ConnectionTransport get transport =>
+      _sessionTransports[this] ?? ConnectionTransport.lan;
+
+  String? get transportEndpoint => _sessionTransportEndpoints[this];
+
+  bool get isBandwidthConstrained => transport.isBandwidthConstrained;
+}
+
 typedef VoidCallback = void Function();
 
 /// Manages the listening socket, accepts incoming peer connections, performs
@@ -289,6 +315,7 @@ class PeerConnectionManager {
     required this.registry,
     required this.onSessionReady,
     required this.onPairingRequest,
+    this.resolveIncomingTransport,
     this.listenPort = kDefaultListenPort,
   });
 
@@ -304,6 +331,7 @@ class PeerConnectionManager {
   final PeerConnectionRegistry registry;
   final OnSessionReady onSessionReady;
   final void Function(DiscoveredPeer peer, String code) onPairingRequest;
+  final IncomingTransport Function(int remotePort)? resolveIncomingTransport;
 
   int listenPort;
   ServerSocket? _server;
@@ -402,6 +430,8 @@ class PeerConnectionManager {
 
   Future<void> _onHello(
       Socket socket, FrameCodec codec, Map<String, dynamic> hello) async {
+    final incoming = resolveIncomingTransport?.call(socket.remotePort) ??
+        const IncomingTransport(ConnectionTransport.lan);
     final peerDeviceId = hello['deviceId'] as String;
     final peerName = hello['name'] as String;
     final peerPlatform = hello['platform'] as String;
@@ -478,6 +508,7 @@ class PeerConnectionManager {
     final existing = registry.sessionFor(peerDeviceId);
     if (existing != null &&
         !existing.isClosed &&
+        !isTransportUpgrade(existing.transport, incoming.transport) &&
         !existing.canBeSupersededByAutoReconnect) {
       Diag.session('dup_hello_rejected',
           peer: peerDeviceId,
@@ -504,7 +535,8 @@ class PeerConnectionManager {
             'missed': existing.missedHeartbeats,
           });
     }
-    final features = (hello['features'] as List?)?.cast<String>().toList() ?? const <String>[];
+    final features = (hello['features'] as List?)?.cast<String>().toList() ??
+        const <String>[];
     codec.send({
       't': Msg.welcome,
       'deviceId': identity.deviceId,
@@ -523,7 +555,15 @@ class PeerConnectionManager {
     if (!isAlreadyPaired) {
       await config.rememberPeer(peer);
     }
-    _publishSession(peer, socket, codec, initiatedByUs: false, features: features);
+    _publishSession(
+      peer,
+      socket,
+      codec,
+      initiatedByUs: false,
+      features: features,
+      transport: incoming.transport,
+      transportEndpoint: incoming.endpointId,
+    );
   }
 
   bool _publishSession(
@@ -532,6 +572,8 @@ class PeerConnectionManager {
     FrameCodec codec, {
     required bool initiatedByUs,
     List<String> features = const [],
+    ConnectionTransport transport = ConnectionTransport.lan,
+    String? transportEndpoint,
   }) {
     final session = PeerSession(
       peer: peer,
@@ -539,6 +581,8 @@ class PeerConnectionManager {
       codec: codec,
       initiatedByUs: initiatedByUs,
       features: features,
+      transport: transport,
+      transportEndpoint: transportEndpoint,
     );
     // The codec is ALREADY being pumped (started in _handleIncoming /
     // _handshake). Its onMessage currently points at the temp handshake
@@ -608,6 +652,42 @@ class PeerConnectionManager {
     );
   }
 
+  /// Connect through a native RFCOMM-to-loopback proxy.
+  Future<PeerSession> connectBluetooth({
+    required DiscoveredPeer target,
+    required int localProxyPort,
+    String? pairCode,
+    Duration timeout = const Duration(seconds: 15),
+    bool forceTakeover = false,
+  }) async {
+    final isPaired =
+        config.pairedPeers.any((p) => p.deviceId == target.deviceId);
+    if (!isPaired && pairCode == null) {
+      throw StateError(
+          'Not paired with ${target.deviceId}; pairCode required.');
+    }
+    final socket = await Socket.connect(
+      InternetAddress.loopbackIPv4,
+      localProxyPort,
+      timeout: timeout,
+    );
+    try {
+      return await _handshake(
+        socket: socket,
+        deviceId: target.deviceId,
+        isPaired: isPaired,
+        pairCode: pairCode,
+        timeout: timeout,
+        forceTakeover: forceTakeover,
+        transport: ConnectionTransport.bluetooth,
+        transportEndpoint: target.transportEndpoint,
+      );
+    } catch (_) {
+      await socket.close().catchError((_) {});
+      rethrow;
+    }
+  }
+
   Future<PeerSession> connectMultiHost({
     required String deviceId,
     required String name,
@@ -660,6 +740,7 @@ class PeerConnectionManager {
           pairCode: pairCode,
           timeout: timeout,
           forceTakeover: forceTakeover,
+          transport: ConnectionTransport.lan,
         );
       } catch (e) {
         lastError = e;
@@ -685,6 +766,8 @@ class PeerConnectionManager {
     String? pairCode,
     required Duration timeout,
     bool forceTakeover = false,
+    ConnectionTransport transport = ConnectionTransport.lan,
+    String? transportEndpoint,
   }) async {
     final codec = FrameCodec(socket);
 
@@ -711,7 +794,8 @@ class PeerConnectionManager {
     codec.send(hello);
 
     final welcome = await waitForMessage(codec, Msg.welcome, timeout: timeout);
-    final features = (welcome['features'] as List?)?.cast<String>().toList() ?? const <String>[];
+    final features = (welcome['features'] as List?)?.cast<String>().toList() ??
+        const <String>[];
     final peer = PairedPeer(
       deviceId: welcome['deviceId'] as String,
       name: welcome['name'] as String,
@@ -719,11 +803,29 @@ class PeerConnectionManager {
       publicKeyB64: welcome['pubKey'] as String,
     );
 
+    if (isPaired) {
+      final expected = config.pairedPeers.firstWhere(
+        (candidate) => candidate.deviceId == deviceId,
+      );
+      if (peer.deviceId != expected.deviceId ||
+          peer.publicKeyB64 != expected.publicKeyB64) {
+        throw StateError('paired peer identity mismatch');
+      }
+    }
+
     if (!isPaired) {
       await config.rememberPeer(peer);
     }
 
-    final accepted = _publishSession(peer, socket, codec, initiatedByUs: true, features: features);
+    final accepted = _publishSession(
+      peer,
+      socket,
+      codec,
+      initiatedByUs: true,
+      features: features,
+      transport: transport,
+      transportEndpoint: transportEndpoint,
+    );
     if (!accepted) {
       throw StateError('connection superseded by existing session');
     }

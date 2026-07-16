@@ -7,10 +7,15 @@
 #include <flutter/standard_method_codec.h>
 
 #include <memory>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "win32_window.h"
+
+class BluetoothProxyWin;
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
@@ -34,6 +39,8 @@ class FlutterWindow : public Win32Window {
  private:
   // Phase 3d: Helper to send paths to Flutter Dart side.
   void SendPathsToDart(const std::vector<std::wstring>& paths);
+  void PostPlatformTask(std::function<void()> task);
+  void DrainPlatformTasks();
 
   // The project to run.
   flutter::DartProject project_;
@@ -49,6 +56,10 @@ class FlutterWindow : public Win32Window {
   // Phase 3d: Method channels for shell operations and sending shared files.
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> shell_channel_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> share_channel_;
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> bluetooth_channel_;
+  std::unique_ptr<BluetoothProxyWin> bluetooth_proxy_;
+  std::mutex platform_tasks_mutex_;
+  std::deque<std::function<void()>> platform_tasks_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

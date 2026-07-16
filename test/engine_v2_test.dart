@@ -62,7 +62,8 @@ void main() {
     await h.dispose();
   });
 
-  test('ready handshake: ack:false marks connected immediately (responder path)',
+  test(
+      'ready handshake: ack:false marks connected immediately (responder path)',
       () async {
     // Fix for the "peer shows offline" race condition:
     // Both sides send {ready, ack:false} immediately after the TCP handshake.
@@ -107,14 +108,14 @@ void main() {
     expect(
       events.any((e) => e.message == 'Connected to Bob ($_bobDeviceId)'),
       isTrue,
-      reason: 'Connected event must fire on ack:false, not deferred to ack:true',
+      reason:
+          'Connected event must fire on ack:false, not deferred to ack:true',
     );
 
     // A subsequent ack:true (if the initiator's own ready was NOT dropped) is
     // a harmless no-op — markLinkReady() is idempotent.
-    final connectedEventsBefore = events
-        .where((e) => e.message.startsWith('Connected to'))
-        .length;
+    final connectedEventsBefore =
+        events.where((e) => e.message.startsWith('Connected to')).length;
     await h.alice.handlePeerMessageForTest(h.session, {
       't': Msg.ready,
       'deviceId': _bobDeviceId,
@@ -128,6 +129,19 @@ void main() {
     );
     expect(h.session.isLinkReady, isTrue);
     await sub.cancel();
+  });
+
+  test('heartbeat pong echoes the probe id', () async {
+    h.connectAlice();
+    h.session.sent.clear();
+
+    await h.alice.handlePeerMessageForTest(h.session, {
+      't': Msg.ping,
+      'hb': 'probe-42',
+    });
+
+    final pong = h.session.sent.singleWhere((msg) => msg['t'] == Msg.pong);
+    expect(pong['hb'], 'probe-42');
   });
 
   test('reconcile with no peer: scans and seeds the DB, reports idle',
@@ -260,6 +274,45 @@ void main() {
             'onPeerSessionLost must drop _peerLive for reconnect to refetch');
   });
 
+  test('replacement session retries after active reconcile unwinds', () async {
+    // Seed the pair while the original session is not link-ready, then hold its
+    // first online reconcile inside the scanner.
+    await h.alice.startPair(h.pair);
+    h.session.markLinkReady();
+    final scanGate = Completer<void>();
+    h.aliceFs.listFilesGate = scanGate;
+    final oldReconcile = h.alice.reconcile(h.pair, h.session);
+    await h.pumpUntil(
+      () => h.alice.stateFor(h.pair.id)?.scanning == true,
+    );
+
+    // A replacement connection becomes ready before the old reconcile has
+    // released its scanning lock. This used to hit the re-entrancy guard and
+    // vanish, leaving the pair stuck until the 30-minute periodic safety net.
+    final replacement = _FakeSession(
+      peer: h.session.peer,
+      bobFs: h.bobFs,
+      generation: 2,
+    );
+    replacement.markLinkReady();
+    h.registry.publish(_bobDeviceId, replacement);
+    await h.alice.reconcile(h.pair, replacement);
+
+    scanGate.complete();
+    await oldReconcile;
+    await h.pumpUntil(
+      () =>
+          h.aliceFs.listFilesCalls >= 3 &&
+          h.alice.stateFor(h.pair.id)?.scanning != true,
+    );
+
+    expect(
+      replacement.sent.any((m) => m['t'] == Msg.indexRequest),
+      isTrue,
+      reason: 'the replacement session must receive the queued reconcile',
+    );
+  });
+
   test('Msg.request for an unknown pair yields a terminal-error response',
       () async {
     // A request for a pair we don't know must reply with a single
@@ -303,6 +356,7 @@ class _Harness {
     this.tmp,
     this.alice,
     this.session,
+    this.registry,
     this.pair,
     this.aliceFs,
     this.bobFs,
@@ -311,6 +365,7 @@ class _Harness {
   final Directory tmp;
   final SyncEngine alice;
   final _FakeSession session;
+  final PeerConnectionRegistry registry;
   final FolderPair pair;
   final FakeFs aliceFs;
   final FakeFs bobFs;
@@ -375,7 +430,7 @@ class _Harness {
     // resolve to this session, exactly as a real onPeerConnected would see.
     registry.publish(_bobDeviceId, session);
 
-    return _Harness._(tmp, alice, session, pair, aliceFs, bobFs);
+    return _Harness._(tmp, alice, session, registry, pair, aliceFs, bobFs);
   }
 
   /// Run Alice's onPeerConnected so her engine owns the message handler. Must
@@ -493,7 +548,11 @@ class _Harness {
 /// (peer, generation, send, onMessage, restartHeartbeat, handlePong). Anything
 /// else would only be reached by the legacy path, which these tests don't run.
 class _FakeSession implements PeerSession {
-  _FakeSession({required this.peer, required this.bobFs});
+  _FakeSession({
+    required this.peer,
+    required this.bobFs,
+    this.generation = 1,
+  });
 
   @override
   final PairedPeer peer;
@@ -501,7 +560,7 @@ class _FakeSession implements PeerSession {
   /// Fixed generation. The engine's gen-guard compares this against the
   /// registry's published generation; since we publish THIS session, they match.
   @override
-  final int generation = 1;
+  final int generation;
 
   /// Every frame the engine asked this session to send. Tests assert on this
   /// directly — no stream taps, no delivery-timing races.
@@ -671,12 +730,18 @@ class FakeFs implements FileSystemAccess {
   }
   final Map<String, List<int>> files = {};
 
+  Completer<void>? listFilesGate;
+  int listFilesCalls = 0;
   @override
   bool get isAndroidSAF => false;
 
   @override
-  Future<List<String>> listFiles(String rootPath) async =>
-      files.keys.toList(growable: false);
+  Future<List<String>> listFiles(String rootPath) async {
+    listFilesCalls++;
+    final gate = listFilesGate;
+    if (gate != null) await gate.future;
+    return files.keys.toList(growable: false);
+  }
 
   @override
   Future<FileEntry?> stat(String rootPath, String relPath) async {

@@ -75,6 +75,8 @@ class Msg {
   static const deviceStatus = 'device_status';
   static const phoneAction = 'phone_action';
   static const phoneActionResult = 'phone_action_result';
+  static const lanProbe = 'lan_probe';
+  static const lanCandidates = 'lan_candidates';
 
   // ---- Ad-hoc file send (Roadmap Phase 3a) --------------------------------
   //

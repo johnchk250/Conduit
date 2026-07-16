@@ -198,6 +198,12 @@ class ConfigStore {
       endpoints.remove(deviceId);
       _data['peerEndpoints'] = endpoints;
     }
+    final rawBluetoothEndpoints = _data['peerBluetoothEndpoints'];
+    if (rawBluetoothEndpoints is Map) {
+      final endpoints = Map<String, dynamic>.from(rawBluetoothEndpoints);
+      endpoints.remove(deviceId);
+      _data['peerBluetoothEndpoints'] = endpoints;
+    }
     await _persist();
   }
 
@@ -234,6 +240,43 @@ class ConfigStore {
       'updatedAt': DateTime.now().toIso8601String(),
     };
     _data['peerEndpoints'] = endpoints;
+    await _persist();
+  }
+
+  String? bluetoothEndpoint(String deviceId) {
+    final raw = _data['peerBluetoothEndpoints'];
+    if (raw is! Map) return null;
+    final value = raw[deviceId];
+    return value is String && value.isNotEmpty ? value : null;
+  }
+
+  String? peerIdForBluetoothEndpoint(String endpointId) {
+    final raw = _data['peerBluetoothEndpoints'];
+    if (raw is! Map) return null;
+    for (final entry in raw.entries) {
+      if (entry.value == endpointId) return entry.key.toString();
+    }
+    return null;
+  }
+
+  Future<void> rememberPeerBluetoothEndpoint({
+    required String deviceId,
+    required String endpointId,
+  }) async {
+    if (deviceId.isEmpty || endpointId.isEmpty) return;
+    final raw = _data['peerBluetoothEndpoints'];
+    final endpoints =
+        raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+    if (endpoints[deviceId] == endpointId) return;
+    endpoints[deviceId] = endpointId;
+    _data['peerBluetoothEndpoints'] = endpoints;
+    await _persist();
+  }
+
+  bool get bluetoothEnabled => _data['bluetoothEnabled'] != false;
+
+  Future<void> setBluetoothEnabled(bool value) async {
+    _data['bluetoothEnabled'] = value;
     await _persist();
   }
 
@@ -316,7 +359,8 @@ class ConfigStore {
     return Map<String, dynamic>.from(snapshots);
   }
 
-  Future<void> saveDeviceStatusSnapshot(String deviceId, Map<String, dynamic> snapshot) async {
+  Future<void> saveDeviceStatusSnapshot(
+      String deviceId, Map<String, dynamic> snapshot) async {
     final snapshots = Map<String, dynamic>.from(deviceStatusSnapshots);
     snapshots[deviceId] = snapshot;
     _data['deviceStatusSnapshots'] = snapshots;

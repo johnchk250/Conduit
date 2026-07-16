@@ -70,6 +70,7 @@ class _SendFlowViewState extends State<SendFlowView> {
       }
     }
   }
+
   _SendPhase _phase = _SendPhase.idle;
 
   // Files loaded from the OS share/send mechanism (Phase 3d). These come in
@@ -419,7 +420,8 @@ class _SendFlowViewState extends State<SendFlowView> {
         : failed == 0
             ? 'Sent $sent file${sent == 1 ? '' : 's'} to $peerName'
             : sent == 0
-                ? "Couldn't send to $peerName"
+                ? (state.lastTransferBlockReason ??
+                    "Couldn't send to $peerName")
                 : 'Sent $sent, failed $failed';
 
     setState(() {
@@ -541,8 +543,8 @@ class _SendFlowViewState extends State<SendFlowView> {
 
   // ── Layouts ───────────────────────────────────────────────────────────────
 
-  Widget _buildCompactLayout(
-      BuildContext context, GlassColors c, AppState state, bool fromShare, bool anyConnected) {
+  Widget _buildCompactLayout(BuildContext context, GlassColors c,
+      AppState state, bool fromShare, bool anyConnected) {
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
       child: Column(
@@ -563,8 +565,8 @@ class _SendFlowViewState extends State<SendFlowView> {
     );
   }
 
-  Widget _buildFullLayout(
-      BuildContext context, GlassColors c, AppState state, bool fromShare, bool anyConnected) {
+  Widget _buildFullLayout(BuildContext context, GlassColors c, AppState state,
+      bool fromShare, bool anyConnected) {
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 640),
@@ -644,7 +646,8 @@ class _SendFlowViewState extends State<SendFlowView> {
 
   // ── Shared-files banner (Phase 3d) ──────────────────────────────────────
 
-  Widget _buildSharedBanner(BuildContext context, GlassColors c, {required bool compact}) {
+  Widget _buildSharedBanner(BuildContext context, GlassColors c,
+      {required bool compact}) {
     return GlassPanel(
       ringColor: c.violet,
       padding: EdgeInsets.symmetric(
@@ -693,7 +696,8 @@ class _SendFlowViewState extends State<SendFlowView> {
 
   // ── Main content states ──────────────────────────────────────────────────
 
-  Widget _buildMainContent(BuildContext context, GlassColors c, AppState state, bool anyConnected) {
+  Widget _buildMainContent(
+      BuildContext context, GlassColors c, AppState state, bool anyConnected) {
     switch (_phase) {
       case _SendPhase.sending:
         return _buildSendingState(context, c);
@@ -707,8 +711,10 @@ class _SendFlowViewState extends State<SendFlowView> {
     }
   }
 
-  Widget _buildPickState(BuildContext context, GlassColors c, bool anyConnected) {
-    final accent = _isDragging ? c.violet : (anyConnected ? c.violet : c.textTertiary);
+  Widget _buildPickState(
+      BuildContext context, GlassColors c, bool anyConnected) {
+    final accent =
+        _isDragging ? c.violet : (anyConnected ? c.violet : c.textTertiary);
     return DropTarget(
       onDragEntered: (_) => setState(() => _isDragging = true),
       onDragExited: (_) => setState(() => _isDragging = false),
@@ -748,8 +754,8 @@ class _SendFlowViewState extends State<SendFlowView> {
                       ],
                     ),
                     border: Border.all(
-                        color: accent.withValues(
-                            alpha: _isDragging ? 0.7 : 0.3)),
+                        color:
+                            accent.withValues(alpha: _isDragging ? 0.7 : 0.3)),
                   ),
                   child: Icon(
                     _isDragging
@@ -761,9 +767,7 @@ class _SendFlowViewState extends State<SendFlowView> {
                 ),
                 SizedBox(height: widget.compact ? 14 : 24),
                 Text(
-                  _isDragging
-                      ? 'Drop to add files'
-                      : 'Click to choose files',
+                  _isDragging ? 'Drop to add files' : 'Click to choose files',
                   style: GoogleFonts.manrope(
                     textStyle: TextStyle(
                       fontWeight: FontWeight.bold,
@@ -792,7 +796,8 @@ class _SendFlowViewState extends State<SendFlowView> {
     );
   }
 
-  Widget _buildReadyState(BuildContext context, GlassColors c, AppState state, bool anyConnected) {
+  Widget _buildReadyState(
+      BuildContext context, GlassColors c, AppState state, bool anyConnected) {
     final names = _fileNames;
     return DropTarget(
       onDragEntered: (_) => setState(() => _isDragging = true),
@@ -861,8 +866,7 @@ class _SendFlowViewState extends State<SendFlowView> {
                     : names.take(4).join(', ') +
                         (names.length > 4 ? ', +${names.length - 4} more' : ''),
                 style: GoogleFonts.inter(
-                  textStyle:
-                      TextStyle(color: c.textSecondary, fontSize: 12.5),
+                  textStyle: TextStyle(color: c.textSecondary, fontSize: 12.5),
                 ),
                 textAlign: TextAlign.center,
                 maxLines: 2,
@@ -1159,8 +1163,9 @@ class _DeviceChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = GlassColors.of(context);
-    final icon =
-        peer.platform == 'windows' ? Icons.computer_rounded : Icons.phone_android_rounded;
+    final icon = peer.platform == 'windows'
+        ? Icons.computer_rounded
+        : Icons.phone_android_rounded;
 
     final Color ringColor = selected ? c.violet : Colors.transparent;
     final Color avatarColor = !connected
@@ -1213,11 +1218,8 @@ class _DeviceChip extends StatelessWidget {
                       height: 14,
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: connected
-                            ? c.mint
-                            : c.textTertiary,
-                        border: Border.all(
-                            color: c.bgMid, width: 2),
+                        color: connected ? c.mint : c.textTertiary,
+                        border: Border.all(color: c.bgMid, width: 2),
                       ),
                     ),
                   ),

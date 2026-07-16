@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../core/identity.dart';
+import 'transport.dart';
 
 /// A peer discovered on the local network.
 class DiscoveredPeer {
@@ -12,6 +13,8 @@ class DiscoveredPeer {
   final InternetAddress address;
   final int port;
   final String publicKeyB64;
+  final ConnectionTransport transport;
+  final String? transportEndpoint;
 
   DiscoveredPeer({
     required this.deviceId,
@@ -20,6 +23,8 @@ class DiscoveredPeer {
     required this.address,
     required this.port,
     required this.publicKeyB64,
+    this.transport = ConnectionTransport.lan,
+    this.transportEndpoint,
   });
 
   @override
@@ -191,6 +196,7 @@ class Discovery {
     InternetAddress? address,
     List<String> hosts = const [],
     String? pairCode,
+    bool bluetoothAvailable = false,
   }) {
     final host = address?.address ?? '';
     // Dedup + preserve order: primary address first, then any extras.
@@ -208,6 +214,7 @@ class Discovery {
       'host': all.isNotEmpty ? all.first : '',
       'hosts': all,
       'port': listenPort,
+      if (bluetoothAvailable) 'bluetooth': true,
       if (pairCode != null) 'pairCode': pairCode,
     });
   }
@@ -215,8 +222,12 @@ class Discovery {
   /// Decode a connect token, returning the peer info, all candidate hosts
   /// (best first), and any pairing code embedded in it. Returns null if the
   /// token is malformed or carries no reachable host at all.
-  static ({DiscoveredPeer peer, List<InternetAddress> hosts, String? pairCode})?
-      decodeConnectTokenFull(String raw) {
+  static ({
+    DiscoveredPeer peer,
+    List<InternetAddress> hosts,
+    String? pairCode,
+    bool bluetoothAvailable,
+  })? decodeConnectTokenFull(String raw) {
     try {
       final j = jsonDecode(raw) as Map<String, dynamic>;
       if (j['type'] != 'conduit-connect') return null;
@@ -226,19 +237,21 @@ class Discovery {
           [
             if ((j['host'] as String?)?.isNotEmpty ?? false) j['host'] as String
           ];
-      if (rawHosts.isEmpty) return null;
+      final bluetoothAvailable = j['bluetooth'] == true;
+      if (rawHosts.isEmpty && !bluetoothAvailable) return null;
       final hosts = rawHosts.map(InternetAddress.new).toList();
       return (
         peer: DiscoveredPeer(
           deviceId: j['deviceId'] as String,
           name: j['name'] as String,
           platform: j['platform'] as String,
-          address: hosts.first,
+          address: hosts.isEmpty ? InternetAddress.loopbackIPv4 : hosts.first,
           port: j['port'] as int,
           publicKeyB64: j['pubKey'] as String,
         ),
         hosts: hosts,
         pairCode: j['pairCode'] as String?,
+        bluetoothAvailable: bluetoothAvailable,
       );
     } catch (_) {
       return null;

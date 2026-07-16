@@ -1,13 +1,13 @@
 # Conduit
 
-Peer-to-peer folder sync between your **PC and phone**, over your local network.
-No cloud. No account. No third-party relay. When both devices are on the same
-Wi-Fi, changes propagate automatically in the background.
+Peer-to-peer folder sync between your **PC and phone**, using the fastest direct
+connection currently available. Conduit prefers LAN and automatically falls
+back to Bluetooth when LAN is unavailable. No cloud, account, or third-party
+relay is involved.
 
 ```
-┌─── PC ───┐         ┌── Phone ──┐
-│ D:\Sync  │ ◀─────▶ │ /Sync     │   two-way mirror, LAN only
-└──────────┘  UDP+TLS └──────────┘
+PC folder  <==== LAN (preferred) ====>  Phone folder
+           <== Bluetooth fallback ==>
 ```
 
 ## Features
@@ -16,8 +16,14 @@ Wi-Fi, changes propagate automatically in the background.
 - **Per-pair direction**: two-way, receive-only, or send-only.
 - **Seamless across networks**: paired devices auto-reconnect on any Wi-Fi
   (home ↔ office) with no re-pairing — UDP auto-discovery finds them.
+- **Bluetooth fallback**: Windows and Android can connect over Bluetooth
+  Classic RFCOMM when LAN is unavailable. The UI always shows the active
+  transport and automatically upgrades back to LAN when it becomes reachable.
+- **Bandwidth-aware behavior**: clipboard, remote commands, status, and small
+  sync operations continue over Bluetooth. Files larger than 10 MiB are paused
+  until LAN returns.
 - **Manual fallback**: scan a QR code if a network blocks auto-discovery
-  (guest/corporate Wi-Fi with client isolation).
+  (including a Bluetooth-only QR when no LAN address is available).
 - **Secure**: self-signed TLS transport, ed25519 public-key pinning, single-
   use first-pair code (embedded in the QR for the scan flow, or typed for the
   manual fallback). The code is consumed on successful pair.
@@ -77,8 +83,23 @@ phone will report `Connection timed out` when pairing. (You can alternatively
 launch the app once and click "Allow access" on the Windows prompt, but the
 `netsh` rule is stable across reinstalls.)
 
-Both devices must be on the **same Wi-Fi**. If the network blocks device-to-
-device traffic (guest Wi-Fi, client isolation), use the QR fallback below.
+For LAN operation, both devices must be on the **same Wi-Fi or reachable local
+network**. If LAN is blocked or unavailable, Conduit can use Bluetooth after
+the devices have been paired in the operating system's Bluetooth settings.
+
+### Bluetooth fallback setup
+
+1. Turn on Bluetooth on Windows and Android.
+2. Pair the PC and phone once in their native Bluetooth settings.
+3. Open Conduit on both devices and allow the Android Nearby devices /
+   Bluetooth permission when prompted.
+4. Pair the devices inside Conduit as usual. OS Bluetooth pairing establishes
+   the radio trust; Conduit pairing separately authenticates the app identity.
+
+LAN remains preferred. The Windows app checks for LAN availability while a
+Bluetooth session is active and performs an authenticated, seamless takeover
+when LAN becomes reachable. The phone only answers these probes, avoiding a
+continuous mobile-side watcher.
 
 ### Pair the devices
 
@@ -103,8 +124,8 @@ Alternatively, **auto-discovery**:
 3. Choose direction (two-way by default).
 4. Do the same on the other device pointing at the corresponding folder.
 
-That's it. Files now mirror automatically whenever both devices are on the
-same network.
+That's it. Files now mirror automatically whenever a supported direct
+connection is available.
 
 ## If pairing fails
 
@@ -113,8 +134,13 @@ same network.
 - **`pairing rejected: wrong or expired code`** → the code was consumed or is
   from a previous attempt. Generate a fresh QR / code on the other device.
 - **Guest / corporate Wi-Fi with client isolation** → device-to-device
-  traffic is blocked at the network level. Switch to a network that allows
-  it (home Wi-Fi, hotspot), or use a different LAN.
+  traffic is blocked at the network level. Use the Bluetooth fallback or
+  switch to a network that permits peer-to-peer traffic.
+- **Bluetooth ready, but no device appears** → pair the devices first in
+  Windows and Android Bluetooth settings, keep Conduit open on both devices,
+  and grant Android's Nearby devices permission.
+- **Large transfer paused on Bluetooth** → this is intentional. Transfers
+  larger than 10 MiB resume when LAN reconnects.
 
 ## Architecture
 
@@ -125,7 +151,8 @@ The codebase is organised as:
 lib/src/
   core/           identity (ed25519), config store (folder pairs, pinned peers)
   protocol/       wire message types, folder-pair model
-  net/            UDP discovery, peer sessions, TLS framing, connection supervisor
+  net/            LAN discovery, Bluetooth bridge, transport policy,
+                  peer sessions, secure framing, connection supervisor
   storage/        per-folder SQLite Index DB (durable source of truth)
   sync/           V2 engine: version vectors, scanner, index diff, block transfer
   clipboard/      clipboard sync controller
@@ -133,9 +160,12 @@ lib/src/
   ui/             dashboard, folders, devices, activity, clipboard screens
   app_state.dart  central ChangeNotifier wiring everything together
 android/app/src/main/kotlin/.../
-  MainActivity.kt   SAF tree-picker + wake-lock channel
+  MainActivity.kt   platform-channel host
+  BluetoothProxy.kt Bluetooth Classic RFCOMM <-> loopback TCP bridge
   SafOps.kt         SAF read/write/list/delete/moveToVault
   SyncService.kt    foreground sync service with partial wake lock
+windows/runner/
+  bluetooth_proxy_win.cpp  Win32 RFCOMM listener, discovery, and TCP proxy
 ```
 
 ## Storage locations
@@ -147,10 +177,10 @@ android/app/src/main/kotlin/.../
 
 ## Privacy
 
-All data stays on your devices. Nothing is sent to any server. Discovery
-beacons carry only your device's public identity (name, ID, public key,
-listen port) — never your files. The first-pair code prevents strangers on
-your Wi-Fi from connecting.
+All data stays on your devices. Nothing is sent to any server. LAN discovery
+beacons and Bluetooth service discovery expose only connection metadata, never
+file contents. Conduit still performs its authenticated pinned-key handshake
+over either transport; OS Bluetooth pairing alone does not authorize access.
 
 ## License
 

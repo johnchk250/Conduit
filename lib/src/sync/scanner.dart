@@ -85,15 +85,16 @@ class IndexScanner {
     required String rootPath,
     required String deviceId,
     Future<List<FileEntry>> Function(String rootPath)? batchListWithStat,
+    Future<String> Function(String rootPath, String relPath)? hashFileOverride,
     List<String> ignoreGlobs = const [],
     List<String> ignoreExtensions = const [],
     int? maxFileSizeBytes,
   }) async {
     final changed = <IndexEntry>[];
     final seenPaths = <String>{};
+    final fingerprints = await db.localFingerprints();
 
-    final diskEntries =
-        await _listWithStat(fs, rootPath, batchListWithStat);
+    final diskEntries = await _listWithStat(fs, rootPath, batchListWithStat);
     for (final fileEntry in diskEntries) {
       final rel = fileEntry.relPath;
       // Skip our own metadata artefacts. The legacy LocalFileSystemAccess
@@ -119,8 +120,13 @@ class IndexScanner {
 
       seenPaths.add(rel);
 
-      // Hash every file. See class docs for why we don't reuse a cached digest.
-      final sha = await hashFile(fs, rootPath, rel);
+      final fingerprint = fingerprints[rel];
+      final sha = fingerprint != null &&
+              fingerprint.size == fileEntry.size &&
+              fingerprint.mtime == fileEntry.mtime
+          ? fingerprint.sha
+          : await (hashFileOverride?.call(rootPath, rel) ??
+              hashFile(fs, rootPath, rel));
 
       final wrote = await db.upsertLocal(
         relPath: rel,

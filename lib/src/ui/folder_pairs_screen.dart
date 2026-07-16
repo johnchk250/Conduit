@@ -77,7 +77,8 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
           children: [
             const GlassPageTitle('Folders'),
             GlassListTile(
-              leadingIcon: state.isPaused ? Icons.pause_circle_outline : Icons.sync,
+              leadingIcon:
+                  state.isPaused ? Icons.pause_circle_outline : Icons.sync,
               accentColor: state.isPaused ? c.amber : c.mint,
               title: 'Sync enabled',
               subtitle: state.isPaused
@@ -392,7 +393,8 @@ class _GlassFabState extends State<_GlassFab>
   Widget build(BuildContext context) {
     final accent = widget.accentColor;
     final platform = Theme.of(context).platform;
-    final isMobile = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
+    final isMobile =
+        platform == TargetPlatform.android || platform == TargetPlatform.iOS;
 
     final container = Container(
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
@@ -513,7 +515,7 @@ class _FolderPairCardState extends State<_FolderPairCard> {
     } else if (status == 'Paused') {
       dotColor = c.amber;
       live = false;
-    } else if (status.startsWith('Idle')) {
+    } else if (status.startsWith('Idle') || status == 'Peer offline') {
       dotColor = c.textTertiary;
       live = false;
     } else {
@@ -575,8 +577,7 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                               value: st.progress,
                               minHeight: 4,
                               color: c.violet,
-                              backgroundColor:
-                                  c.violet.withValues(alpha: 0.15),
+                              backgroundColor: c.violet.withValues(alpha: 0.15),
                             ),
                           ),
                         ),
@@ -743,8 +744,8 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
     // only after this screen is reopened. Falls back to widget.pair if the
     // pair was removed while this screen is open.
     final currentPair = state.config.folderPairs
-        .cast<FolderPair?>()
-        .firstWhere((p) => p?.id == widget.pair.id, orElse: () => null) ??
+            .cast<FolderPair?>()
+            .firstWhere((p) => p?.id == widget.pair.id, orElse: () => null) ??
         widget.pair;
     return Scaffold(
       appBar: AppBar(
@@ -910,8 +911,7 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
     AppState state,
     FolderPair pair,
   ) async {
-    final globsCtl =
-        TextEditingController(text: pair.ignoreGlobs.join('\n'));
+    final globsCtl = TextEditingController(text: pair.ignoreGlobs.join('\n'));
     final extCtl =
         TextEditingController(text: pair.ignoreExtensions.join('\n'));
     final sizeCtl = TextEditingController(
@@ -1014,5 +1014,3 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
     );
   }
 }
-
-

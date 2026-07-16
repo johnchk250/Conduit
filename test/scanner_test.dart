@@ -57,11 +57,14 @@ void main() {
     final fs = FakeFs({'a.txt': utf8Bytes('hello')});
     await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
     final firstMax = await db.maxSequence();
+    expect(fs.openReadCalls, 1);
 
     final result =
         await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
     expect(result.changed, isEmpty); // THE key invariant
     expect(await db.maxSequence(), firstMax); // sequence unmoved
+    expect(fs.openReadCalls, 1,
+        reason: 'unchanged files must reuse their persisted digest');
   });
 
   test('a modified file bumps version + sequence and appears in changed',
@@ -208,7 +211,11 @@ void main() {
       () async {
     final fs = FakeFs({'a.txt': utf8Bytes('hello')});
     await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
-    await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A',
+    await scanner.scan(
+        fs: fs,
+        db: db,
+        rootPath: 'r',
+        deviceId: 'A',
         ignoreGlobs: ['a.txt']); // frozen
     fs.files['a.txt'] = utf8Bytes('edited while frozen');
 
@@ -224,7 +231,8 @@ void main() {
     expect(row!.deleted, isFalse);
   });
 
-  test('ignore params default to empty/null — every existing caller and '
+  test(
+      'ignore params default to empty/null — every existing caller and '
       'test above behaves byte-for-byte unchanged (no ignore rules passed)',
       () async {
     final fs = FakeFs({'a.txt': utf8Bytes('hello')});
@@ -242,6 +250,7 @@ List<int> utf8Bytes(String s) => s.codeUnits;
 class FakeFs implements FileSystemAccess {
   FakeFs(this.files);
   final Map<String, List<int>> files;
+  int openReadCalls = 0;
 
   @override
   bool get isAndroidSAF => false;
@@ -262,6 +271,7 @@ class FakeFs implements FileSystemAccess {
   @override
   Stream<List<int>> openRead(String rootPath, String relPath,
       [int offset = 0]) async* {
+    openReadCalls++;
     final data = files[relPath];
     if (data == null) return;
     yield data.sublist(offset);

@@ -13,9 +13,11 @@ import 'clipboard/clipboard_sync.dart';
 import 'desktop/commands.dart';
 import 'diag.dart';
 import 'net/connection_supervisor.dart';
+import 'net/bluetooth_bridge.dart';
 import 'net/discovery.dart';
 import 'net/peer_registry.dart';
 import 'net/peer_session.dart';
+import 'net/transport.dart';
 import 'notifications/notifier.dart';
 import 'platform/saf_access.dart';
 import 'protocol/wire.dart';
@@ -48,6 +50,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   late PeerConnectionRegistry _registry;
   late ConnectionSupervisor _supervisor;
   Discovery? _discovery;
+  BluetoothBridge? _bluetooth;
+  final Map<String, DiscoveredPeer> _bluetoothPeers = {};
+  String _bluetoothAdapterStatus = 'Bluetooth starting';
+  String? _bluetoothAttemptStatus;
 
   /// Roadmap Phase 2 — clipboard sync. Created in [start] once the registry
   /// and config exist. Lives outside the sync engine; talks to peers over the
@@ -68,6 +74,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // waiting to be sent (when no peer is connected at share-time, or when
   // multiple peers are connected and the user must pick one).
   List<PendingSharedFile>? _pendingSharedFiles;
+  String? _lastTransferBlockReason;
 
   /// Pending files from an OS-level share/send action. Non-null when there
   /// are files queued that need the user to select a peer before sending.
@@ -78,6 +85,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// the transfer after it has a visible progress UI on screen.
   bool _pendingSharedFilesAutoStart = false;
   bool get pendingSharedFilesAutoStart => _pendingSharedFilesAutoStart;
+  String? get lastTransferBlockReason => _lastTransferBlockReason;
 
   /// Clear the pending shared-files queue (called after they've been sent).
   void clearPendingSharedFiles() {
@@ -108,6 +116,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   int _alertIdCounter = 0;
   // In-flight outbound connects (guard against parallel dials for one peer).
   final _connectingPeerIds = <String>{};
+  final _connectingBluetoothPeerIds = <String>{};
+  final Map<String, Timer> _bluetoothDialTimers = <String, Timer>{};
+  Timer? _windowsLanUpgradeTimer;
 
   /// Peers the user has INTENTIONALLY disconnected from via [disconnectPeer].
   /// The [ConnectionSupervisor] and the beacon-driven auto-connect both skip
@@ -162,11 +173,65 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool get isStarted => _started;
   bool get sendWidgetMode => _sendWidgetMode;
   String get status => _status;
-  List<DiscoveredPeer> get discoveredPeers =>
-      _discoveredPeers.values.toList(growable: false);
+  List<DiscoveredPeer> get discoveredPeers => <DiscoveredPeer>{
+        ..._discoveredPeers.values,
+        ..._bluetoothPeers.values.where((candidate) => !_discoveredPeers.values
+            .any((lan) => lan.deviceId == candidate.deviceId)),
+      }.toList(growable: false);
   List<PairedPeer> get pairedPeers => _config.pairedPeers;
   List<SyncEvent> get events => _engine.eventLog;
   PairSyncState? stateFor(String pairId) => _engine.stateFor(pairId);
+  bool get bluetoothEnabled => _config.bluetoothEnabled;
+  String get bluetoothStatus {
+    for (final peer in _config.pairedPeers) {
+      final session = _registry.openSessionFor(peer.deviceId);
+      if (session?.isLinkReady == true &&
+          session?.transport == ConnectionTransport.bluetooth) {
+        return 'Bluetooth connected to ${peer.name}';
+      }
+    }
+    for (final peer in _config.pairedPeers) {
+      final session = _registry.openSessionFor(peer.deviceId);
+      if (session?.isLinkReady == true &&
+          session?.transport == ConnectionTransport.lan) {
+        return 'LAN active - Bluetooth remains available as fallback';
+      }
+    }
+    return _bluetoothAttemptStatus ?? _bluetoothAdapterStatus;
+  }
+
+  bool get bluetoothStatusHealthy {
+    if (_registry.readyPeerIds.isNotEmpty) return true;
+    final lower = bluetoothStatus.toLowerCase();
+    return lower.contains('ready') || lower.contains('available as fallback');
+  }
+
+  bool get bluetoothSupported =>
+      _bluetooth?.isSupported ?? (Platform.isAndroid || Platform.isWindows);
+
+  PeerConnectionSnapshot connectionStateFor(String deviceId) {
+    final session = _registry.openSessionFor(deviceId);
+    if (session?.isLinkReady == true) {
+      return PeerConnectionSnapshot(
+        phase: PeerConnectionPhase.connected,
+        transport: session!.transport,
+        latestRttMs: session.latestRttMs,
+        missedHeartbeats: session.missedHeartbeats,
+      );
+    }
+    final connecting = session != null ||
+        _connectingPeerIds.contains(deviceId) ||
+        _connectingBluetoothPeerIds.contains(deviceId);
+    return PeerConnectionSnapshot(
+      phase: connecting
+          ? PeerConnectionPhase.connecting
+          : PeerConnectionPhase.offline,
+      transport: session?.transport,
+    );
+  }
+
+  ConnectionTransport? connectionTransportFor(String deviceId) =>
+      connectionStateFor(deviceId).transport;
 
   /// UI helper for an explicit per-folder sync request. Uses the current ready
   /// session when available; passing null intentionally means a local scan only.
@@ -180,7 +245,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   bool isPeerConnected(String deviceId) =>
-      _registry.openSessionFor(deviceId)?.isLinkReady == true;
+      connectionStateFor(deviceId).isConnected;
 
   /// Info about currently-connected peers for the devices panel.
   List<PairedPeer> get connectedPeers => _config.pairedPeers
@@ -257,6 +322,15 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // Step 4: shared registry — the single source of truth for live sessions.
     _registry = PeerConnectionRegistry();
 
+    _bluetooth = BluetoothBridge(
+      onDevice: _onBluetoothDevice,
+      onStatus: (status) {
+        _bluetoothAdapterStatus = status;
+        Diag.log('bluetooth_status', fields: {'status': status});
+        notifyListeners();
+      },
+    );
+
     // App-private dir for sync metadata. Same place as config.json /
     // identity.json. NEVER inside the synced folder.
     final stateDir = await ConfigStore.appSupportDir();
@@ -278,11 +352,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       onDeviceStatus: _onDeviceStatusReceived,
       onPhoneAction: _onPhoneActionReceived,
       onPhoneActionResult: _onPhoneActionResultReceived,
+      onLanProbe: _onLanProbeReceived,
+      onLanCandidates: _onLanCandidatesReceived,
       // Phase 0.6: on Android, give the watcher/scanner the batched SAF
       // lister instead of the per-file stat loop. Null (unchanged behaviour)
       // on every other platform.
       batchListWithStat: _fs is SafFileSystemAccess
           ? (_fs as SafFileSystemAccess).listFilesWithStat
+          : null,
+      hashFileOverride: _fs is SafFileSystemAccess
+          ? (_fs as SafFileSystemAccess).hashFile
           : null,
     );
     _engine.stateChanges.listen((s) {
@@ -301,6 +380,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       registry: _registry,
       onSessionReady: _onSessionReady,
       onPairingRequest: (_, __) {},
+      resolveIncomingTransport: _bluetooth!.resolveIncoming,
     );
     final port = await _connections.start();
 
@@ -322,6 +402,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       },
     );
     await _discovery!.start();
+    if (_config.bluetoothEnabled) {
+      if (Platform.isAndroid) {
+        await _bluetooth!.requestPermissions();
+      }
+      unawaited(_bluetooth!.start(dartListenPort: port));
+    } else {
+      _bluetoothAdapterStatus = 'Bluetooth disabled';
+    }
     _seedDiscoveredPeersFromSavedEndpoints();
 
     // The supervisor is the reliable reconnect path: independent of discovery
@@ -338,6 +426,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       isSuppressed: (id) => _suppressedPeerIds.contains(id),
     );
     _supervisor.start();
+    if (Platform.isWindows) {
+      _windowsLanUpgradeTimer = Timer.periodic(
+        const Duration(seconds: 10),
+        (_) => _probeLanUpgrades(),
+      );
+    }
 
     // Restart watching any pre-existing folder pairs.
     //
@@ -500,6 +594,218 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     await _dialPeer(peer, allowStagger: true);
   }
 
+  void _onBluetoothDevice(BluetoothDeviceEndpoint endpoint) {
+    final mappedId = _config.peerIdForBluetoothEndpoint(endpoint.id);
+    PairedPeer? paired;
+    if (mappedId != null) {
+      for (final candidate in _config.pairedPeers) {
+        if (candidate.deviceId == mappedId) {
+          paired = candidate;
+          break;
+        }
+      }
+    }
+    // The Windows backend changed from opaque WinRT service IDs to stable
+    // Bluetooth addresses. When this installation has exactly one Conduit
+    // peer, use its authenticated identity as the candidate for a newly seen
+    // endpoint. The endpoint is persisted only after the handshake succeeds,
+    // so an unrelated RFCOMM service cannot corrupt the mapping.
+    if (paired == null && _config.pairedPeers.length == 1) {
+      paired = _config.pairedPeers.single;
+    }
+    final peer = DiscoveredPeer(
+      deviceId: paired?.deviceId ?? 'bluetooth:${endpoint.id}',
+      name: paired?.name ?? endpoint.name,
+      platform: paired?.platform ?? 'bluetooth',
+      address: InternetAddress.loopbackIPv4,
+      port: 0,
+      publicKeyB64: paired?.publicKeyB64 ?? '',
+      transport: ConnectionTransport.bluetooth,
+      transportEndpoint: endpoint.id,
+    );
+    _bluetoothPeers[endpoint.id] = peer;
+    notifyListeners();
+    if (paired != null) _scheduleBluetoothCandidates(peer.deviceId);
+  }
+
+  void _scheduleBluetoothCandidates(String peerId) {
+    _bluetoothDialTimers.remove(peerId)?.cancel();
+    _bluetoothDialTimers[peerId] = Timer(
+      const Duration(milliseconds: 500),
+      () {
+        _bluetoothDialTimers.remove(peerId);
+        unawaited(_dialBluetoothCandidates(peerId));
+      },
+    );
+  }
+
+  void _setConnecting(Set<String> set, String peerId, bool connecting) {
+    final changed = connecting ? set.add(peerId) : set.remove(peerId);
+    if (changed) notifyListeners();
+  }
+
+  Future<void> _dialBluetoothCandidates(String peerId) async {
+    if (_suppressedPeerIds.contains(peerId) ||
+        _registry.openSessionFor(peerId) != null ||
+        _connectingBluetoothPeerIds.contains(peerId)) {
+      return;
+    }
+    final candidates = <String, DiscoveredPeer>{};
+    final savedEndpoint = _config.bluetoothEndpoint(peerId);
+    if (savedEndpoint != null) {
+      final savedPeer = _bluetoothPeers[savedEndpoint];
+      if (savedPeer != null) candidates[savedEndpoint] = savedPeer;
+    }
+    for (final peer in _bluetoothPeers.values) {
+      final endpoint = peer.transportEndpoint;
+      if (peer.deviceId == peerId && endpoint != null) {
+        candidates[endpoint] = peer;
+      }
+    }
+    if (candidates.isEmpty) {
+      _bluetoothAttemptStatus =
+          'Bluetooth ready - no OS-paired candidates found';
+      notifyListeners();
+      return;
+    }
+
+    _setConnecting(_connectingBluetoothPeerIds, peerId, true);
+    _bluetoothAttemptStatus =
+        'Trying ${candidates.length} OS-paired Bluetooth candidate${candidates.length == 1 ? '' : 's'}';
+    notifyListeners();
+    Object? lastError;
+    try {
+      for (final peer in candidates.values) {
+        if (_registry.openSessionFor(peerId) != null) return;
+        try {
+          final session = await _connectTarget(peer);
+          await _rememberSessionEndpoint(session, peer);
+          _bluetoothAttemptStatus = null;
+          notifyListeners();
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (_registry.openSessionFor(peerId) != null) return;
+      Diag.session(
+        'bluetooth_candidates_failed',
+        peer: peerId,
+        fields: {
+          'candidates': candidates.length,
+          if (lastError != null) 'error': lastError.toString(),
+        },
+      );
+      _bluetoothAttemptStatus =
+          'No OS-paired device accepted a Conduit Bluetooth connection';
+      notifyListeners();
+    } finally {
+      _setConnecting(_connectingBluetoothPeerIds, peerId, false);
+    }
+  }
+
+  void _probeLanUpgrades() {
+    if (!Platform.isWindows) return;
+    for (final peerId in _registry.readyPeerIds) {
+      final session = _registry.openSessionFor(peerId);
+      if (session?.transport != ConnectionTransport.bluetooth) continue;
+      try {
+        session!.send({'t': Msg.lanProbe});
+      } catch (error) {
+        Diag.session('lan_probe_send_failed',
+            peer: peerId, fields: {'error': error.toString()});
+      }
+    }
+  }
+
+  Future<void> _onLanProbeReceived(String peerId) async {
+    final session = _registry.openSessionFor(peerId);
+    if (session == null || session.transport != ConnectionTransport.bluetooth) {
+      return;
+    }
+    final hosts = await localIpAddresses();
+    if (hosts.isEmpty) return;
+    try {
+      session.send({
+        't': Msg.lanCandidates,
+        'hosts': hosts,
+        'port': _connections.listenPort,
+      });
+    } catch (error) {
+      Diag.session('lan_candidates_send_failed',
+          peer: peerId, fields: {'error': error.toString()});
+    }
+  }
+
+  void _onLanCandidatesReceived(String peerId, List<String> hosts, int port) {
+    if (!Platform.isWindows) return;
+    unawaited(_dialLanCandidates(peerId, hosts, port));
+  }
+
+  Future<void> _dialLanCandidates(
+      String peerId, List<String> rawHosts, int port) async {
+    final existing = _registry.openSessionFor(peerId);
+    if (existing?.transport != ConnectionTransport.bluetooth ||
+        _connectingPeerIds.contains(peerId)) {
+      return;
+    }
+    PairedPeer? paired;
+    for (final candidate in _config.pairedPeers) {
+      if (candidate.deviceId == peerId) {
+        paired = candidate;
+        break;
+      }
+    }
+    if (paired == null) return;
+
+    final hosts = <InternetAddress>[];
+    for (final raw in rawHosts) {
+      try {
+        final address = InternetAddress(raw);
+        if (address.type == InternetAddressType.IPv4 &&
+            !address.isLoopback &&
+            !hosts.any((candidate) => candidate.address == address.address)) {
+          hosts.add(address);
+        }
+      } catch (_) {}
+    }
+    if (hosts.isEmpty) return;
+
+    _setConnecting(_connectingPeerIds, peerId, true);
+    try {
+      final session = await _connections.connectMultiHost(
+        deviceId: paired.deviceId,
+        name: paired.name,
+        platform: paired.platform,
+        publicKeyB64: paired.publicKeyB64,
+        hosts: hosts,
+        port: port,
+        forceTakeover: true,
+      );
+      await _config.rememberPeerEndpoint(
+        deviceId: peerId,
+        address: session.remoteAddress,
+        port: port,
+      );
+      _discoveredPeers[peerId] = DiscoveredPeer(
+        deviceId: paired.deviceId,
+        name: paired.name,
+        platform: paired.platform,
+        address: InternetAddress(session.remoteAddress),
+        port: port,
+        publicKeyB64: paired.publicKeyB64,
+      );
+      notifyListeners();
+    } catch (error) {
+      Diag.session('lan_upgrade_failed', peer: peerId, fields: {
+        'hosts': hosts.map((host) => host.address).toList(),
+        'error': error.toString(),
+      });
+    } finally {
+      _setConnecting(_connectingPeerIds, peerId, false);
+    }
+  }
+
   /// Entry point for the [ConnectionSupervisor]. Same as the beacon path,
   /// including the deterministic stagger that prevents both devices from
   /// issuing authenticated takeovers at the same time on every sweep.
@@ -515,35 +821,90 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (_suppressedPeerIds.contains(id)) return;
 
     final existing = _registry.openSessionFor(id);
-    if (existing != null) return; // already live
+    final isLanUpgrade = existing != null &&
+        isTransportUpgrade(existing.transport, peer.transport);
+    if (isLanUpgrade && !Platform.isWindows) return;
+    if (existing != null && !isLanUpgrade) return; // already on best link
     if (_connectingPeerIds.contains(id)) return; // a dial is in flight
-    _connectingPeerIds.add(id);
+    _setConnecting(_connectingPeerIds, id, true);
 
     try {
       // Anti-simultaneous-dial tie-break: the lexically-larger device gives the
       // smaller one a head start on the first reconnect attempt for this peer.
-      if (allowStagger && _identity.deviceId.compareTo(id) > 0) {
+      if (!isLanUpgrade &&
+          allowStagger &&
+          _identity.deviceId.compareTo(id) > 0) {
         await Future<void>.delayed(const Duration(milliseconds: 3500));
         // Re-check after the delay: the other side may have already connected.
         final e2 = _registry.openSessionFor(id);
         if (e2 != null) return;
       }
-      final session =
-          await _connections.connect(target: peer, forceTakeover: false);
-      unawaited(_config
-          .rememberPeerEndpoint(
-            deviceId: peer.deviceId,
-            address: session.remoteAddress,
-            port: peer.port,
-          )
-          .catchError((_) {}));
+      final session = await _connectTarget(
+        peer,
+        forceTakeover: isLanUpgrade,
+      );
+      unawaited(_rememberSessionEndpoint(session, peer));
     } catch (e) {
       Diag.session('auto_dial_failed',
           peer: id, fields: {'error': e.toString()});
       // transient - supervisor (and next beacon) will retry
     } finally {
-      _connectingPeerIds.remove(id);
+      _setConnecting(_connectingPeerIds, id, false);
     }
+  }
+
+  Future<PeerSession> _connectTarget(
+    DiscoveredPeer peer, {
+    String? pairCode,
+    bool forceTakeover = false,
+  }) async {
+    if (peer.transport == ConnectionTransport.bluetooth) {
+      final endpoint = peer.transportEndpoint;
+      if (endpoint == null || endpoint.isEmpty) {
+        throw StateError('Bluetooth endpoint is missing for ${peer.name}.');
+      }
+      final proxyPort = await _bluetooth!.connect(endpoint);
+      return _connections.connectBluetooth(
+        target: peer,
+        localProxyPort: proxyPort,
+        pairCode: pairCode,
+        forceTakeover: forceTakeover,
+      );
+    }
+    return _connections.connect(
+      target: peer,
+      pairCode: pairCode,
+      forceTakeover: forceTakeover,
+    );
+  }
+
+  Future<void> _rememberSessionEndpoint(
+      PeerSession session, DiscoveredPeer source) async {
+    if (session.transport == ConnectionTransport.bluetooth) {
+      final endpoint = session.transportEndpoint ?? source.transportEndpoint;
+      if (endpoint != null) {
+        await _config.rememberPeerBluetoothEndpoint(
+          deviceId: session.peer.deviceId,
+          endpointId: endpoint,
+        );
+        _bluetoothPeers[endpoint] = DiscoveredPeer(
+          deviceId: session.peer.deviceId,
+          name: session.peer.name,
+          platform: session.peer.platform,
+          address: InternetAddress.loopbackIPv4,
+          port: 0,
+          publicKeyB64: session.peer.publicKeyB64,
+          transport: ConnectionTransport.bluetooth,
+          transportEndpoint: endpoint,
+        );
+      }
+      return;
+    }
+    await _config.rememberPeerEndpoint(
+      deviceId: session.peer.deviceId,
+      address: session.remoteAddress,
+      port: source.port,
+    );
   }
 
   /// Called whenever a session with a peer becomes available.
@@ -566,13 +927,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       final incomingPreferred = _isPreferredSession(id, session);
       final previousStillHealthy =
           previousOpen && !previous.canBeSupersededByAutoReconnect;
+      final incomingIsBetter =
+          isTransportUpgrade(previous.transport, session.transport);
 
       // Deterministic link ownership: for a pair of devices, the lexically
       // smaller id owns the outbound socket and the larger id owns the inbound
       // side of that same socket. If a healthy preferred session already
       // exists, reject a competing duplicate instead of replacing it and
       // triggering another reconnect on the peer.
-      if (previousStillHealthy && (previousPreferred || !incomingPreferred)) {
+      if (previousStillHealthy &&
+          !incomingIsBetter &&
+          (previousPreferred || !incomingPreferred)) {
         Diag.session('session_rejected_existing_preferred',
             peer: id,
             session: session.generation,
@@ -587,7 +952,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       }
     }
 
+    _bluetoothDialTimers.remove(id)?.cancel();
+    _bluetoothAttemptStatus = null;
     final replaced = _registry.publish(id, session);
+    if (session.transport == ConnectionTransport.bluetooth &&
+        session.transportEndpoint != null) {
+      unawaited(_config.rememberPeerBluetoothEndpoint(
+        deviceId: id,
+        endpointId: session.transportEndpoint!,
+      ));
+    }
     if (replaced != null && !identical(replaced, session)) {
       // A previous session is being replaced. Cancel its in-flight sync work
       // BEFORE wiring up the new session, so the old manifest waiters / chunk
@@ -606,10 +980,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       final dstate = getOrCreateDashboardState(id);
       dstate.connectedAt = DateTime.now();
       dstate.lastSeenAt = DateTime.now();
+      dstate.latestRttMs = session.latestRttMs;
+      dstate.recentRttMs = List<int>.from(session.recentRttMs);
+      dstate.missedHeartbeats = 0;
       _persistDashboardState(id);
 
       _supervisor.noteConnected(id);
       _applyBeaconMode();
+      if (Platform.isWindows &&
+          session.transport == ConnectionTransport.bluetooth) {
+        _probeLanUpgrades();
+      }
       _clipboard?.onPeerConnectivityChanged();
       notifyListeners();
     };
@@ -666,6 +1047,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         _applyBeaconMode(); // Phase 0.3: last ready session gone -> fast beacon
         _clipboard?.onPeerConnectivityChanged(); // Phase 2: peer gone -> idle
         notifyListeners();
+        if (_config.bluetoothEnabled) {
+          _scheduleBluetoothCandidates(id);
+        }
       }
     });
     notifyListeners();
@@ -805,9 +1189,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // LateInitializationError — which then masks any real disposal error and
     // fails the test/provider teardown. Guard it.
     if (!_started) {
+      _windowsLanUpgradeTimer?.cancel();
+      _windowsLanUpgradeTimer = null;
       super.dispose();
       return;
     }
+    _windowsLanUpgradeTimer?.cancel();
+    _windowsLanUpgradeTimer = null;
     _supervisor.stop();
     _discovery?.stop();
     _connections.stop();
@@ -1095,24 +1483,33 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _suppressedPeerIds.remove(peer.deviceId);
     final existing = _registry.openSessionFor(peer.deviceId);
     if (existing != null) return;
-    final target = _discoveredPeers[peer.deviceId] ??
-        _discoveredPeerFromSavedEndpoint(peer);
-    if (target == null) {
+    final targets = <DiscoveredPeer>[
+      if (_discoveredPeers[peer.deviceId] ??
+              _discoveredPeerFromSavedEndpoint(peer)
+          case final target?)
+        target,
+      ..._bluetoothPeers.values.where((p) => p.deviceId == peer.deviceId),
+    ];
+    if (targets.isEmpty) {
       throw StateError(
-          'No address for ${peer.name}. Open Conduit on that device or use Manual connect.');
+          'No LAN or Bluetooth route for ${peer.name}. Open Conduit on that device.');
     }
     if (_connectingPeerIds.contains(peer.deviceId)) return;
-    _connectingPeerIds.add(peer.deviceId);
+    _setConnecting(_connectingPeerIds, peer.deviceId, true);
     try {
-      final session =
-          await _connections.connect(target: target, forceTakeover: true);
-      await _config.rememberPeerEndpoint(
-        deviceId: target.deviceId,
-        address: session.remoteAddress,
-        port: target.port,
-      );
+      Object? lastError;
+      for (final target in targets) {
+        try {
+          final session = await _connectTarget(target, forceTakeover: true);
+          await _rememberSessionEndpoint(session, target);
+          return;
+        } catch (e) {
+          lastError = e;
+        }
+      }
+      throw lastError ?? StateError('No route connected');
     } finally {
-      _connectingPeerIds.remove(peer.deviceId);
+      _setConnecting(_connectingPeerIds, peer.deviceId, false);
       notifyListeners();
     }
   }
@@ -1683,6 +2080,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     final session = _registry.openSessionFor(peerId);
     if (session == null || !session.isLinkReady) return false;
     if (_adHoc == null) return false;
+    _lastTransferBlockReason = null;
+    var effectiveSize = fileSize ?? fileBytes?.length ?? 0;
+    if (effectiveSize <= 0 && filePath != null) {
+      try {
+        effectiveSize = await File(filePath).length();
+      } catch (_) {}
+    }
+    if (session.isBandwidthConstrained &&
+        effectiveSize > bluetoothLargeTransferLimitBytes) {
+      _lastTransferBlockReason =
+          'This file is larger than 10 MiB. Large transfers are paused on '
+          'Bluetooth and will be available when LAN reconnects.';
+      notifyListeners();
+      return false;
+    }
     var transferSucceeded = false;
 
     void done(bool ok) {
@@ -1829,6 +2241,26 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     });
   }
 
+  Future<void> setBluetoothEnabled(bool enabled) async {
+    await _config.setBluetoothEnabled(enabled);
+    if (enabled) {
+      await _bluetooth?.requestPermissions();
+      await _bluetooth?.start(dartListenPort: _connections.listenPort);
+    } else {
+      await _bluetooth?.stop();
+      _bluetoothPeers.clear();
+      // A disabled transport must not tear down a healthy LAN session.
+      for (final peerId in _registry.openPeerIds.toList(growable: false)) {
+        final session = _registry.openSessionFor(peerId);
+        if (session?.transport == ConnectionTransport.bluetooth) {
+          await disconnectPeer(peerId);
+          _suppressedPeerIds.remove(peerId);
+        }
+      }
+    }
+    notifyListeners();
+  }
+
   /// True while sync is paused (Roadmap Phase 1). Surfaced to the UI so the
   /// tray / a status chip can reflect it.
   bool get isPaused => _engine.isPaused;
@@ -1857,10 +2289,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     try {
       _setConnectionWakeLockEnabled(false);
       _onTransferState(false); // cancel renewal timer + release, if held
+      for (final timer in _bluetoothDialTimers.values) {
+        timer.cancel();
+      }
+      _bluetoothDialTimers.clear();
+      _windowsLanUpgradeTimer?.cancel();
+      _windowsLanUpgradeTimer = null;
       _stopBackgroundService();
       if (_started) {
         _supervisor.stop();
         _discovery?.stop();
+        await _bluetooth?.stop();
         _connections.stop();
         await _engine.dispose();
       }
@@ -1883,16 +2322,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _suppressedPeerIds.remove(peer.deviceId);
     final alreadyPaired =
         _config.pairedPeers.any((p) => p.deviceId == peer.deviceId);
-    final session = await _connections.connect(
-      target: peer,
+    final session = await _connectTarget(
+      peer,
       pairCode: pairCode.isEmpty ? null : pairCode,
       forceTakeover: alreadyPaired,
     );
-    await _config.rememberPeerEndpoint(
-      deviceId: peer.deviceId,
-      address: session.remoteAddress,
-      port: peer.port,
-    );
+    await _rememberSessionEndpoint(session, peer);
     notifyListeners();
   }
 
@@ -1902,6 +2337,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     return _discovery!.encodeConnectToken(
       address: addrs.isEmpty ? null : InternetAddress(addrs.first),
       hosts: addrs,
+      bluetoothAvailable: _bluetooth?.isStarted == true,
     );
   }
 
@@ -1935,6 +2371,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       address: addrs.isEmpty ? null : InternetAddress(addrs.first),
       hosts: addrs,
       pairCode: code,
+      bluetoothAvailable: _bluetooth?.isStarted == true,
     );
     _cachedQrToken = token;
     return token;
@@ -1970,22 +2407,67 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _suppressedPeerIds.remove(decoded.peer.deviceId);
     final alreadyPaired =
         _config.pairedPeers.any((p) => p.deviceId == decoded.peer.deviceId);
-    final session = await _connections.connectMultiHost(
-      deviceId: decoded.peer.deviceId,
-      name: decoded.peer.name,
-      platform: decoded.peer.platform,
-      publicKeyB64: decoded.peer.publicKeyB64,
-      hosts: decoded.hosts,
-      port: decoded.peer.port,
-      pairCode: pairCode.isEmpty ? null : pairCode,
-      forceTakeover: alreadyPaired,
+    Object? lastError;
+    if (decoded.hosts.isNotEmpty) {
+      try {
+        final session = await _connections.connectMultiHost(
+          deviceId: decoded.peer.deviceId,
+          name: decoded.peer.name,
+          platform: decoded.peer.platform,
+          publicKeyB64: decoded.peer.publicKeyB64,
+          hosts: decoded.hosts,
+          port: decoded.peer.port,
+          pairCode: pairCode.isEmpty ? null : pairCode,
+          forceTakeover: alreadyPaired,
+        );
+        await _config.rememberPeerEndpoint(
+          deviceId: decoded.peer.deviceId,
+          address: session.remoteAddress,
+          port: decoded.peer.port,
+        );
+        notifyListeners();
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (decoded.bluetoothAvailable && _bluetooth?.isStarted == true) {
+      final endpoints = <String>{
+        if (_config.bluetoothEndpoint(decoded.peer.deviceId) case final saved?)
+          saved,
+        ..._bluetoothPeers.keys,
+      };
+      for (final endpoint in endpoints) {
+        final target = DiscoveredPeer(
+          deviceId: decoded.peer.deviceId,
+          name: decoded.peer.name,
+          platform: decoded.peer.platform,
+          address: InternetAddress.loopbackIPv4,
+          port: 0,
+          publicKeyB64: decoded.peer.publicKeyB64,
+          transport: ConnectionTransport.bluetooth,
+          transportEndpoint: endpoint,
+        );
+        try {
+          final session = await _connectTarget(
+            target,
+            pairCode: pairCode.isEmpty ? null : pairCode,
+            forceTakeover: alreadyPaired,
+          );
+          await _rememberSessionEndpoint(session, target);
+          notifyListeners();
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+    }
+
+    if (lastError != null) throw lastError;
+    throw const SocketException(
+      'No reachable LAN or Bluetooth endpoint was found for this device.',
     );
-    await _config.rememberPeerEndpoint(
-      deviceId: decoded.peer.deviceId,
-      address: session.remoteAddress,
-      port: decoded.peer.port,
-    );
-    notifyListeners();
   }
 }
 

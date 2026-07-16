@@ -9,6 +9,7 @@ import 'package:uuid/uuid.dart';
 
 import '../notifications/notifier.dart';
 import '../net/peer_session.dart';
+import '../net/transport.dart';
 import '../protocol/wire.dart';
 import '../sync/block_transfer.dart';
 import '../sync/manifest.dart';
@@ -515,6 +516,20 @@ class AdHocFileSend {
       onLog('fileOffer missing offerId or name — dropped', isError: true);
       return;
     }
+    if (session.isBandwidthConstrained &&
+        size > bluetoothLargeTransferLimitBytes) {
+      session.send({
+        't': Msg.fileOfferControl,
+        'offerId': offerId,
+        'action': 'cancel',
+        'reason': 'large_transfer_paused_on_bluetooth',
+      });
+      onLog(
+        'Bluetooth deferred $name: files larger than 10 MiB require LAN',
+        isError: true,
+      );
+      return;
+    }
     if (_inbound.containsKey(offerId)) return; // duplicate, ignore
 
     final offer = _InboundOffer(
@@ -571,7 +586,8 @@ class AdHocFileSend {
           notifier.showReceiveProgress(offer.name, received, total,
               offerId: offer.offerId);
         },
-        pipelineDepth: _adHocPipelineDepth,
+        pipelineDepth:
+            offer.session.isBandwidthConstrained ? 1 : _adHocPipelineDepth,
       );
 
       onLog(
