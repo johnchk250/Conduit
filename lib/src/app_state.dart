@@ -542,7 +542,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         SafFileSystemAccess.openFile(treeUri, relPath);
       };
     }
-    unawaited(_notifier.init());
+    await _notifier.init();
 
     // Phase 3d: subscribe to the OS share/send channel so files shared into
     // Conduit from any file manager, gallery, or the Windows "Send to" menu

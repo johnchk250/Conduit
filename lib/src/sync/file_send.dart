@@ -695,6 +695,16 @@ class AdHocFileSend {
         TransferDirection.incoming,
         status: TransferStatus.transferring,
       );
+      // Publish a visible 0% state before requesting the first block. The old
+      // code emitted its first notification only after a full 1 MiB block had
+      // arrived, so small/fast transfers reached completion and immediately
+      // cancelled that first update before Android had time to display it.
+      await notifier.showReceiveProgress(
+        offer.name,
+        0,
+        offer.size,
+        offerId: offer.offerId,
+      );
       await fetchFileBlockLevel(
         fs: fs,
         rootPath: destPath,
@@ -719,11 +729,16 @@ class AdHocFileSend {
           return offer._sink.next();
         },
         onProgress: (received, total) {
-          notifier.showReceiveProgress(offer.name, received, total,
-              offerId: offer.offerId);
+          unawaited(notifier.showReceiveProgress(
+            offer.name,
+            received,
+            total,
+            offerId: offer.offerId,
+          ));
         },
         pipelineDepth:
             offer.session.isBandwidthConstrained ? 1 : _adHocPipelineDepth,
+        yieldBetweenBlocks: Platform.isAndroid,
       );
 
       onLog(
@@ -744,10 +759,21 @@ class AdHocFileSend {
         null,
       );
       final peerName = offer.session.peer.name;
-      notifier.showFileReceived(offer.name, peerName, treeUri: destPath);
+      await notifier.cancelReceiveProgress(
+        offer.name,
+        offerId: offer.offerId,
+      );
+      await notifier.showFileReceived(
+        offer.name,
+        peerName,
+        treeUri: destPath,
+      );
     } catch (e) {
       onLog('Ad-hoc receive failed for ${offer.name}: $e', isError: true);
-      await notifier.cancelReceiveProgress(offer.name);
+      await notifier.cancelReceiveProgress(
+        offer.name,
+        offerId: offer.offerId,
+      );
       await _updateReceipt(
         offer.offerId,
         TransferDirection.incoming,
@@ -851,7 +877,10 @@ class AdHocFileSend {
     } catch (_) {}
 
     onLog('Ad-hoc receive cancelled locally: ${offer.name}');
-    notifier.cancelReceiveProgress(offer.name);
+    unawaited(notifier.cancelReceiveProgress(
+      offer.name,
+      offerId: offer.offerId,
+    ));
   }
 
   bool pauseOutboundForPeer(String peerId) {

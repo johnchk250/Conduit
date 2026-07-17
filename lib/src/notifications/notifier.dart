@@ -45,6 +45,22 @@ class AppNotifier {
 
   final _plugin = FlutterLocalNotificationsPlugin();
   bool _ready = false;
+  Future<void>? _initInFlight;
+
+  // Progress notifications cross a platform channel and ultimately execute
+  // work on Android's main thread. A fast LAN transfer can complete dozens of
+  // 1 MiB blocks per second, so publishing every callback floods that channel,
+  // makes the Flutter UI janky, and lets late progress updates race with the
+  // completion/cancel notification. Keep at most four visible updates per
+  // second (plus the mandatory 0% and 100% boundaries) and serialize each
+  // transfer's notification operations.
+  static const _progressMinInterval = Duration(milliseconds: 250);
+  final Map<String, DateTime> _receiveLastShownAt = {};
+  final Map<String, int> _receiveLastPercent = {};
+  final Map<String, Future<void>> _receiveChains = {};
+  final Map<String, DateTime> _sendLastShownAt = {};
+  final Map<String, int> _sendLastPercent = {};
+  final Map<String, Future<void>> _sendChains = {};
 
   // Android notification channel for file transfer events.
   static const _androidChannelId = 'conduit_transfers';
@@ -71,9 +87,22 @@ class AppNotifier {
   ///
   /// Safe to call multiple times — subsequent calls are no-ops once [_ready].
   /// Errors are swallowed: a notification failure must never block sync.
-  Future<void> init() async {
-    if (!Platform.isAndroid) return;
-    if (_ready) return;
+  Future<void> init() {
+    if (!Platform.isAndroid || _ready) return Future<void>.value();
+    final current = _initInFlight;
+    if (current != null) return current;
+
+    late final Future<void> operation;
+    operation = _initAndroid().whenComplete(() {
+      if (identical(_initInFlight, operation)) {
+        _initInFlight = null;
+      }
+    });
+    _initInFlight = operation;
+    return operation;
+  }
+
+  Future<void> _initAndroid() async {
     try {
       // Set up the background message channel port
       const portName = 'conduit_notification_port';
@@ -107,12 +136,19 @@ class AppNotifier {
           importance: Importance.high,
         ),
       );
-      // Request POST_NOTIFICATIONS permission (Android 13+). Best-effort.
-      await android?.requestNotificationsPermission();
+      // Channel/plugin setup is enough for already-authorized devices and for
+      // background-engine starts where no Activity exists to show a prompt.
+      // Do not let a permission-prompt failure leave notifications permanently
+      // marked unready for the lifetime of this Dart isolate.
       _ready = true;
+      // Request POST_NOTIFICATIONS permission (Android 13+). Best-effort.
+      try {
+        await android?.requestNotificationsPermission();
+      } catch (_) {}
     } catch (_) {
       // Best-effort: if notifications aren't available (e.g. in tests or a
       // stripped platform build), just mark not-ready and skip all shows.
+      _ready = false;
     }
   }
 
@@ -165,87 +201,173 @@ class AppNotifier {
     int total, {
     required String offerId,
   }) async {
-    if (!Platform.isAndroid || !_ready) return;
-    try {
-      final percent = total > 0 ? (received * 100) ~/ total : 0;
-      final androidDetails = AndroidNotificationDetails(
-        _androidChannelId,
-        _androidChannelName,
-        channelDescription: _androidChannelDesc,
-        importance: Importance.low, // low importance so it doesn't alert/sound on every update
-        priority: Priority.low,
-        showProgress: true,
-        maxProgress: 100,
-        progress: percent,
-        icon: '@mipmap/ic_launcher',
-        onlyAlertOnce: true,
-        actions: const <AndroidNotificationAction>[
-          AndroidNotificationAction(
-            'cancel_receive',
-            'Cancel',
-            // The live inbound offer exists in the main Flutter engine.
-            // Running this action in the plugin's separate background engine
-            // cannot reach that in-memory state, so the notification merely
-            // reappears on the next progress update. Route it to the main
-            // engine instead, where [_onNotificationResponse] cancels it.
-            showsUserInterface: true,
-            cancelNotification: true,
-          ),
-        ],
-      );
-      final details = NotificationDetails(android: androidDetails);
-      await _plugin.show(
-        name.hashCode ^ 3,
-        'Receiving file',
-        '$name ($percent%)',
-        details,
-        payload: offerId,
-      );
-    } catch (_) {}
+    if (!Platform.isAndroid) return;
+    final percent = total > 0 ? (received * 100) ~/ total : 0;
+    if (!_shouldPublishProgress(
+      key: offerId,
+      current: received,
+      total: total,
+      percent: percent,
+      lastShownAt: _receiveLastShownAt,
+      lastPercent: _receiveLastPercent,
+    )) {
+      return;
+    }
+
+    await _enqueue(_receiveChains, offerId, () async {
+      await init();
+      if (!_ready) return;
+      try {
+        final androidDetails = AndroidNotificationDetails(
+          _androidChannelId,
+          _androidChannelName,
+          channelDescription: _androidChannelDesc,
+          importance: Importance.low,
+          priority: Priority.low,
+          showProgress: true,
+          maxProgress: 100,
+          progress: percent,
+          icon: '@mipmap/ic_launcher',
+          onlyAlertOnce: true,
+          actions: const <AndroidNotificationAction>[
+            AndroidNotificationAction(
+              'cancel_receive',
+              'Cancel',
+              // The live inbound offer exists in the main Flutter engine.
+              // Running this action in the plugin's separate background engine
+              // cannot reach that in-memory state, so the notification merely
+              // reappears on the next progress update. Route it to the main
+              // engine instead, where [_onNotificationResponse] cancels it.
+              showsUserInterface: true,
+              cancelNotification: true,
+            ),
+          ],
+        );
+        final details = NotificationDetails(android: androidDetails);
+        await _plugin.show(
+          offerId.hashCode ^ 3,
+          'Receiving file',
+          '$name ($percent%)',
+          details,
+          payload: offerId,
+        );
+      } catch (_) {}
+    });
   }
 
   /// Cancel/dismiss the "Receiving file" progress notification for a file.
-  Future<void> cancelReceiveProgress(String name) async {
-    if (!Platform.isAndroid || !_ready) return;
-    try {
-      await _plugin.cancel(name.hashCode ^ 3);
-    } catch (_) {}
+  Future<void> cancelReceiveProgress(
+    String name, {
+    String? offerId,
+  }) async {
+    if (!Platform.isAndroid) return;
+    final key = offerId ?? name;
+    _receiveLastShownAt.remove(key);
+    _receiveLastPercent.remove(key);
+    await _enqueue(_receiveChains, key, () async {
+      await init();
+      if (!_ready) return;
+      try {
+        await _plugin.cancel(
+          offerId == null ? name.hashCode ^ 3 : offerId.hashCode ^ 3,
+        );
+      } catch (_) {}
+    });
   }
 
   /// Cancel/dismiss the "Sending file" progress notification for a file.
   Future<void> cancelSendProgress(String name) async {
-    if (!Platform.isAndroid || !_ready) return;
-    try {
-      await _plugin.cancel(name.hashCode ^ 4);
-    } catch (_) {}
+    if (!Platform.isAndroid) return;
+    _sendLastShownAt.remove(name);
+    _sendLastPercent.remove(name);
+    await _enqueue(_sendChains, name, () async {
+      await init();
+      if (!_ready) return;
+      try {
+        await _plugin.cancel(name.hashCode ^ 4);
+      } catch (_) {}
+    });
   }
 
   /// Show progress for sending a file.
   Future<void> showSendProgress(String name, int sent, int total) async {
-    if (!Platform.isAndroid || !_ready) return;
-    try {
-      final percent = total > 0 ? (sent * 100) ~/ total : 0;
-      final androidDetails = AndroidNotificationDetails(
-        _androidChannelId,
-        _androidChannelName,
-        channelDescription: _androidChannelDesc,
-        importance: Importance
-            .low, // low importance so it doesn't alert/sound on every update
-        priority: Priority.low,
-        showProgress: true,
-        maxProgress: 100,
-        progress: percent,
-        icon: '@mipmap/ic_launcher',
-        onlyAlertOnce: true,
-      );
-      final details = NotificationDetails(android: androidDetails);
-      await _plugin.show(
-        name.hashCode ^ 4,
-        'Sending file',
-        '$name ($percent%)',
-        details,
-      );
-    } catch (_) {}
+    if (!Platform.isAndroid) return;
+    final percent = total > 0 ? (sent * 100) ~/ total : 0;
+    if (!_shouldPublishProgress(
+      key: name,
+      current: sent,
+      total: total,
+      percent: percent,
+      lastShownAt: _sendLastShownAt,
+      lastPercent: _sendLastPercent,
+    )) {
+      return;
+    }
+
+    await _enqueue(_sendChains, name, () async {
+      await init();
+      if (!_ready) return;
+      try {
+        final androidDetails = AndroidNotificationDetails(
+          _androidChannelId,
+          _androidChannelName,
+          channelDescription: _androidChannelDesc,
+          importance: Importance.low,
+          priority: Priority.low,
+          showProgress: true,
+          maxProgress: 100,
+          progress: percent,
+          icon: '@mipmap/ic_launcher',
+          onlyAlertOnce: true,
+        );
+        final details = NotificationDetails(android: androidDetails);
+        await _plugin.show(
+          name.hashCode ^ 4,
+          'Sending file',
+          '$name ($percent%)',
+          details,
+        );
+      } catch (_) {}
+    });
+  }
+
+  bool _shouldPublishProgress({
+    required String key,
+    required int current,
+    required int total,
+    required int percent,
+    required Map<String, DateTime> lastShownAt,
+    required Map<String, int> lastPercent,
+  }) {
+    final now = DateTime.now();
+    final isBoundary = current <= 0 || (total > 0 && current >= total);
+    if (!isBoundary) {
+      if (lastPercent[key] == percent) return false;
+      final previous = lastShownAt[key];
+      if (previous != null && now.difference(previous) < _progressMinInterval) {
+        return false;
+      }
+    }
+    lastShownAt[key] = now;
+    lastPercent[key] = percent;
+    return true;
+  }
+
+  Future<void> _enqueue(
+    Map<String, Future<void>> chains,
+    String key,
+    Future<void> Function() operation,
+  ) {
+    final previous = chains[key] ?? Future<void>.value();
+    late final Future<void> next;
+    next = previous.then<void>(
+      (_) => operation(),
+      onError: (Object _, StackTrace __) => operation(),
+    ).whenComplete(() {
+      if (identical(chains[key], next)) chains.remove(key);
+    });
+    chains[key] = next;
+    return next;
   }
 
   /// Show a "File sent" system notification. Fires after a successful send.
@@ -253,11 +375,7 @@ class AppNotifier {
   /// [name] is the file name (no path). [peerName] is the connected peer's
   /// display name. Best-effort — swallows errors.
   Future<void> showFileSent(String name, String peerName) async {
-    try {
-      if (Platform.isAndroid && _ready) {
-        await _plugin.cancel(name.hashCode ^ 4);
-      }
-    } catch (_) {}
+    await cancelSendProgress(name);
     await _show(
       id: name.hashCode ^ 1,
       title: 'File sent',
@@ -340,6 +458,7 @@ class AppNotifier {
     String? payload,
   }) async {
     if (!Platform.isAndroid) return;
+    await init();
     if (!_ready) return;
     try {
       const androidDetails = AndroidNotificationDetails(

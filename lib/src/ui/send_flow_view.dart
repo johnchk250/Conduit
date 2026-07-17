@@ -107,6 +107,9 @@ class _SendFlowViewState extends State<SendFlowView> {
   DateTime? _speedLastTime;
   int _speedLastBytes = 0;
   double? _speedBytesPerSec; // exponential moving average
+  DateTime? _uiProgressLastTime;
+
+  static const _uiProgressMinInterval = Duration(milliseconds: 100);
 
   @override
   void didChangeDependencies() {
@@ -268,6 +271,7 @@ class _SendFlowViewState extends State<SendFlowView> {
     _speedLastTime = null;
     _speedLastBytes = 0;
     _speedBytesPerSec = null;
+    _uiProgressLastTime = null;
   }
 
   // Called from inside the onProgress callback (already wrapped in setState
@@ -397,6 +401,15 @@ class _SendFlowViewState extends State<SendFlowView> {
         fileSize: f.size,
         onProgress: (sentBytes, totalBytes) {
           if (!mounted) return;
+          final now = DateTime.now();
+          final previous = _uiProgressLastTime;
+          final isComplete = totalBytes > 0 && sentBytes >= totalBytes;
+          if (!isComplete &&
+              previous != null &&
+              now.difference(previous) < _uiProgressMinInterval) {
+            return;
+          }
+          _uiProgressLastTime = now;
           _sampleSpeed(sentBytes);
           setState(() {
             _currentProgress = totalBytes > 0 ? sentBytes / totalBytes : 0.0;

@@ -129,6 +129,14 @@ void main() {
       // Give microtasks time to start the fetch loop.
       await Future<void>.delayed(const Duration(milliseconds: 20));
 
+      // A visible progress notification must be published before the first
+      // block arrives; otherwise a small/fast transfer can complete before
+      // Android ever renders a progress bar or Cancel action.
+      expect(notifier.receiveProgress, isNotEmpty);
+      expect(notifier.receiveProgress.first.received, 0);
+      expect(notifier.receiveProgress.first.total, fileBytes.length);
+      expect(notifier.receiveProgress.first.offerId, 'offer-inbound-123');
+
       // Receiver should have sent a fileOfferBlock request to pull the data.
       expect(session.sent.length, 1);
       final reqMsg = session.sent.first;
@@ -159,6 +167,7 @@ void main() {
 
       // Verify notifier was called.
       expect(notifier.receivedName, fileName);
+      expect(notifier.cancelledReceiveOfferId, 'offer-inbound-123');
     });
 
     test('supported receiver confirms only after verified local commit',
@@ -257,6 +266,9 @@ void main() {
 class _FakeNotifier implements AppNotifier {
   String? sentName;
   String? receivedName;
+  String? cancelledReceiveOfferId;
+  final receiveProgress =
+      <({String name, int received, int total, String offerId})>[];
 
   @override
   void Function(String treeUri, String relPath)? onFileNotificationTap;
@@ -280,13 +292,22 @@ class _FakeNotifier implements AppNotifier {
 
   @override
   Future<void> showReceiveProgress(String name, int received, int total,
-      {required String offerId}) async {}
+      {required String offerId}) async {
+    receiveProgress.add((
+      name: name,
+      received: received,
+      total: total,
+      offerId: offerId,
+    ));
+  }
 
   @override
   Future<void> showSendProgress(String name, int sent, int total) async {}
 
   @override
-  Future<void> cancelReceiveProgress(String name) async {}
+  Future<void> cancelReceiveProgress(String name, {String? offerId}) async {
+    cancelledReceiveOfferId = offerId;
+  }
 
   @override
   Future<void> cancelSendProgress(String name) async {}

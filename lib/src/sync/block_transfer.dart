@@ -93,6 +93,7 @@ Future<String> fetchFileBlockLevel({
       sendRequest,
   void Function(int received, int total)? onProgress,
   int pipelineDepth = 1,
+  bool yieldBetweenBlocks = false,
   // Roadmap Phase 6.4 (version-restore) — fires with the vault destination
   // path and the SIZE OF THE OLD FILE THAT WAS VAULTED (not the new
   // incoming size) whenever an existing file is vaulted before being
@@ -210,6 +211,15 @@ Future<String> fetchFileBlockLevel({
     await fs.append(rootPath, partRel, data);
     digestSink.add(data);
     onProgress?.call(offset + data.length, expectedSize);
+    // With a pipelined ad-hoc receive, several response futures and SAF writes
+    // can already be complete. Awaiting those resumes through microtasks and
+    // can starve Flutter's event queue long enough to make animations and taps
+    // visibly lag. Mobile callers opt into one event-loop yield per 1 MiB
+    // block so a pending frame gets a chance to render without changing the
+    // transfer protocol or the default sync-engine behavior.
+    if (yieldBetweenBlocks) {
+      await Future<void>.delayed(Duration.zero);
+    }
   }
 
   digestSink.close();
