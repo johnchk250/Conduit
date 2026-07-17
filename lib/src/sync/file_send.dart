@@ -33,6 +33,14 @@ import '../transfers/transfer_receipt.dart';
 /// keeps the default depth of 1.
 const int _adHocPipelineDepth = 8;
 
+/// Ad-hoc file data is carried inside encrypted JSON as base64. A 1-MiB file
+/// block therefore becomes a roughly 1.4-MiB JSON frame that must be decrypted,
+/// UTF-8 decoded, JSON parsed, base64 decoded, and hashed on Flutter's isolate.
+/// Splitting hashless ad-hoc offers into 256-KiB requests keeps each individual
+/// CPU burst short enough for frames and taps to be serviced between blocks.
+/// Eight pipelined requests still keep up to 2 MiB in flight on a fast LAN.
+const int _adHocRequestBlockSize = 256 * 1024;
+
 /// Metadata about an incoming file offer, kept on the receiver side while the
 /// transfer is in flight. Never surfaces to the UI (auto-receive — no dialog).
 class _InboundOffer {
@@ -738,6 +746,9 @@ class AdHocFileSend {
         },
         pipelineDepth:
             offer.session.isBandwidthConstrained ? 1 : _adHocPipelineDepth,
+        requestBlockSize: offer.blockHashes.isEmpty
+            ? _adHocRequestBlockSize
+            : blockSize,
         yieldBetweenBlocks: Platform.isAndroid,
       );
 

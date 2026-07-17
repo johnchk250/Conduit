@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 
@@ -100,7 +101,7 @@ class SafFileSystemAccess implements FileSystemAccess, TemporaryFileFinalizer {
     await _chSaf.invokeMethod('write', {
       'treeUri': rootPath,
       'relPath': relPath,
-      'data': Uint8List.fromList(data),
+      'data': data is Uint8List ? data : Uint8List.fromList(data),
     });
   }
 
@@ -109,7 +110,7 @@ class SafFileSystemAccess implements FileSystemAccess, TemporaryFileFinalizer {
     await _chSaf.invokeMethod('append', {
       'treeUri': rootPath,
       'relPath': relPath,
-      'data': Uint8List.fromList(data),
+      'data': data is Uint8List ? data : Uint8List.fromList(data),
     });
   }
 

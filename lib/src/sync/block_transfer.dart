@@ -93,6 +93,7 @@ Future<String> fetchFileBlockLevel({
       sendRequest,
   void Function(int received, int total)? onProgress,
   int pipelineDepth = 1,
+  int requestBlockSize = blockSize,
   bool yieldBetweenBlocks = false,
   // Roadmap Phase 6.4 (version-restore) — fires with the vault destination
   // path and the SIZE OF THE OLD FILE THAT WAS VAULTED (not the new
@@ -103,7 +104,15 @@ Future<String> fetchFileBlockLevel({
   void Function(String vaultPath, int oldSizeBytes)? onVaulted,
 }) async {
   final partRel = '$relPath$syncPartSuffix';
-  final totalBlocks = (expectedSize + blockSize - 1) ~/ blockSize;
+  // Peer-provided block hashes are defined over the protocol's standard
+  // 1-MiB blocks. Hashless ad-hoc transfers may request smaller blocks to
+  // reduce the longest uninterrupted JSON/base64/crypto burst on Flutter's
+  // isolate. That improves frame pacing without changing the wire format.
+  final transferBlockSize = blockHashes.isEmpty && requestBlockSize > 0
+      ? requestBlockSize
+      : blockSize;
+  final totalBlocks =
+      (expectedSize + transferBlockSize - 1) ~/ transferBlockSize;
 
   final digestAcc = AccumulatorSink<Digest>();
   final digestSink = sha256.startChunkedConversion(digestAcc);
@@ -118,11 +127,11 @@ Future<String> fetchFileBlockLevel({
     final existing = await _readAll(fs, rootPath, partRel);
     var okPrefix = 0;
     for (var i = 0; i < totalBlocks && i < blockHashes.length; i++) {
-      final start = i * blockSize;
-      final end = (start + blockSize > existing.length)
+      final start = i * transferBlockSize;
+      final end = (start + transferBlockSize > existing.length)
           ? existing.length
-          : start + blockSize;
-      if (end <= start || end - start != blockSize) break;
+          : start + transferBlockSize;
+      if (end <= start || end - start != transferBlockSize) break;
       final chunk = existing.sublist(start, end);
       if (sha256.convert(chunk).toString() != blockHashes[i]) break;
       okPrefix = end;
@@ -156,12 +165,13 @@ Future<String> fetchFileBlockLevel({
   // so firing several requests before awaiting any of them still yields
   // responses in the same order they were sent.
   final effectiveDepth = pipelineDepth < 1 ? 1 : pipelineDepth;
-  final startBlock = resumeBytes ~/ blockSize;
+  final startBlock = resumeBytes ~/ transferBlockSize;
 
   Map<String, dynamic> blockRequest(int i) {
-    final offset = i * blockSize;
-    final want =
-        (offset + blockSize > expectedSize) ? expectedSize - offset : blockSize;
+    final offset = i * transferBlockSize;
+    final want = (offset + transferBlockSize > expectedSize)
+        ? expectedSize - offset
+        : transferBlockSize;
     return {
       't': Msg.request,
       'name': relPath,
@@ -185,7 +195,7 @@ Future<String> fetchFileBlockLevel({
 
   topUpPipeline();
   for (var i = startBlock; i < totalBlocks; i++) {
-    final offset = i * blockSize;
+    final offset = i * transferBlockSize;
     final resp = await inFlight.removeAt(0);
     // A slot just freed — top up immediately so the window stays full while
     // this response is verified and written below.
