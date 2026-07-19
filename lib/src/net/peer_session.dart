@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
@@ -690,11 +689,23 @@ class PeerConnectionManager {
   }
 
   String _newPairingSecret() {
-    final bytes = Uint8List(32);
-    for (var i = 0; i < bytes.length; i++) {
-      bytes[i] = _rand.nextInt(256);
+    // Two pronounceable pseudo-words keep manual laptop pairing typeable
+    // without reducing the secret to a readily guessed numeric PIN. Each
+    // word contains five independently generated consonant-vowel syllables:
+    // (16 * 6)^10 gives the complete phrase about 66 bits of entropy.
+    const consonants = 'bcdfghjklmnprstv';
+    const vowels = 'aeiouy';
+    String word() {
+      final out = StringBuffer();
+      for (var i = 0; i < 5; i++) {
+        out
+          ..write(consonants[_rand.nextInt(consonants.length)])
+          ..write(vowels[_rand.nextInt(vowels.length)]);
+      }
+      return out.toString();
     }
-    return base64UrlEncode(bytes).replaceAll('=', '');
+
+    return '${word()} ${word()}';
   }
 
   // ---- Client side (connect out) -----------------------------------------
@@ -819,6 +830,27 @@ class PeerConnectionManager {
         SocketException('Could not connect to any host for $deviceId');
   }
 
+  /// Connect to an undiscovered peer using a user-entered LAN endpoint.
+  /// The authenticated welcome supplies the peer identity that discovery or
+  /// a QR token would normally provide.
+  Future<PeerSession> connectManual({
+    required List<InternetAddress> hosts,
+    required int port,
+    required String pairCode,
+    Duration timeout = const Duration(seconds: 10),
+  }) {
+    return connectMultiHost(
+      deviceId: '',
+      name: 'Manual peer',
+      platform: 'unknown',
+      publicKeyB64: '',
+      hosts: hosts,
+      port: port,
+      pairCode: pairCode,
+      timeout: timeout,
+    );
+  }
+
   /// Run the hello → welcome handshake over an already-connected socket.
   ///
   /// Step 2 fix: set the codec's onMessage to a temp handler BEFORE listen(),
@@ -894,10 +926,20 @@ class PeerConnectionManager {
       publicKeyB64: welcome['pubKey'] as String,
     );
 
+    PairedPeer? expected;
     if (isPaired) {
-      final expected = config.pairedPeers.firstWhere(
+      expected = config.pairedPeers.firstWhere(
         (candidate) => candidate.deviceId == deviceId,
       );
+    } else {
+      for (final candidate in config.pairedPeers) {
+        if (candidate.deviceId == peer.deviceId) {
+          expected = candidate;
+          break;
+        }
+      }
+    }
+    if (expected != null) {
       if (peer.deviceId != expected.deviceId ||
           peer.publicKeyB64 != expected.publicKeyB64) {
         throw StateError('paired peer identity mismatch');
@@ -919,7 +961,7 @@ class PeerConnectionManager {
     codec.send({'t': 'secure_confirm'});
     await waitForMessage(codec, 'secure_confirmed', timeout: timeout);
 
-    if (!isPaired) {
+    if (expected == null) {
       await config.rememberPeer(peer);
     }
 
@@ -953,7 +995,10 @@ String _pairingProof(String secret, Map<String, dynamic> hello) {
     'secureNonce': hello['secureNonce'],
     'secureVersion': hello['secureVersion'],
   }));
-  return base64Encode(Hmac(sha256, utf8.encode(secret)).convert(input).bytes);
+  final normalizedSecret =
+      secret.trim().toLowerCase().replaceAll(RegExp(r'[\s-]+'), ' ');
+  return base64Encode(
+      Hmac(sha256, utf8.encode(normalizedSecret)).convert(input).bytes);
 }
 
 bool _constantTimeEquals(String left, String right) {

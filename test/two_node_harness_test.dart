@@ -8,6 +8,31 @@ import 'support/two_node_harness.dart';
 import 'support/wait_until.dart';
 
 void main() {
+  test('manual endpoint pairing uses a typeable two-word phrase', () async {
+    final harness = await TwoNodeHarness.create();
+    addTearDown(harness.dispose);
+    await harness.start();
+
+    final phrase = harness.nodeB.manager.armGenericPairing();
+    expect(phrase, matches(RegExp(r'^[a-z]{10} [a-z]{10}$')));
+    await harness.nodeA.manager.connectManual(
+      hosts: [InternetAddress.loopbackIPv4],
+      port: harness.nodeB.port!,
+      pairCode: phrase.toUpperCase().replaceFirst(' ', '-'),
+    );
+    await waitUntil(
+      () =>
+          harness.nodeA.isReady(harness.nodeB.identity.deviceId) &&
+          harness.nodeB.isReady(harness.nodeA.identity.deviceId),
+      description: 'manual pairing to establish a secure session',
+    );
+
+    expect(harness.nodeA.config.pairedPeers.single.deviceId,
+        harness.nodeB.identity.deviceId);
+    expect(harness.nodeB.config.pairedPeers.single.deviceId,
+        harness.nodeA.identity.deviceId);
+  });
+
   test('fresh secure pairing persists pins and reconnects without a secret',
       () async {
     final harness = await TwoNodeHarness.create();

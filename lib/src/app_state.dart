@@ -2403,6 +2403,34 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  /// Pair over LAN when UDP discovery is unavailable. The secure welcome
+  /// provides the remote identity, which is pinned by PeerConnectionManager.
+  Future<void> pairManually({
+    required String host,
+    required int port,
+    required String pairingPhrase,
+  }) async {
+    final hosts = await InternetAddress.lookup(
+      host,
+      type: InternetAddressType.IPv4,
+    );
+    if (hosts.isEmpty) {
+      throw SocketException('No IPv4 address found for $host');
+    }
+    final session = await _connections.connectManual(
+      hosts: hosts,
+      port: port,
+      pairCode: pairingPhrase,
+    );
+    _suppressedPeerIds.remove(session.peer.deviceId);
+    await _config.rememberPeerEndpoint(
+      deviceId: session.peer.deviceId,
+      address: session.remoteAddress,
+      port: port,
+    );
+    notifyListeners();
+  }
+
   /// Show this device's connect token for QR (manual fallback).
   Future<String> connectToken() async {
     final addrs = await localIpAddresses();

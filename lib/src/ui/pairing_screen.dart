@@ -616,10 +616,18 @@ class _ManualConnect extends StatelessWidget {
             const SizedBox(height: 8),
             GlassButton(
               icon: Icons.pin,
-              label: 'Pair manually (no camera)',
+              label: 'Show pairing phrase',
               accentColor: c.textSecondary,
               style: GlassButtonStyle.outline,
               onTap: () => _generateCode(ctx, state),
+            ),
+            const SizedBox(height: 8),
+            GlassButton(
+              icon: Icons.keyboard_alt_outlined,
+              label: 'Enter pairing phrase',
+              accentColor: c.textSecondary,
+              style: GlassButtonStyle.outline,
+              onTap: () => _enterManualPairing(ctx, state),
             ),
           ],
         ),
@@ -633,20 +641,32 @@ class _ManualConnect extends StatelessWidget {
     // in on the other device. (Previously this just fabricated a code for
     // display without arming anything — so pairing could never succeed.)
     final code = state.generatePairingCode();
+    final addresses = await localIpAddresses();
+    if (!ctx.mounted) return;
     await showDialog<void>(
       context: ctx,
       builder: (dctx) => AlertDialog(
-        title: const Text('Pairing code'),
+        title: const Text('Pairing phrase'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('Enter this code on the other device within 2 minutes:'),
+            const Text(
+                'Enter this phrase on the other device within 2 minutes:'),
             const SizedBox(height: 16),
             Text(code,
                 style: const TextStyle(
-                    fontSize: 40,
+                    fontSize: 28,
                     fontWeight: FontWeight.bold,
                     fontFamily: 'monospace')),
+            const SizedBox(height: 16),
+            const Text('Other laptop should connect to:'),
+            const SizedBox(height: 6),
+            SelectableText(
+              addresses.isEmpty
+                  ? 'This laptop\'s IPv4 address, port 41828'
+                  : '${addresses.first}:41828',
+              style: const TextStyle(fontFamily: 'monospace'),
+            ),
           ],
         ),
         actions: [
@@ -655,6 +675,96 @@ class _ManualConnect extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  Future<void> _enterManualPairing(BuildContext ctx, AppState state) async {
+    final hostCtl = TextEditingController();
+    final portCtl = TextEditingController(text: '41828');
+    final phraseCtl = TextEditingController();
+    final input = await showDialog<_ManualPairingInput>(
+      context: ctx,
+      builder: (dctx) => AlertDialog(
+        title: const Text('Enter pairing phrase'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: hostCtl,
+              autofocus: true,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'Other laptop IP or hostname',
+                hintText: '192.168.1.25',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: portCtl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Port'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: phraseCtl,
+              autocorrect: false,
+              textCapitalization: TextCapitalization.none,
+              maxLength: 64,
+              decoration: const InputDecoration(
+                labelText: 'Two-word pairing phrase',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final host = hostCtl.text.trim();
+              final port = int.tryParse(portCtl.text.trim());
+              final phrase = phraseCtl.text.trim();
+              if (host.isEmpty ||
+                  port == null ||
+                  port < 1 ||
+                  port > 65535 ||
+                  phrase.split(RegExp(r'\s+')).length != 2) {
+                return;
+              }
+              Navigator.pop(
+                dctx,
+                _ManualPairingInput(host, port, phrase),
+              );
+            },
+            child: const Text('Connect'),
+          ),
+        ],
+      ),
+    );
+    hostCtl.dispose();
+    portCtl.dispose();
+    phraseCtl.dispose();
+    if (input == null || !ctx.mounted) return;
+
+    try {
+      await state.pairManually(
+        host: input.host,
+        port: input.port,
+        pairingPhrase: input.phrase,
+      );
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(ctx).showSnackBar(
+          const SnackBar(content: Text('Device paired successfully')),
+        );
+      }
+    } catch (e) {
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(ctx).showSnackBar(
+          SnackBar(content: Text(_explainPairingError(e))),
+        );
+      }
+    }
   }
 
   Future<void> _scan(BuildContext ctx, AppState state) async {
@@ -720,6 +830,14 @@ class _ManualConnect extends StatelessWidget {
       ),
     );
   }
+}
+
+class _ManualPairingInput {
+  const _ManualPairingInput(this.host, this.port, this.phrase);
+
+  final String host;
+  final int port;
+  final String phrase;
 }
 
 /// Dedicated QR-scan route with an explicit, correctly-managed
