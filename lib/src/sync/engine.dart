@@ -238,9 +238,9 @@ class SyncEngine {
   final _stateController = StreamController<PairSyncState>.broadcast();
   final _eventController = StreamController<SyncEvent>.broadcast();
 
-  /// pairIds that the peer has accepted via folderAccept. Reconciliation is
-  /// gated on this — we won't exchange indexes for a pair until the peer
-  /// has confirmed it.
+  /// Peer+pair keys that have been accepted via folderAccept or subsequent
+  /// pair-scoped traffic. Acceptance is device-scoped: a pair accepted by one
+  /// peer must never authorize a session belonging to another peer.
   final _peerAcceptedPairs = <String>{};
 
   /// Pending invites keyed by pairId, so the UI can re-display them and so
@@ -1015,15 +1015,12 @@ class SyncEngine {
     log('', 'Connected to ${session.peer.name} (${session.peer.deviceId})',
         SyncEventLevel.info);
 
-    // Reconcile every pair that the peer has already accepted. Pairs we've
-    // invited but the peer hasn't accepted yet are skipped.
+    // Reconcile only pairs assigned to this exact device. A connection from a
+    // different paired device must not alter statuses or exchange indexes for
+    // unrelated folder pairs.
     for (final pair in config.folderPairs) {
-      if (_peerAcceptedPairs.contains(pair.id) ||
-          pair.peerDeviceId == session.peer.deviceId) {
-        reconcile(pair, session);
-      } else {
-        _setStatus(pair.id, 'Waiting for peer to accept');
-      }
+      if (pair.peerDeviceId != session.peer.deviceId) continue;
+      reconcile(pair, session);
     }
     // Phase 0.2: a peer just came online: restore the snappy watcher cadence
     // for every pair bound to it, so a real edit is caught quickly.
@@ -1151,6 +1148,15 @@ class SyncEngine {
   // ---- Reconciliation ----------------------------------------------------
 
   Future<void> reconcile(FolderPair pair, PeerSession? session) async {
+    if (session != null && !_sessionOwnsPair(session, pair)) {
+      Diag.log(
+        'pair_session_mismatch',
+        peer: session.peer.deviceId,
+        pairId: pair.id,
+        fields: {'expectedPeer': pair.peerDeviceId},
+      );
+      return;
+    }
     final st = _states[pair.id] ??= PairSyncState(pairId: pair.id);
     if (st.scanning) {
       // A reconnect can complete while the reconcile tied to the dead session
@@ -1714,7 +1720,7 @@ class SyncEngine {
       peerDeviceId: invite.peerDeviceId,
     );
     await config.upsertPair(pair);
-    _peerAcceptedPairs.add(invite.pairId);
+    _peerAcceptedPairs.add(_peerKey(invite.peerDeviceId, invite.pairId));
     await startPair(pair);
     // Tell the initiator we've joined, so it stops gating and reconciles.
     final session = registry.openSessionFor(invite.peerDeviceId);
@@ -1753,7 +1759,7 @@ class SyncEngine {
   /// Forget a peer-accepted pair (used when the user disconnects a device or
   /// removes a pair) so reconciliation stops trying it.
   void forgetPeerAccepted(String pairId) {
-    _peerAcceptedPairs.remove(pairId);
+    _peerAcceptedPairs.removeWhere((key) => key.endsWith('|$pairId'));
   }
 
   // ---- Incoming peer messages --------------------------------------------
@@ -1765,6 +1771,26 @@ class SyncEngine {
     for (final p in config.folderPairs) {
       if (p.id == pairId) return p;
     }
+    return null;
+  }
+
+  bool _sessionOwnsPair(PeerSession session, FolderPair pair) =>
+      pair.peerDeviceId == session.peer.deviceId;
+
+  /// Resolve a pair only when it belongs to the session's authenticated peer.
+  /// Pair IDs are routing keys, not authorization: every inbound pair-scoped
+  /// frame must also satisfy this device binding.
+  FolderPair? _pairForSession(PeerSession session, String? pairId) {
+    if (pairId == null) return null;
+    final pair = _pairById(pairId);
+    if (pair == null) return null;
+    if (_sessionOwnsPair(session, pair)) return pair;
+    Diag.log(
+      'pair_frame_wrong_peer',
+      peer: session.peer.deviceId,
+      pairId: pairId,
+      fields: {'expectedPeer': pair.peerDeviceId},
+    );
     return null;
   }
 
@@ -1893,7 +1919,7 @@ class SyncEngine {
         });
         final pairId = msg['pairId'] as String?;
         if (pairId != null) {
-          final pair = _pairById(pairId);
+          final pair = _pairForSession(session, pairId);
           if (pair == null) {
             session.send({'t': Msg.error, 'message': 'no such pair: $pairId'});
             break;
@@ -1908,12 +1934,21 @@ class SyncEngine {
         final name = msg['name'] as String;
         final direction =
             SyncDirection.values.byName(msg['direction'] as String);
-        if (_pairById(pairId) != null) {
+        final existingPair = _pairById(pairId);
+        if (existingPair != null) {
+          if (!_sessionOwnsPair(session, existingPair)) {
+            Diag.log(
+              'folder_invite_wrong_peer',
+              peer: session.peer.deviceId,
+              pairId: pairId,
+              fields: {'expectedPeer': existingPair.peerDeviceId},
+            );
+            break;
+          }
           // Already have this pair (e.g. re-invite after a reconnect) — just
           // mark it peer-accepted and reconcile, no UI prompt needed.
-          _peerAcceptedPairs.add(pairId);
-          final pair = _pairById(pairId)!;
-          reconcile(pair, session);
+          _markPeerAccepted(pairId, session.peer.deviceId);
+          reconcile(existingPair, session);
           break;
         }
         if (_pendingInvites.containsKey(pairId)) break; // already shown
@@ -1932,13 +1967,12 @@ class SyncEngine {
       case Msg.folderAccept:
         // Peer accepted one of our invites — ungate reconciliation for it.
         final pairId = msg['pairId'] as String;
-        _peerAcceptedPairs.add(pairId);
+        final pair = _pairForSession(session, pairId);
+        if (pair == null) break;
+        _markPeerAccepted(pairId, session.peer.deviceId);
         _setStatus(pairId, 'Peer accepted');
         log(pairId, 'Peer accepted folder invite', SyncEventLevel.info);
-        final pair = _pairById(pairId);
-        if (pair != null) {
-          reconcile(pair, session);
-        }
+        reconcile(pair, session);
         break;
       case Msg.error:
         log('', 'Peer error: ${msg['message']}', SyncEventLevel.warn);
@@ -1949,18 +1983,14 @@ class SyncEngine {
       // reply) and is exempt from the generation guard at the top of this method.
       case Msg.index:
       case Msg.indexUpdate:
-        final pairId = msg['pairId'] as String?;
-        if (pairId != null) _markPeerAccepted(pairId);
         await _handleIndexFrame(session, msg);
         break;
       case Msg.indexRequest:
-        final pairId = msg['pairId'] as String?;
-        if (pairId != null) _markPeerAccepted(pairId);
         await _handleIndexRequest(session, msg);
         break;
       case Msg.request:
         final pairId = msg['pairId'] as String?;
-        final pair = pairId == null ? null : _pairById(pairId);
+        final pair = _pairForSession(session, pairId);
         if (pair == null) {
           // Unknown pair — terminal-error so the peer drops the need instead
           // of retrying a fetch against a pair we no longer know about.
@@ -1973,15 +2003,16 @@ class SyncEngine {
           });
           break;
         }
-        if (pairId != null) _markPeerAccepted(pairId);
+        _markPeerAccepted(pair.id, session.peer.deviceId);
         await _routeServeRequest(session, pair, msg);
         break;
       case Msg.response:
         final respPairId = msg['pairId'] as String?;
         final respName = msg['name'] as String?;
-        if (respPairId != null) _markPeerAccepted(respPairId);
-        if (respPairId != null && respName != null) {
-          final sink = _blockSinks[_blockKey(respPairId, respName)];
+        final pair = _pairForSession(session, respPairId);
+        if (pair != null && respName != null) {
+          _markPeerAccepted(pair.id, session.peer.deviceId);
+          final sink = _blockSinks[_blockKey(pair.id, respName)];
           if (sink != null && !sink.isClosed) {
             sink.add(msg);
           }
@@ -2086,10 +2117,11 @@ class SyncEngine {
   ) async {
     final pairId = msg['pairId'] as String?;
     if (pairId == null) return;
+    final pair = _pairForSession(session, pairId);
+    if (pair == null) return; // unknown or assigned to a different peer
     final restoreBarrier = _restoreBarriers[pairId];
     if (restoreBarrier != null) await restoreBarrier.future;
-    final pair = _pairById(pairId);
-    if (pair == null) return; // unknown pair — nothing to apply
+    _markPeerAccepted(pairId, session.peer.deviceId);
     final entriesRaw = msg['entries'];
     if (entriesRaw is! List) return;
     final peerKey = _peerKey(session.peer.deviceId, pairId);
@@ -2170,8 +2202,9 @@ class SyncEngine {
   ) async {
     final pairId = msg['pairId'] as String?;
     if (pairId == null) return;
-    final pair = _pairById(pairId);
+    final pair = _pairForSession(session, pairId);
     if (pair == null) return;
+    _markPeerAccepted(pairId, session.peer.deviceId);
     final fromSeq = (msg['fromSequence'] as num?)?.toInt() ?? 0;
     final db = await _indexDbFor(pair);
     // Only send rows WE wrote — the peer already has its own.
@@ -2338,11 +2371,17 @@ class SyncEngine {
     }
   }
 
-  bool isPairAcceptedByPeer(String pairId) =>
-      _peerAcceptedPairs.contains(pairId);
+  bool isPairAcceptedByPeer(String pairId) {
+    final pair = _pairById(pairId);
+    final peerId = pair?.peerDeviceId;
+    return peerId != null &&
+        _peerAcceptedPairs.contains(_peerKey(peerId, pairId));
+  }
 
-  void _markPeerAccepted(String pairId) {
-    if (_peerAcceptedPairs.add(pairId)) {
+  void _markPeerAccepted(String pairId, String peerDeviceId) {
+    final pair = _pairById(pairId);
+    if (pair == null || pair.peerDeviceId != peerDeviceId) return;
+    if (_peerAcceptedPairs.add(_peerKey(peerDeviceId, pairId))) {
       final st = _states[pairId] ??= PairSyncState(pairId: pairId);
       if (!_disposed) _stateController.add(st);
     }

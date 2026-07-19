@@ -581,7 +581,9 @@ class _OverviewPage extends StatelessWidget {
               } else if (status == 'Paused') {
                 dotColor = c.amber;
                 live = false;
-              } else if (status.startsWith('Idle')) {
+              } else if (status.startsWith('Idle') ||
+                  status.startsWith('Waiting') ||
+                  status == 'Peer offline') {
                 dotColor = c.textTertiary;
                 live = false;
               } else {

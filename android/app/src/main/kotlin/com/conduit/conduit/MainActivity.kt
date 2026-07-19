@@ -59,6 +59,12 @@ class MainActivity : FlutterActivity() {
         // This is the Flutter-idiomatic equivalent of KDE Connect keeping its
         // connection manager in a long-lived Service rather than an Activity.
         const val ENGINE_ID = "conduit_main_engine"
+
+        // Share intents can outlive one Activity instance because the Flutter
+        // engine is retained by SyncService. Keep their URI strings at process
+        // scope so an Activity recreation cannot discard a share that arrived
+        // before the retained Dart isolate acknowledged the new channel host.
+        private val pendingShareUris = mutableListOf<String>()
     }
 
     private var pendingTreeResult: MethodChannel.Result? = null
@@ -68,7 +74,6 @@ class MainActivity : FlutterActivity() {
     // Lateinit because it is created inside configureFlutterEngine.
     private lateinit var shareChannel: MethodChannel
     private var shareHandlerReady = false
-    private val pendingShareUris = mutableListOf<String>()
 
     private var activeRingtone: Ringtone? = null
     private var activeVibrator: Vibrator? = null
@@ -273,6 +278,13 @@ class MainActivity : FlutterActivity() {
         val pending = _pendingShareIntent
         _pendingShareIntent = null
         if (pending != null) handleShareIntent(pending)
+
+        // A cached FlutterEngine keeps the existing Dart AppState alive across
+        // Activity recreation, so Dart's one-time shareHandlerReady call may
+        // have targeted the previous Activity. Ask the retained Dart handler
+        // to acknowledge this newly attached channel host. On a cold engine
+        // the normal startup announcement still handles the intent.
+        shareChannel.invokeMethod("shareHostAttached", null)
 
         // Channel 6 (Roadmap Phase 2): native clipboard write for the PC→phone
         // inbound path. Flutter's Clipboard.setData() uses the Activity context,
