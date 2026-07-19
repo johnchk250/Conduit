@@ -28,6 +28,7 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 /build/
+**/build/
 
 # Symbolication related
 app.*.symbols
@@ -79,8 +80,10 @@ android/key.properties
 # case — these cover any nested ones from local experiments)
 **/windows/flutter/ephemeral/
 **/windows/flutter/generated_plugin_registrant.*
+**/windows/flutter/generated_plugins.cmake
 **/linux/flutter/ephemeral/
 **/linux/flutter/generated_plugin_registrant.*
+**/linux/flutter/generated_plugins.cmake
 
 # Project-specific: diagnostic capture output from capture_pc.bat /
 # capture_android.bat — timestamped logs, not something to version.
