@@ -802,6 +802,11 @@ class _SettingsHubPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
     final c = GlassColors.of(context);
+    final boostUntil = state.connectionBoostUntil;
+    final boostUntilLabel = boostUntil == null
+        ? null
+        : '${boostUntil.hour.toString().padLeft(2, '0')}:'
+            '${boostUntil.minute.toString().padLeft(2, '0')}';
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -859,6 +864,26 @@ class _SettingsHubPage extends StatelessWidget {
                   _fadeRoute((_) => const ActivityScreen()),
                 );
               },
+            ),
+            const SizedBox(height: 10),
+            GlassListTile(
+              leadingIcon: Icons.bolt_rounded,
+              accentColor: boostUntil == null ? c.blue : c.mint,
+              title: boostUntil == null
+                  ? 'Boost connection & sync'
+                  : 'Connection boost active',
+              subtitle: boostUntil == null
+                  ? 'Temporarily force discovery, reconnect every device, and sync every folder'
+                  : 'Fast reconnect and sync stays active until $boostUntilLabel',
+              trailing: boostUntil == null
+                  ? Icon(Icons.chevron_right, size: 20, color: c.textTertiary)
+                  : GlassChip(
+                      label: 'Active',
+                      icon: Icons.bolt_rounded,
+                      accentColor: c.mint,
+                      filled: true,
+                    ),
+              onTap: () => _chooseConnectionBoost(context, state),
             ),
             const SizedBox(height: 10),
             GlassListTile(
@@ -990,6 +1015,42 @@ class _SettingsHubPage extends StatelessWidget {
             const SizedBox(height: 80),
           ],
         ),
+      ),
+    );
+  }
+
+  Future<void> _chooseConnectionBoost(
+      BuildContext context, AppState state) async {
+    final duration = await showDialog<Duration>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Boost connection & sync'),
+        content: const Text(
+          'Conduit will temporarily keep Android awake, use fast LAN and '
+          'Bluetooth discovery, retry every paired device, and synchronize '
+          'every folder. Healthy connections and active transfers are kept.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          for (final minutes in const [2, 5, 15])
+            FilledButton.tonal(
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(Duration(minutes: minutes)),
+              child: Text('$minutes min'),
+            ),
+        ],
+      ),
+    );
+    if (duration == null || !context.mounted) return;
+    await state.startConnectionBoost(duration);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+            'Connection and sync boost active for ${duration.inMinutes} minutes.'),
       ),
     );
   }

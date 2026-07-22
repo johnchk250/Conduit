@@ -69,6 +69,15 @@ class BluetoothBridge {
     onStatus('Bluetooth disabled');
   }
 
+  /// Run one explicit nearby-device refresh without restarting the RFCOMM
+  /// listener or any active bridge.
+  Future<void> refreshDiscovery() async {
+    if (!isSupported || !_started || !Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod<void>('refreshDiscovery');
+    } catch (_) {}
+  }
+
   Future<int> connect(String endpointId) async {
     final port = await _channel.invokeMethod<int>(
       'connect',

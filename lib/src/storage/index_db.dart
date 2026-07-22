@@ -141,6 +141,20 @@ class IndexEntry {
       'v=$version, seq=$sequence${deleted ? ", DELETED" : ""})';
 }
 
+class LocalFileObservation {
+  const LocalFileObservation({
+    required this.relPath,
+    required this.size,
+    required this.mtime,
+    required this.sha256,
+  });
+
+  final String relPath;
+  final int size;
+  final int mtime;
+  final String sha256;
+}
+
 /// Per-folder SQLite index — the durable source of truth for the new engine
 /// (REDESIGN.md §(1)).
 ///
@@ -572,6 +586,119 @@ class IndexDb {
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
       return true;
+    });
+  }
+
+  /// Bounded-memory form of [changesSinceLocal]. Database rows are decoded in
+  /// pages and only locally-originated entries are yielded to the transport.
+  Stream<List<IndexEntry>> changesSinceLocalPages(
+    int since,
+    String deviceId, {
+    int pageSize = 500,
+  }) async* {
+    var cursor = since;
+    var cursorPath = '';
+    while (true) {
+      final rows = await _db.rawQuery(
+        'SELECT * FROM files WHERE sequence > ? '
+        'OR (sequence = ? AND path > ?) '
+        'ORDER BY sequence ASC, path ASC LIMIT ?',
+        [cursor, cursor, cursorPath, pageSize],
+      );
+      if (rows.isEmpty) return;
+      cursor = (rows.last['sequence'] as num).toInt();
+      cursorPath = rows.last['path'] as String;
+      final local = rows
+          .map(_rowToEntry)
+          .where((entry) => (entry.version.counts[deviceId] ?? 0) > 0)
+          .toList(growable: false);
+      if (local.isNotEmpty) yield local;
+      if (rows.length < pageSize) return;
+    }
+  }
+
+  /// Apply one complete scanner pass in a single SQLite transaction. This uses
+  /// the same stale-disk and version-vector rules as [upsertLocal], but avoids a
+  /// SELECT, MAX(sequence), and transaction commit for every file.
+  Future<List<IndexEntry>> applyLocalScan({
+    required List<LocalFileObservation> observations,
+    required Set<String> seenPaths,
+    required String deviceId,
+  }) async {
+    return _db.transaction((txn) async {
+      final rows = await txn.rawQuery('SELECT * FROM files');
+      final current = <String, IndexEntry>{
+        for (final row in rows) row['path'] as String: _rowToEntry(row),
+      };
+      final maxRows = await txn
+          .rawQuery('SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM files');
+      var nextSequence = (maxRows.first['max_seq'] as num?)?.toInt() ?? 0;
+      final changed = <IndexEntry>[];
+
+      for (final observation in observations) {
+        final prior = current[observation.relPath];
+        final priorLocalSha = prior?.localSha ?? '';
+        if (prior?.deleted != true &&
+            observation.sha256 == priorLocalSha &&
+            observation.sha256.isNotEmpty) {
+          if (prior!.localSize != observation.size ||
+              prior.localMtime != observation.mtime) {
+            await txn.update(
+              'files',
+              {
+                'local_size': observation.size,
+                'local_mtime': observation.mtime,
+              },
+              where: 'path = ?',
+              whereArgs: [observation.relPath],
+            );
+          }
+          continue;
+        }
+
+        nextSequence++;
+        final entry = IndexEntry(
+          relPath: observation.relPath,
+          size: observation.size,
+          mtime: observation.mtime,
+          sha256: observation.sha256,
+          version:
+              (prior?.version ?? const VersionVector.empty()).bump(deviceId),
+          sequence: nextSequence,
+          localSha: observation.sha256,
+          localSize: observation.size,
+          localMtime: observation.mtime,
+        );
+        await txn.insert('files', _entryToRow(entry),
+            conflictAlgorithm: sqf.ConflictAlgorithm.replace);
+        current[observation.relPath] = entry;
+        changed.add(entry);
+      }
+
+      for (final prior in current.values.toList(growable: false)) {
+        if (prior.deleted || seenPaths.contains(prior.relPath)) continue;
+        final localCounter = prior.version.counts[deviceId] ?? 0;
+        final hasLocalBytes = prior.localSha.isNotEmpty ||
+            (prior.localSize >= 0 && localCounter > 0);
+        if (!hasLocalBytes) continue;
+        nextSequence++;
+        final tombstone = IndexEntry(
+          relPath: prior.relPath,
+          size: prior.size,
+          mtime: prior.mtime,
+          sha256: prior.sha256,
+          version: prior.version.bump(deviceId),
+          sequence: nextSequence,
+          deleted: true,
+          blockHashes: prior.blockHashes,
+        );
+        await txn.insert('files', _entryToRow(tombstone),
+            conflictAlgorithm: sqf.ConflictAlgorithm.replace);
+        changed.add(tombstone);
+      }
+
+      changed.sort((a, b) => a.sequence.compareTo(b.sequence));
+      return changed;
     });
   }
 

@@ -60,8 +60,8 @@ class Discovery {
   final _seen = <String, DateTime>{}; // deviceId -> last seen
   Timer? _sweepTimer;
 
-  static const _sweepInterval = Duration(seconds: 8);
-  static const _staleAfter = Duration(seconds: 10);
+  static const _sweepInterval = Duration(minutes: 1);
+  static const _staleAfter = Duration(minutes: 5);
 
   // ---- Beacon backoff (Roadmap Phase 0.3) --------------------------------
   //
@@ -75,33 +75,57 @@ class Discovery {
   //
   // [setBeaconMode] reschedules the broadcast timer with the new period. The
   // listener side (receive path) is unchanged.
-  static final _fastInterval = const Duration(seconds: 3);
-  static final _stableInterval = const Duration(seconds: 15);
-  Duration _currentInterval = _fastInterval;
+  static const _fastInterval = Duration(seconds: 3);
+  static const _recoveryInterval = Duration(seconds: 15);
+  static const _idleInterval = Duration(minutes: 1);
+  static const _stableInterval = Duration(minutes: 1);
+  BeaconMode _mode = BeaconMode.fast;
+  bool _boosted = false;
+  DateTime _fastModeStartedAt = DateTime.now();
+
+  Duration get _currentInterval {
+    if (_boosted) return _fastInterval;
+    if (_mode == BeaconMode.stable) return _stableInterval;
+    final elapsed = DateTime.now().difference(_fastModeStartedAt);
+    if (elapsed < const Duration(seconds: 30)) return _fastInterval;
+    if (elapsed < const Duration(minutes: 5)) return _recoveryInterval;
+    return _idleInterval;
+  }
 
   /// Switch the broadcast cadence between [BeaconMode.fast] (3s — used right
   /// after startup / a reconnect so peers find us quickly) and
-  /// [BeaconMode.stable] (15s — used once at least one session is live, so the
+  /// [BeaconMode.stable] (1m — used once at least one session is live, so the
   /// Wi-Fi radio gets to sleep between beacons). Idempotent: a no-op if the
-  /// mode is already current. Restarting the periodic timer reschedules from
-  /// now (Timer.periodic has no reschedule API), which is the desired behaviour
-  /// — a newly-fast mode fires soon rather than waiting out a slow one.
+  /// mode is already current. Fast mode automatically backs off from 3 seconds
+  /// to 15 seconds and then 1 minute when a peer remains unavailable.
   void setBeaconMode(BeaconMode mode) {
-    final target = mode == BeaconMode.fast ? _fastInterval : _stableInterval;
-    if (target == _currentInterval) return;
-    _currentInterval = target;
+    if (mode == _mode) return;
+    _mode = mode;
+    if (mode == BeaconMode.fast) _fastModeStartedAt = DateTime.now();
     final running = _broadcastTimer;
     if (running == null) return; // not started — start() will pick it up
     running.cancel();
-    _broadcastTimer = Timer.periodic(target, (_) => _broadcast());
+    _scheduleBroadcast();
+  }
+
+  /// Temporarily force the fastest beacon cadence. The caller owns the timer
+  /// that turns this off; regular fast-mode backoff is suspended while active.
+  void setBoosted(bool enabled) {
+    if (_boosted == enabled) return;
+    _boosted = enabled;
+    final running = _broadcastTimer;
+    if (running == null) return;
+    running.cancel();
+    if (enabled) _broadcast();
+    _scheduleBroadcast();
   }
 
   Future<void> start() async {
     _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, port);
     _socket!.broadcastEnabled = true;
 
-    _broadcastTimer = Timer.periodic(_currentInterval, (_) => _broadcast());
     _broadcast(); // immediate first beacon
+    _scheduleBroadcast();
 
     // sweep stale peers out periodically
     _sweepTimer = Timer.periodic(_sweepInterval, (_) => _sweep());
@@ -130,6 +154,14 @@ class Discovery {
   void reannounce() {
     if (_socket == null) return; // not started yet, or stopped
     _broadcast();
+  }
+
+  void _scheduleBroadcast() {
+    _broadcastTimer = Timer(_currentInterval, () {
+      if (_socket == null) return;
+      _broadcast();
+      _scheduleBroadcast();
+    });
   }
 
   void _broadcast() {
@@ -273,7 +305,7 @@ enum BeaconMode {
   /// the link quickly.
   fast,
 
-  /// Slower broadcast (15s) — used once a session is live, letting the Wi-Fi
+  /// Slower broadcast (1m) — used once a session is live, letting the Wi-Fi
   /// radio sleep between beacons.
   stable,
 }

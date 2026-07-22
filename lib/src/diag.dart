@@ -29,6 +29,9 @@ class Diag {
   /// run never collide with another run's.
   static final String _boot = _randomBootHex();
   static int _seq = 0;
+  static int _bulkFrames = 0;
+  static int _heartbeatFrames = 0;
+  static int _heartbeatEvents = 0;
 
   /// Next monotonic message id, e.g. `a3f01c-1`. Shared across all sessions
   /// so correlation-by-grep works regardless of which session sent it.
@@ -50,6 +53,7 @@ class Diag {
 
   /// Log an outgoing message. Call AFTER stamping `msg['msgId']`.
   static void send(Map<String, dynamic> msg, {String? peer, int? session}) {
+    if (_skipBulkFrame(msg)) return;
     log('send',
         peer: peer,
         session: session,
@@ -59,6 +63,7 @@ class Diag {
 
   /// Log an incoming message.
   static void recv(Map<String, dynamic> msg, {String? peer, int? session}) {
+    if (_skipBulkFrame(msg)) return;
     log('recv',
         peer: peer,
         session: session,
@@ -75,6 +80,10 @@ class Diag {
     int? rttMs,
     int? missed,
   }) {
+    if (event != 'hb_dead') {
+      _heartbeatEvents++;
+      if (_heartbeatEvents % 50 != 1) return;
+    }
     log(event, peer: peer, session: session, fields: {
       if (hbId != null) 'hbId': hbId,
       if (rttMs != null) 'rttMs': rttMs,
@@ -119,4 +128,15 @@ class Diag {
   }
 
   static String? _str(Object? v) => v?.toString();
+
+  static bool _skipBulkFrame(Map<String, dynamic> msg) {
+    final type = _str(msg['t']);
+    if (type == 'ping' || type == 'pong') {
+      _heartbeatFrames++;
+      return _heartbeatFrames % 50 != 1;
+    }
+    if (type != 'response' && type != 'fileOfferData') return false;
+    _bulkFrames++;
+    return _bulkFrames % 64 != 1;
+  }
 }

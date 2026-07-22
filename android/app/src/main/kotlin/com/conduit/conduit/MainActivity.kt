@@ -162,7 +162,7 @@ class MainActivity : FlutterActivity() {
             }
 
         // Channel 2: SAF operations against a persisted tree URI.
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CH_SAF)
+        SafOps.channel(flutterEngine.dartExecutor.binaryMessenger)
             .setMethodCallHandler { call, result -> SafOps.handle(this, call, result) }
 
         // Channel 3 (Roadmap Phase 1): foreground-service start/stop + open the

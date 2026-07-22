@@ -1,7 +1,6 @@
 // ignore_for_file: unintended_html_in_doc_comment
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -15,6 +14,7 @@ import '../net/transport.dart';
 import '../protocol/wire.dart';
 import '../sync/block_transfer.dart';
 import '../sync/manifest.dart';
+import '../sync/work_scheduler.dart';
 import '../transfers/transfer_receipt.dart';
 
 /// How many blocks [_receiveOffer] keeps outstanding at once when pulling an
@@ -473,14 +473,14 @@ class AdHocFileSend {
           final blockBytes = await offer.readBlock(reqOffset, reqSize);
           if (offer.canceled || session.isClosed) break;
           final blockSha = sha256.convert(blockBytes).toString();
-          session.send({
+          await session.sendAsync({
             't': Msg.fileOfferData,
             'offerId': offer.offerId,
             'name': fileName,
             'offset': reqOffset,
             'length': blockBytes.length,
             'sha256': blockSha,
-            'data': base64.encode(blockBytes),
+            'data': blockBytes,
           });
           bytesSent += blockBytes.length;
           onProgress?.call(bytesSent, fileSize);
@@ -689,6 +689,7 @@ class AdHocFileSend {
       return;
     }
 
+    final transferLease = await heavyWorkScheduler.acquireTransfer();
     try {
       await _updateReceipt(
         offer.offerId,
@@ -763,6 +764,7 @@ class AdHocFileSend {
         TransferFailureCode.writeFailed,
       );
     } finally {
+      transferLease.release();
       offer._sink.close();
       _inbound.remove(offer.offerId);
     }

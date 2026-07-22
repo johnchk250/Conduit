@@ -432,12 +432,11 @@ void main() {
     expect(responses.length, 2);
     expect(responses[0]['offset'], blockSize);
     expect(responses[0]['sha256'], hashes[1]);
-    expect(base64.decode(responses[0]['data'] as String),
+    expect(responses[0]['data'] as List<int>,
         content.sublist(blockSize, blockSize + 1000));
     expect(responses[1]['offset'], 0);
     expect(responses[1]['sha256'], hashes[0]);
-    expect(base64.decode(responses[1]['data'] as String),
-        content.sublist(0, blockSize));
+    expect(responses[1]['data'] as List<int>, content.sublist(0, blockSize));
   });
 }
 

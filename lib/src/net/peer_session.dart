@@ -144,7 +144,7 @@ class PeerSession {
     return true;
   }
 
-  void send(Map<String, dynamic> msg) => codec.send(msg);
+  void send(Map<String, dynamic> msg) => unawaited(codec.send(msg));
 
   Future<void> close() async {
     try {
@@ -280,6 +280,19 @@ class PeerSession {
     _onHeartbeatDead = null;
     _pendingPingId = null;
     _pendingPingSentAt = null;
+  }
+}
+
+extension PeerSessionBackpressure on PeerSession {
+  /// Route through [PeerSession.send] so custom/test sessions keep intercepting
+  /// messages, then drain the real codec when one exists.
+  Future<void> sendAsync(Map<String, dynamic> msg) async {
+    send(msg);
+    try {
+      await codec.flushPendingWrites();
+    } on NoSuchMethodError {
+      // Lightweight PeerSession test doubles may not expose a codec.
+    }
   }
 }
 

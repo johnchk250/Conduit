@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -94,10 +95,10 @@ class FrameCodec {
   }
 
   int? _pendingLen;
-  final List<int> _raw = <int>[];
+  final _raw = _ByteQueue();
 
   void _onData(List<int> data) {
-    _raw.addAll(data);
+    _raw.add(data);
     _drain();
   }
 
@@ -111,9 +112,8 @@ class FrameCodec {
     while (true) {
       if (_pendingLen == null) {
         if (_raw.length < 4) return;
-        final b = Uint8List.fromList(_raw.sublist(0, 4));
+        final b = _raw.read(4);
         final len = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
-        _raw.removeRange(0, 4);
         final cap = _secureKeys == null ? 64 * 1024 : _maxEnvelopeBytes;
         if (len < 0 || len > cap) {
           _closed = true;
@@ -127,8 +127,7 @@ class FrameCodec {
       }
       final len = _pendingLen!;
       if (_raw.length < len) return;
-      final raw = _raw.sublist(0, len);
-      _raw.removeRange(0, len);
+      final raw = _raw.read(len);
       _pendingLen = null;
       _receiveChain = _receiveChain.then((_) => _decodeFrame(raw)).catchError(
         (Object e) {
@@ -164,13 +163,13 @@ class FrameCodec {
       );
       _receiveSequence++;
     }
-    final msg = jsonDecode(utf8.decode(clear)) as Map<String, dynamic>;
+    final msg = _decodePayload(clear);
     Diag.recv(msg);
     onMessage?.call(msg);
   }
 
-  void send(Map<String, dynamic> msg) {
-    if (_closed) return; // writing to a closed socket throws asynchronously
+  Future<void> send(Map<String, dynamic> msg) {
+    if (_closed) return Future.value();
     // Universal msgId stamping: every wire message gets a correlation id.
     // Any caller can pass its own (e.g. a request/response correlation); if
     // absent, we mint one here. This is the single chokepoint — there is no
@@ -178,18 +177,19 @@ class FrameCodec {
     // msgId" holds structurally.
     msg['msgId'] ??= Diag.nextMsgId();
     Diag.send(msg);
-    final payload = utf8.encode(jsonEncode(msg));
     final keys = _secureKeys;
     if (keys == null) {
-      _writeFrame(payload);
-      return;
+      _writeFrame(_encodePayload(msg));
+      return _socket.flush();
     }
+    final queued = Map<String, dynamic>.from(msg);
     _sendChain = _sendChain.then((_) async {
       if (_closed) return;
       if (_sendSequence == 0xFFFFFFFFFFFFFFFF) {
         throw StateError('secure sequence exhausted');
       }
       final sequence = _sendSequence;
+      final payload = _encodePayload(queued);
       final box = await _aead.encrypt(
         payload,
         secretKey: keys.sendKey,
@@ -202,12 +202,48 @@ class FrameCodec {
         ..add(box.cipherText)
         ..add(box.mac.bytes);
       _writeFrame(record.takeBytes());
+      await _socket.flush();
       _sendSequence++;
     }).catchError((Object e) {
       _closed = true;
       onError?.call(e);
       _socket.destroy();
     });
+    return _sendChain;
+  }
+
+  static Uint8List _encodePayload(Map<String, dynamic> msg) {
+    final data = msg['data'];
+    if (data is List<int>) {
+      final metadata = Map<String, dynamic>.from(msg)..remove('data');
+      final json = utf8.encode(jsonEncode(metadata));
+      final header = ByteData(5)
+        ..setUint8(0, 1)
+        ..setUint32(1, json.length);
+      return (BytesBuilder(copy: false)
+            ..add(header.buffer.asUint8List())
+            ..add(json)
+            ..add(data))
+          .takeBytes();
+    }
+    return Uint8List.fromList(utf8.encode(jsonEncode(msg)));
+  }
+
+  static Map<String, dynamic> _decodePayload(List<int> clear) {
+    if (clear.isNotEmpty && clear.first == 1) {
+      if (clear.length < 5) throw const FormatException('short binary frame');
+      final bytes = clear is Uint8List ? clear : Uint8List.fromList(clear);
+      final jsonLength = ByteData.sublistView(bytes, 1, 5).getUint32(0);
+      final dataOffset = 5 + jsonLength;
+      if (dataOffset > bytes.length) {
+        throw const FormatException('invalid binary frame metadata length');
+      }
+      final msg = jsonDecode(utf8.decode(bytes.sublist(5, dataOffset)))
+          as Map<String, dynamic>;
+      msg['data'] = Uint8List.sublistView(bytes, dataOffset);
+      return msg;
+    }
+    return jsonDecode(utf8.decode(clear)) as Map<String, dynamic>;
   }
 
   void _writeFrame(List<int> payload) {
@@ -215,6 +251,8 @@ class FrameCodec {
     _socket.add(header.buffer.asUint8List());
     _socket.add(payload);
   }
+
+  Future<void> flushPendingWrites() => _sendChain;
 
   static Uint8List _nonce(Uint8List prefix, int sequence) {
     final nonce = Uint8List(12)..setRange(0, 4, prefix);
@@ -234,7 +272,42 @@ class FrameCodec {
 
   Future<void> close() async {
     _closed = true;
+    try {
+      await _sendChain;
+    } catch (_) {}
     await _socket.close();
+  }
+}
+
+class _ByteQueue {
+  final ListQueue<Uint8List> _chunks = ListQueue<Uint8List>();
+  int _headOffset = 0;
+  int length = 0;
+
+  void add(List<int> data) {
+    if (data.isEmpty) return;
+    _chunks.add(data is Uint8List ? data : Uint8List.fromList(data));
+    length += data.length;
+  }
+
+  Uint8List read(int count) {
+    if (count > length) throw RangeError.range(count, 0, length);
+    final out = Uint8List(count);
+    var written = 0;
+    while (written < count) {
+      final head = _chunks.first;
+      final available = head.length - _headOffset;
+      final take = available < count - written ? available : count - written;
+      out.setRange(written, written + take, head, _headOffset);
+      written += take;
+      _headOffset += take;
+      if (_headOffset == head.length) {
+        _chunks.removeFirst();
+        _headOffset = 0;
+      }
+    }
+    length -= count;
+    return out;
   }
 }
 

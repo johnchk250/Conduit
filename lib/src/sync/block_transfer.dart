@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart';
@@ -114,21 +115,21 @@ Future<String> fetchFileBlockLevel({
   final existingPart = await fs.stat(rootPath, partRel);
   int resumeBytes = 0;
   if (existingPart != null && blockHashes.isNotEmpty) {
-    final existing = await _readAll(fs, rootPath, partRel);
     var okPrefix = 0;
-    for (var i = 0; i < totalBlocks && i < blockHashes.length; i++) {
+    final completeBlocks = existingPart.size ~/ blockSize;
+    for (var i = 0;
+        i < completeBlocks && i < totalBlocks && i < blockHashes.length;
+        i++) {
       final start = i * blockSize;
-      final end = (start + blockSize > existing.length)
-          ? existing.length
-          : start + blockSize;
-      if (end <= start || end - start != blockSize) break;
-      final chunk = existing.sublist(start, end);
+      final chunk =
+          await readFileBlock(fs, rootPath, partRel, start, blockSize);
+      if (chunk.length != blockSize) break;
       if (sha256.convert(chunk).toString() != blockHashes[i]) break;
-      okPrefix = end;
+      digestSink.add(chunk);
+      okPrefix = start + chunk.length;
     }
-    if (okPrefix > 0 && okPrefix == existing.length) {
+    if (okPrefix > 0 && okPrefix == existingPart.size) {
       resumeBytes = okPrefix;
-      digestSink.add(existing.sublist(0, resumeBytes));
       onProgress?.call(resumeBytes, expectedSize);
     } else {
       await fs.delete(rootPath, partRel);
@@ -196,7 +197,7 @@ Future<String> fetchFileBlockLevel({
     if (resp['error'] != null) {
       throw TerminalFetchError(relPath, resp['error'].toString());
     }
-    final data = base64.decode(resp['data'] as String);
+    final data = _wireBytes(resp['data']);
     final respSha = resp['sha256'] as String?;
     final actualSha = sha256.convert(data).toString();
     if (respSha != null && respSha != actualSha) {
@@ -309,7 +310,7 @@ Future<void> serveFileBlockLevel({
   required String rootPath,
   required String relPath,
   required Stream<Map<String, dynamic>> requests,
-  required void Function(Map<String, dynamic> response) respond,
+  required FutureOr<void> Function(Map<String, dynamic> response) respond,
 }) async {
   // Pre-check existence once. A per-request check would be more robust against
   // a vanish mid-serve, but reading the file per block (below) already throws
@@ -318,22 +319,17 @@ Future<void> serveFileBlockLevel({
   final stat = await fs.stat(rootPath, relPath);
   if (stat == null) {
     await for (final _ in requests) {
-      respond({'t': Msg.response, 'name': relPath, 'error': 'no such file'});
+      await respond(
+          {'t': Msg.response, 'name': relPath, 'error': 'no such file'});
     }
     return;
   }
 
-  // Cache the whole file in memory for serving. SAF reads are whole-file
-  // already (SafOps.kt), so this adds no cost on Android; on desktop the file
-  // is read once via the stream and held. Phase 2 sizes are modest; true
-  // streaming serve is a v2 optimization.
-  final bytes = await _readAll(fs, rootPath, relPath);
-
   await for (final req in requests) {
     final offset = (req['offset'] as num?)?.toInt() ?? 0;
     final want = (req['size'] as num?)?.toInt() ?? blockSize;
-    if (offset < 0 || offset > bytes.length) {
-      respond({
+    if (offset < 0 || offset > stat.size || want < 0) {
+      await respond({
         't': Msg.response,
         'name': relPath,
         'offset': offset,
@@ -341,17 +337,33 @@ Future<void> serveFileBlockLevel({
       });
       continue;
     }
-    final end = (offset + want > bytes.length) ? bytes.length : offset + want;
-    final block = bytes.sublist(offset, end);
-    respond({
-      't': Msg.response,
-      'name': relPath,
-      'offset': offset,
-      'length': block.length,
-      'sha256': sha256.convert(block).toString(),
-      'data': base64.encode(block),
-    });
+    final bounded = (offset + want > stat.size) ? stat.size - offset : want;
+    try {
+      final block = await readFileBlock(fs, rootPath, relPath, offset, bounded);
+      await respond({
+        't': Msg.response,
+        'name': relPath,
+        'offset': offset,
+        'length': block.length,
+        'sha256': sha256.convert(block).toString(),
+        'data': block,
+      });
+    } catch (e) {
+      await respond({
+        't': Msg.response,
+        'name': relPath,
+        'offset': offset,
+        'error': e.toString(),
+      });
+    }
   }
+}
+
+List<int> _wireBytes(Object? value) {
+  if (value is Uint8List) return value;
+  if (value is List<int>) return value;
+  if (value is String) return base64.decode(value);
+  throw const FormatException('response has no binary data');
 }
 
 /// Read every byte of a file via [FileSystemAccess]. Used by the resume path

@@ -911,23 +911,24 @@ class _PairDetailScreenState extends State<_PairDetailScreen> {
             )
           else
             Card(
-              child: ListView.separated(
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                itemCount: _files!.length,
-                separatorBuilder: (_, __) =>
-                    const Divider(height: 1, indent: 56),
-                itemBuilder: (_, i) {
-                  final rel = _files![i];
-                  return ListTile(
-                    dense: true,
-                    leading:
-                        const Icon(Icons.insert_drive_file_outlined, size: 20),
-                    title: Text(rel,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 13)),
-                  );
-                },
+              child: SizedBox(
+                height: 420,
+                child: ListView.separated(
+                  itemCount: _files!.length,
+                  separatorBuilder: (_, __) =>
+                      const Divider(height: 1, indent: 56),
+                  itemBuilder: (_, i) {
+                    final rel = _files![i];
+                    return ListTile(
+                      dense: true,
+                      leading: const Icon(Icons.insert_drive_file_outlined,
+                          size: 20),
+                      title: Text(rel,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 13)),
+                    );
+                  },
+                ),
               ),
             ),
         ],

@@ -62,7 +62,7 @@ object ConduitEngineHost {
 
         BluetoothProxy.install(appContext, messenger)
 
-        MethodChannel(messenger, "conduit/saf").setMethodCallHandler { call, result ->
+        SafOps.channel(messenger).setMethodCallHandler { call, result ->
             SafOps.handle(appContext, call, result)
         }
 

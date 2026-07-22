@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'manifest.dart';
 
@@ -53,8 +54,11 @@ class FolderWatcher {
 
   Timer? _timer;
   Timer? _debounceTimer;
+  StreamSubscription<FileSystemEvent>? _nativeEvents;
+  StreamSubscription<void>? _providerEvents;
   final _controller = StreamController<void>.broadcast();
   int _lastSignature = 0;
+  bool _hasBaseline = false;
   bool _scanInProgress = false;
 
   Stream<void> get changes => _controller.stream;
@@ -62,8 +66,14 @@ class FolderWatcher {
 
   void start() {
     if (_timer != null) return;
-    _timer = Timer.periodic(_currentInterval, (_) => _scan());
-    _scan(); // establish baseline
+    _startNativeEvents();
+    _schedulePoller();
+    if (!_hasBaseline) _scan();
+  }
+
+  void seedSignature(int signature) {
+    _lastSignature = signature;
+    _hasBaseline = true;
   }
 
   /// Change the poll cadence at runtime (Roadmap Phase 0.2 — battery backoff).
@@ -87,7 +97,7 @@ class FolderWatcher {
       return; // not started — start() will pick up the new value
     }
     running.cancel();
-    _timer = Timer.periodic(newInterval, (_) => _scan());
+    _schedulePoller();
     _scan(); // Trigger immediate scan to capture pending changes instantly
   }
 
@@ -96,6 +106,17 @@ class FolderWatcher {
     _timer = null;
     _debounceTimer?.cancel();
     _debounceTimer = null;
+    await _nativeEvents?.cancel();
+    _nativeEvents = null;
+    await _providerEvents?.cancel();
+    _providerEvents = null;
+    final source = fs;
+    if (source is FileSystemChangeSource) {
+      final changeSource = source as FileSystemChangeSource;
+      try {
+        await changeSource.stopWatching(rootPath);
+      } catch (_) {}
+    }
     await _controller.close();
   }
 
@@ -104,14 +125,12 @@ class FolderWatcher {
     _scanInProgress = true;
     try {
       final sig = await _computeSignature();
-      if (sig != _lastSignature && _lastSignature != 0) {
+      if (_hasBaseline && sig != _lastSignature) {
         // something changed — debounce so we coalesce bursts of writes.
-        _debounceTimer?.cancel();
-        _debounceTimer = Timer(debounce, () {
-          _controller.add(null);
-        });
+        _signalChange();
       }
       _lastSignature = sig;
+      _hasBaseline = true;
     } catch (_) {
       // directory might be briefly unavailable — skip this tick. (This is also
       // the path a SAF permission revocation takes: listFiles throws and we
@@ -119,6 +138,52 @@ class FolderWatcher {
     } finally {
       _scanInProgress = false;
     }
+  }
+
+  void _schedulePoller() {
+    final interval =
+        _nativeEvents != null && _currentInterval < const Duration(seconds: 30)
+            ? const Duration(seconds: 30)
+            : _currentInterval;
+    _timer = Timer.periodic(interval, (_) => _scan());
+  }
+
+  void _startNativeEvents() {
+    final source = fs;
+    if (source is FileSystemChangeSource) {
+      final changeSource = source as FileSystemChangeSource;
+      _providerEvents = changeSource.changesFor(rootPath).listen((_) {
+        _signalChange();
+      });
+      unawaited(changeSource.startWatching(rootPath).catchError((_) {
+        // The periodic signature scan remains the correctness fallback for
+        // document providers that do not support observation.
+      }));
+      return;
+    }
+    if (fs.isAndroidSAF) return;
+    try {
+      final root = Directory(rootPath);
+      if (!root.existsSync()) return;
+      _nativeEvents = root.watch(recursive: true).listen((event) {
+        final rel = event.path
+            .substring(rootPath.length)
+            .replaceFirst(RegExp(r'^[\\/]'), '')
+            .replaceAll('\\', '/');
+        if (!_isInternalArtefact(rel)) _signalChange();
+      }, onError: (_) {
+        _nativeEvents = null;
+      });
+    } catch (_) {
+      _nativeEvents = null;
+    }
+  }
+
+  void _signalChange() {
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(debounce, () {
+      if (!_controller.isClosed) _controller.add(null);
+    });
   }
 
   /// Cheap signature: total file count + sum of sizes + newest mtime.

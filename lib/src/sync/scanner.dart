@@ -89,12 +89,16 @@ class IndexScanner {
     List<String> ignoreGlobs = const [],
     List<String> ignoreExtensions = const [],
     int? maxFileSizeBytes,
+    void Function(int signature)? onDiskSignature,
   }) async {
-    final changed = <IndexEntry>[];
+    final observations = <LocalFileObservation>[];
     final seenPaths = <String>{};
     final fingerprints = await db.localFingerprints();
 
     final diskEntries = await _listWithStat(fs, rootPath, batchListWithStat);
+    var signatureCount = 0;
+    var signatureSize = 0;
+    var signatureNewest = 0;
     for (final fileEntry in diskEntries) {
       final rel = fileEntry.relPath;
       // Skip our own metadata artefacts. The legacy LocalFileSystemAccess
@@ -102,6 +106,11 @@ class IndexScanner {
       // partial-download suffix here so a crashed block transfer never appears
       // as a "new file" in the index.
       if (_isInternalArtefact(rel)) continue;
+      signatureCount++;
+      signatureSize += fileEntry.size;
+      if (fileEntry.mtime > signatureNewest) {
+        signatureNewest = fileEntry.mtime;
+      }
 
       // Phase 6.2 — ignore rules. Freeze (not tombstone): still mark the
       // path seen so the tombstone sweep below leaves it alone, but skip
@@ -128,17 +137,12 @@ class IndexScanner {
           : await (hashFileOverride?.call(rootPath, rel) ??
               hashFile(fs, rootPath, rel));
 
-      final wrote = await db.upsertLocal(
+      observations.add(LocalFileObservation(
         relPath: rel,
         size: fileEntry.size,
         mtime: fileEntry.mtime,
         sha256: sha,
-        deviceId: deviceId,
-      );
-      if (wrote) {
-        final entry = await db.get(rel);
-        if (entry != null) changed.add(entry);
-      }
+      ));
     }
 
     // Tombstone detection: any LOCAL path that was live before this scan but
@@ -146,19 +150,13 @@ class IndexScanner {
     // localLivePaths (not livePaths) because applyRemote stores peer entries in
     // the same table — a peer's file we haven't fetched yet is NOT a local
     // delete, and tombstoning it would create a delete-storm.
-    final priorLive = await db.localLivePaths(deviceId);
-    for (final prior in priorLive) {
-      if (!seenPaths.contains(prior)) {
-        final wrote =
-            await db.markDeletedLocal(relPath: prior, deviceId: deviceId);
-        if (wrote) {
-          final entry = await db.get(prior);
-          if (entry != null) changed.add(entry);
-        }
-      }
-    }
-
-    changed.sort((a, b) => a.sequence.compareTo(b.sequence));
+    onDiskSignature
+        ?.call(signatureCount * 1000003 + signatureSize + signatureNewest);
+    final changed = await db.applyLocalScan(
+      observations: observations,
+      seenPaths: seenPaths,
+      deviceId: deviceId,
+    );
     final maxSeq =
         changed.isEmpty ? await db.maxSequence() : changed.last.sequence;
     return ScanResult(changed, maxSeq);

@@ -89,6 +89,14 @@ class ConnectionSupervisor {
     _nextAttemptAt.remove(peerId); // eligible again immediately
   }
 
+  /// Clear reconnect backoff and run an immediate sweep. Used only by the
+  /// explicit user-triggered connection boost.
+  void retryNow() {
+    _failures.clear();
+    _nextAttemptAt.clear();
+    _sweep();
+  }
+
   /// One sweep pass. For each paired peer with no live session and no
   /// in-flight connect, attempt a connect if the per-peer backoff allows.
   ///

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
@@ -89,6 +90,54 @@ abstract class FileSystemAccess {
   }
 }
 
+/// Optional event source for filesystems that can report tree changes without
+/// recursively enumerating the tree. Events are coarse hints; reconciliation
+/// remains the authoritative source of sync state.
+abstract interface class FileSystemChangeSource {
+  Stream<void> changesFor(String rootPath);
+
+  Future<void> startWatching(String rootPath);
+
+  Future<void> stopWatching(String rootPath);
+}
+
+abstract interface class BlockFileReader {
+  Future<Uint8List> readBlock(
+    String rootPath,
+    String relPath,
+    int offset,
+    int length,
+  );
+}
+
+Future<Uint8List> readFileBlock(
+  FileSystemAccess fs,
+  String rootPath,
+  String relPath,
+  int offset,
+  int length,
+) async {
+  final blockReader = fs;
+  if (blockReader is BlockFileReader) {
+    return (blockReader as BlockFileReader)
+        .readBlock(rootPath, relPath, offset, length);
+  }
+  final out = BytesBuilder(copy: false);
+  var remaining = length;
+  await for (final chunk in fs.openRead(rootPath, relPath, offset)) {
+    if (remaining <= 0) break;
+    if (chunk.length <= remaining) {
+      out.add(chunk);
+      remaining -= chunk.length;
+    } else {
+      out.add(chunk.sublist(0, remaining));
+      remaining = 0;
+    }
+    if (remaining == 0) break;
+  }
+  return out.takeBytes();
+}
+
 /// Optional filesystem capability for materializing a completed temporary
 /// file without copying all of its bytes through Dart.
 abstract interface class TemporaryFileFinalizer {
@@ -100,7 +149,7 @@ abstract interface class TemporaryFileFinalizer {
 }
 
 /// Standard filesystem access for Windows (and any platform with real File I/O).
-class LocalFileSystemAccess implements FileSystemAccess {
+class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
   const LocalFileSystemAccess();
 
   @override
@@ -119,6 +168,30 @@ class LocalFileSystemAccess implements FileSystemAccess {
         continue;
       }
       result.add(rel.replaceAll('\\', '/'));
+    }
+    return result;
+  }
+
+  /// Enumerate and stat in one traversal, avoiding a second exists/stat pass.
+  Future<List<FileEntry>> listFilesWithStat(String rootPath) async {
+    final root = Directory(rootPath);
+    if (!await root.exists()) return const <FileEntry>[];
+    final result = <FileEntry>[];
+    await for (final entity in root.list(recursive: true, followLinks: false)) {
+      if (entity is! File) continue;
+      final rel = p.relative(entity.path, from: rootPath).replaceAll('\\', '/');
+      if (rel.startsWith('.syncstate/') ||
+          rel.startsWith('.syncversions/') ||
+          rel.endsWith('.syncpart')) {
+        continue;
+      }
+      final stat = await entity.stat();
+      result.add(FileEntry(
+        relPath: rel,
+        size: stat.size,
+        mtime: stat.modified.millisecondsSinceEpoch,
+        sha256: '',
+      ));
     }
     return result;
   }
@@ -142,6 +215,22 @@ class LocalFileSystemAccess implements FileSystemAccess {
     final file = File(p.join(rootPath, relPath));
     final raf = file.openRead(offset);
     return raf;
+  }
+
+  @override
+  Future<Uint8List> readBlock(
+    String rootPath,
+    String relPath,
+    int offset,
+    int length,
+  ) async {
+    final file = await File(p.join(rootPath, relPath)).open();
+    try {
+      await file.setPosition(offset);
+      return file.read(length);
+    } finally {
+      await file.close();
+    }
   }
 
   @override

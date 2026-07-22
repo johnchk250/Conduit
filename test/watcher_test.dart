@@ -81,6 +81,31 @@ void main() {
     final w = FolderWatcher(fs: fs, rootPath: '.');
     expect(w.isRunning, isFalse);
   });
+
+  test('FolderWatcher emits from a provider hint without polling first',
+      () async {
+    const root = 'content://tree/primary%3AEvents';
+    final fs = _EventSafFs({'a.txt': _b('hello')});
+    final emitted = <Null>[];
+    final w = FolderWatcher(
+      fs: fs,
+      rootPath: root,
+      interval: const Duration(hours: 1),
+      debounce: const Duration(milliseconds: 10),
+    );
+    final sub = w.changes.listen((_) => emitted.add(null));
+
+    w.seedSignature(1);
+    w.start();
+    fs.notify(root);
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+
+    expect(emitted, hasLength(1));
+    expect(fs.started, [root]);
+    await sub.cancel();
+    await w.stop();
+    expect(fs.stopped, [root]);
+  });
 }
 
 Future<void> _settle([Duration d = const Duration(milliseconds: 160)]) async {
@@ -149,4 +174,27 @@ class _SafLikeFs implements FileSystemAccess {
   @override
   Future<String> moveToVault(String rootPath, String relPath) async =>
       throw UnsupportedError('not used by the watcher');
+}
+
+class _EventSafFs extends _SafLikeFs implements FileSystemChangeSource {
+  _EventSafFs(super.files);
+
+  final _changes = StreamController<String>.broadcast();
+  final started = <String>[];
+  final stopped = <String>[];
+
+  void notify(String rootPath) => _changes.add(rootPath);
+
+  @override
+  Stream<void> changesFor(String rootPath) =>
+      _changes.stream.where((root) => root == rootPath).map((_) {});
+
+  @override
+  Future<void> startWatching(String rootPath) async => started.add(rootPath);
+
+  @override
+  Future<void> stopWatching(String rootPath) async {
+    stopped.add(rootPath);
+    await _changes.close();
+  }
 }

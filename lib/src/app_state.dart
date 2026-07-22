@@ -137,9 +137,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   Timer? _connectionWakeLockRenewal;
   bool _connectionWakeLockHeld = false;
+  Timer? _connectionBoostTimer;
+  Timer? _connectionBoostRetryTimer;
+  DateTime? _connectionBoostUntil;
+
+  bool get connectionBoostActive {
+    final until = _connectionBoostUntil;
+    return until != null && dependencies.now().isBefore(until);
+  }
+
+  DateTime? get connectionBoostUntil =>
+      connectionBoostActive ? _connectionBoostUntil : null;
 
   /// Roadmap Phase 0.4 (post-audit fix): renews the transfer-tied wake lock
-  /// every 45s while a burst is active, mirroring [_connectionWakeLockRenewal].
+  /// every 45s while a burst is active. The connection lock has a longer,
+  /// clipboard-oriented renewal window.
   /// Previously a transfer burst only fired one native `acquire` at its start
   /// with no renewal, so any burst longer than the native lock's timeout
   /// silently lost wake-lock protection even without the app being
@@ -250,6 +262,87 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       pair,
       session != null && session.isLinkReady ? session : null,
     );
+  }
+
+  /// Temporarily run discovery, reconnect, and folder reconciliation in an
+  /// aggressive user-requested mode. Healthy sessions are preserved; only
+  /// offline or incomplete sessions are redialled.
+  Future<void> startConnectionBoost(Duration requestedDuration) async {
+    if (!_started) return;
+    final duration = requestedDuration < const Duration(minutes: 1)
+        ? const Duration(minutes: 1)
+        : requestedDuration > const Duration(minutes: 30)
+            ? const Duration(minutes: 30)
+            : requestedDuration;
+    final deadline = dependencies.now().add(duration);
+    _connectionBoostUntil = deadline;
+    _connectionBoostTimer?.cancel();
+    _connectionBoostRetryTimer?.cancel();
+    _connectionBoostTimer =
+        Timer(duration, () => _finishConnectionBoost(deadline));
+    _connectionBoostRetryTimer =
+        Timer.periodic(const Duration(seconds: 10), (_) {
+      if (!connectionBoostActive) return;
+      _supervisor.retryNow();
+      _discovery?.reannounce();
+    });
+
+    _suppressedPeerIds.clear();
+    if (_engine.isPaused) _engine.resumeSync();
+    _ensureBackgroundServiceRunning();
+    _applyBeaconMode();
+    notifyListeners();
+    Diag.log('connection_boost_start', fields: {
+      'durationSeconds': duration.inSeconds,
+      'peers': _config.pairedPeers.length,
+      'pairs': _config.folderPairs.length,
+    });
+    unawaited(_runConnectionBoost());
+  }
+
+  Future<void> _runConnectionBoost() async {
+    _discovery?.reannounce();
+    if (_config.bluetoothEnabled) await _bluetooth?.refreshDiscovery();
+
+    final reconnects = <Future<void>>[];
+    for (final peer in _config.pairedPeers) {
+      final session = _registry.openSessionFor(peer.deviceId);
+      if (session?.isLinkReady == true) continue;
+      if (session != null) {
+        _registry.drop(peer.deviceId, session);
+        session.stopHeartbeat();
+        _engine.onPeerSessionLost(peer.deviceId);
+        _engine.onPeerDisconnected(peer.deviceId);
+        unawaited(session.close().catchError((Object _) {}));
+      }
+      reconnects.add(reconnectPeer(peer).catchError((Object error) {
+        Diag.session('connection_boost_dial_failed',
+            peer: peer.deviceId, fields: {'error': error.toString()});
+      }));
+    }
+    await Future.wait(reconnects);
+    _supervisor.retryNow();
+
+    await Future.wait(_config.folderPairs.map((pair) async {
+      try {
+        await syncFolderNow(pair);
+      } catch (error) {
+        Diag.log('connection_boost_sync_failed',
+            pairId: pair.id, fields: {'error': error.toString()});
+      }
+    }));
+  }
+
+  void _finishConnectionBoost(DateTime deadline) {
+    if (_connectionBoostUntil != deadline) return;
+    _connectionBoostTimer?.cancel();
+    _connectionBoostTimer = null;
+    _connectionBoostRetryTimer?.cancel();
+    _connectionBoostRetryTimer = null;
+    _connectionBoostUntil = null;
+    _applyBeaconMode();
+    notifyListeners();
+    Diag.log('connection_boost_end');
   }
 
   Future<SyncPreview> buildSyncPreview(
@@ -388,7 +481,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       // on every other platform.
       batchListWithStat: _fs is SafFileSystemAccess
           ? (_fs as SafFileSystemAccess).listFilesWithStat
-          : null,
+          : _fs is LocalFileSystemAccess
+              ? (_fs as LocalFileSystemAccess).listFilesWithStat
+              : null,
       hashFileOverride: _fs is SafFileSystemAccess
           ? (_fs as SafFileSystemAccess).hashFile
           : null,
@@ -1099,20 +1194,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// live we run fast so a reconnect (or a brand-new peer) finds us quickly.
   void _applyBeaconMode() {
     final anyLive = _registry.readyPeerIds.isNotEmpty;
+    final boosted = connectionBoostActive;
     _discovery?.setBeaconMode(anyLive ? BeaconMode.stable : BeaconMode.fast);
-    // 2026-07-11 fix: hold the connection wake lock whenever a session is
-    // live, regardless of battery-saver mode. Battery-saver's idle savings
-    // come entirely from the watcher-polling interval (set once at startup
-    // in start(), see _engine.setBatterySaverMode) and from the discovery
-    // lock below — neither depends on this lock. Previously this was
-    // `anyLive && !_config.batterySaverMode`, which let Doze stall an
-    // already-live session's heartbeat during battery-saver mode, causing a
-    // disconnect -> rediscover -> resync cycle roughly every 72-90s for as
-    // long as the peer stayed in range (see PROGRESS.md / THINKING.md,
-    // 2026-07-11 entries, for the full investigation). That's strictly
-    // worse than just holding the lock for the life of the session, so the
-    // two concerns are decoupled here.
-    _setConnectionWakeLockEnabled(anyLive);
+    _discovery?.setBoosted(boosted);
+    // Clipboard sync promises immediate delivery while connected. Preserve the
+    // continuous CPU lock for that opt-in feature; other sync work uses short
+    // reconnect and transfer-scoped wake windows.
+    _setConnectionWakeLockEnabled(
+        boosted || (anyLive && _config.clipboardSyncEnabled));
     // Phase 0.6: the Android MulticastLock only gates RECEIVING broadcast/
     // multicast UDP — i.e. discovery beacons on port 41827. It has no effect
     // on an already-live peer session, which is a unicast TCP socket
@@ -1121,7 +1210,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // held for the SyncService's entire lifetime; now held only while it can
     // actually do something useful (no session live, so a new or returning
     // peer still needs to be discovered).
-    _setDiscoveryLockEnabled(!anyLive);
+    _setDiscoveryLockEnabled(boosted || !anyLive);
 
     if (anyLive) {
       _startAndroidStatusSampling();
@@ -1157,7 +1246,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (enabled) {
       _renewConnectionWakeLock();
       _connectionWakeLockRenewal ??= Timer.periodic(
-        const Duration(seconds: 45),
+        const Duration(minutes: 10),
         (_) => _renewConnectionWakeLock(),
       );
       return;
@@ -1227,6 +1316,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     _windowsLanUpgradeTimer?.cancel();
     _windowsLanUpgradeTimer = null;
+    _connectionBoostTimer?.cancel();
+    _connectionBoostRetryTimer?.cancel();
     _supervisor.stop();
     _discovery?.stop();
     _connections.stop();
@@ -1725,7 +1816,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (Platform.isAndroid) {
       _androidStatusTimer?.cancel();
       _androidStatusTimer = Timer.periodic(
-          const Duration(seconds: 60), (_) => _sampleAndSendStatusIfNeeded());
+          const Duration(minutes: 5), (_) => _sampleAndSendStatusIfNeeded());
       _sampleAndSendStatusIfNeeded(forceFull: true);
     }
   }
@@ -1992,6 +2083,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> setClipboardSyncEnabled(bool enabled) async {
     await _config.setClipboardSyncEnabled(enabled);
     _clipboard?.setEnabled(enabled);
+    _applyBeaconMode();
     notifyListeners();
   }
 
@@ -2144,6 +2236,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       return false;
     }
     var transferSucceeded = false;
+    var lastProgressUiAt = DateTime.fromMillisecondsSinceEpoch(0);
 
     void done(bool ok) {
       transferSucceeded = ok;
@@ -2167,7 +2260,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       // Update the Android status-bar notification.
       _adHoc!.notifier.showSendProgress(fileName, sent, total);
       // Notify the UI caller.
-      onProgress?.call(sent, total);
+      final now = DateTime.now();
+      if (sent >= total ||
+          now.difference(lastProgressUiAt) >=
+              const Duration(milliseconds: 100)) {
+        lastProgressUiAt = now;
+        onProgress?.call(sent, total);
+      }
     }
 
     if (safUri != null) {
@@ -2360,6 +2459,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> quit() async {
     try {
       _setConnectionWakeLockEnabled(false);
+      _connectionBoostTimer?.cancel();
+      _connectionBoostRetryTimer?.cancel();
+      _connectionBoostTimer = null;
+      _connectionBoostRetryTimer = null;
+      _connectionBoostUntil = null;
       _onTransferState(false); // cancel renewal timer + release, if held
       for (final timer in _bluetoothDialTimers.values) {
         timer.cancel();

@@ -13,11 +13,60 @@ const _chSaf = MethodChannel('conduit/saf');
 /// The [rootPath] passed in by a folder pair is the persisted tree URI string
 /// (e.g. content://com.android.externalstorage.documents/tree/primary%3A...).
 /// We resolve relative paths within it via the Kotlin SafOps handler.
-class SafFileSystemAccess implements FileSystemAccess, TemporaryFileFinalizer {
+class SafFileSystemAccess
+    implements
+        FileSystemAccess,
+        FileSystemChangeSource,
+        TemporaryFileFinalizer,
+        BlockFileReader {
   const SafFileSystemAccess();
+
+  static final _treeChanges = StreamController<String>.broadcast();
+  static final _watchCounts = <String, int>{};
+  static bool _changeHandlerInstalled = false;
 
   @override
   bool get isAndroidSAF => true;
+
+  static void _ensureChangeHandler() {
+    if (_changeHandlerInstalled) return;
+    _changeHandlerInstalled = true;
+    _chSaf.setMethodCallHandler((call) async {
+      if (call.method != 'treeChanged') return;
+      final args = (call.arguments as Map?)?.cast<String, dynamic>();
+      final treeUri = args?['treeUri'];
+      if (treeUri is String) _treeChanges.add(treeUri);
+    });
+  }
+
+  @override
+  Stream<void> changesFor(String rootPath) {
+    _ensureChangeHandler();
+    return _treeChanges.stream.where((tree) => tree == rootPath).map((_) {});
+  }
+
+  @override
+  Future<void> startWatching(String rootPath) async {
+    _ensureChangeHandler();
+    final count = _watchCounts[rootPath] ?? 0;
+    _watchCounts[rootPath] = count + 1;
+    if (count == 0) {
+      await _chSaf.invokeMethod<void>('watchTree', {'treeUri': rootPath});
+    }
+  }
+
+  @override
+  Future<void> stopWatching(String rootPath) async {
+    final count = _watchCounts[rootPath] ?? 0;
+    if (count <= 1) {
+      _watchCounts.remove(rootPath);
+      if (count == 1) {
+        await _chSaf.invokeMethod<void>('unwatchTree', {'treeUri': rootPath});
+      }
+      return;
+    }
+    _watchCounts[rootPath] = count - 1;
+  }
 
   /// Launch the system folder picker. Returns the granted tree URI, or null
   /// if the user cancelled. The permission is persisted on the Kotlin side.
@@ -93,6 +142,22 @@ class SafFileSystemAccess implements FileSystemAccess, TemporaryFileFinalizer {
       'offset': offset,
     }) as Uint8List;
     yield bytes;
+  }
+
+  @override
+  Future<Uint8List> readBlock(
+    String rootPath,
+    String relPath,
+    int offset,
+    int length,
+  ) async {
+    final bytes = await _chSaf.invokeMethod<Uint8List>('readBlock', {
+      'treeUri': rootPath,
+      'relPath': relPath,
+      'offset': offset,
+      'length': length,
+    });
+    return bytes ?? Uint8List(0);
   }
 
   @override

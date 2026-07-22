@@ -3,16 +3,21 @@ package com.conduit.conduit
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.database.ContentObserver
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.os.Handler
+import android.os.Looper
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.BinaryMessenger
 import java.io.ByteArrayOutputStream
 import java.io.FileInputStream
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.IdentityHashMap
 
 /**
  * SAF (Storage Access Framework) operations exposed to Dart over the
@@ -41,6 +46,66 @@ import java.util.concurrent.Executors
  */
 object SafOps {
     private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val channels = IdentityHashMap<BinaryMessenger, MethodChannel>()
+    private val treeWatches = HashMap<String, TreeWatch>()
+
+    private data class TreeWatch(
+        val observer: ContentObserver,
+        var references: Int = 1,
+        var pendingNotification: Runnable? = null
+    )
+
+    @Synchronized
+    fun channel(messenger: BinaryMessenger): MethodChannel =
+        channels.getOrPut(messenger) { MethodChannel(messenger, "conduit/saf") }
+
+    @Synchronized
+    private fun watchTree(ctx: Context, treeUri: String) {
+        val existing = treeWatches[treeUri]
+        if (existing != null) {
+            existing.references += 1
+            return
+        }
+
+        lateinit var watch: TreeWatch
+        val observer = object : ContentObserver(mainHandler) {
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                super.onChange(selfChange, uri)
+                synchronized(this@SafOps) {
+                    watch.pendingNotification?.let(mainHandler::removeCallbacks)
+                    val pending = Runnable {
+                        synchronized(this@SafOps) {
+                            watch.pendingNotification = null
+                            val arguments = mapOf("treeUri" to treeUri)
+                            channels.values.toList().forEach { channel ->
+                                channel.invokeMethod("treeChanged", arguments)
+                            }
+                        }
+                    }
+                    watch.pendingNotification = pending
+                    mainHandler.postDelayed(pending, 1_000L)
+                }
+            }
+        }
+        watch = TreeWatch(observer)
+        ctx.applicationContext.contentResolver.registerContentObserver(
+            Uri.parse(treeUri),
+            true,
+            observer
+        )
+        treeWatches[treeUri] = watch
+    }
+
+    @Synchronized
+    private fun unwatchTree(ctx: Context, treeUri: String) {
+        val watch = treeWatches[treeUri] ?: return
+        watch.references -= 1
+        if (watch.references > 0) return
+        watch.pendingNotification?.let(mainHandler::removeCallbacks)
+        ctx.applicationContext.contentResolver.unregisterContentObserver(watch.observer)
+        treeWatches.remove(treeUri)
+    }
 
 
     /**
@@ -130,8 +195,38 @@ object SafOps {
     }
 
     fun handle(ctx: Context, call: MethodCall, result: MethodChannel.Result) {
+        // ContentResolver and stream operations can take seconds for large trees
+        // or files. Keep every SAF operation except launching a viewer off the
+        // Android UI thread, and marshal the MethodChannel reply back to it.
+        if (call.method == "openFile") {
+            handleNow(ctx, call, result)
+            return
+        }
+        val reply = object : MethodChannel.Result {
+            override fun success(value: Any?) {
+                mainHandler.post { result.success(value) }
+            }
+            override fun error(code: String, message: String?, details: Any?) {
+                mainHandler.post { result.error(code, message, details) }
+            }
+            override fun notImplemented() {
+                mainHandler.post { result.notImplemented() }
+            }
+        }
+        ioExecutor.execute { handleNow(ctx, call, reply) }
+    }
+
+    private fun handleNow(ctx: Context, call: MethodCall, result: MethodChannel.Result) {
         try {
             when (call.method) {
+                "watchTree" -> {
+                    watchTree(ctx, call.argument<String>("treeUri")!!)
+                    result.success(null)
+                }
+                "unwatchTree" -> {
+                    unwatchTree(ctx, call.argument<String>("treeUri")!!)
+                    result.success(null)
+                }
                 "listFiles" -> {
                     val tree = call.argument<String>("treeUri")!!
                     val out = ArrayList<String>()
@@ -199,11 +294,41 @@ object SafOps {
                         result.success(buf.toByteArray())
                     }
                 }
+                "readBlock" -> {
+                    val tree = call.argument<String>("treeUri")!!
+                    val rel = call.argument<String>("relPath")!!
+                    val offset = call.argument<Number>("offset")?.toLong() ?: 0L
+                    val length = call.argument<Number>("length")?.toInt() ?: (1024 * 1024)
+                    val uri = resolveFile(ctx, tree, rel)
+                        ?: throw IllegalArgumentException("no such file: $rel")
+                    val bytes = readSharedUriBlockFast(ctx, uri, offset, length)
+                        ?: ctx.contentResolver.openInputStream(uri).use { input ->
+                            if (input == null) {
+                                throw IllegalStateException("cannot open input stream")
+                            }
+                            var remaining = offset
+                            while (remaining > 0) {
+                                val skipped = input.skip(remaining)
+                                if (skipped <= 0) break
+                                remaining -= skipped
+                            }
+                            val buffer = ByteArrayOutputStream(length)
+                            val temp = ByteArray(64 * 1024)
+                            var wanted = length
+                            while (wanted > 0) {
+                                val count = input.read(temp, 0, minOf(temp.size, wanted))
+                                if (count <= 0) break
+                                buffer.write(temp, 0, count)
+                                wanted -= count
+                            }
+                            buffer.toByteArray()
+                        }
+                    result.success(bytes)
+                }
                 "hashFile" -> {
                     val tree = call.argument<String>("treeUri")!!
                     val rel = call.argument<String>("relPath")!!
-                    ioExecutor.execute {
-                        try {
+                    try {
                             val uri = resolveFile(ctx, tree, rel)
                                 ?: throw IllegalArgumentException("no such file: $rel")
                             val digest = MessageDigest.getInstance("SHA-256")
@@ -221,10 +346,9 @@ object SafOps {
                             val hex = digest.digest().joinToString("") {
                                 "%02x".format(it)
                             }
-                            result.success(hex)
-                        } catch (e: Exception) {
-                            result.error("hash_error", e.message, null)
-                        }
+                        result.success(hex)
+                    } catch (e: Exception) {
+                        result.error("hash_error", e.message, null)
                     }
                 }
                 "write" -> {
@@ -279,8 +403,7 @@ object SafOps {
                         call.argument<String>("temporaryRelPath")!!
                     val destinationRel =
                         call.argument<String>("destinationRelPath")!!
-                    ioExecutor.execute {
-                        try {
+                    try {
                             val sourceUri = resolveFile(ctx, tree, temporaryRel)
                                 ?: throw IllegalArgumentException(
                                     "no such temporary file: $temporaryRel"
@@ -352,10 +475,9 @@ object SafOps {
                                     sourceUri
                                 )
                             }
-                            result.success(true)
-                        } catch (e: Exception) {
-                            result.error("finalize_error", e.message, null)
-                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("finalize_error", e.message, null)
                     }
                 }
                 "delete" -> {

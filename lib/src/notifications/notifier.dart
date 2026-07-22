@@ -19,7 +19,8 @@ import '../diag.dart';
 /// cause is confirmed — remove this comment block when that happens.
 @pragma('vm:entry-point')
 void notificationTapBackground(NotificationResponse response) {
-  final sendPort = IsolateNameServer.lookupPortByName('conduit_notification_port');
+  final sendPort =
+      IsolateNameServer.lookupPortByName('conduit_notification_port');
   Diag.log('notif_tap_background', fields: {
     'actionId': response.actionId,
     'responseType': response.notificationResponseType.toString(),
@@ -45,6 +46,8 @@ class AppNotifier {
 
   final _plugin = FlutterLocalNotificationsPlugin();
   bool _ready = false;
+  final _receiveProgress = <int, int>{};
+  final _sendProgress = <int, int>{};
 
   // Android notification channel for file transfer events.
   static const _androidChannelId = 'conduit_transfers';
@@ -168,11 +171,15 @@ class AppNotifier {
     if (!Platform.isAndroid || !_ready) return;
     try {
       final percent = total > 0 ? (received * 100) ~/ total : 0;
+      final id = name.hashCode ^ 3;
+      if (_receiveProgress[id] == percent && received < total) return;
+      _receiveProgress[id] = percent;
       final androidDetails = AndroidNotificationDetails(
         _androidChannelId,
         _androidChannelName,
         channelDescription: _androidChannelDesc,
-        importance: Importance.low, // low importance so it doesn't alert/sound on every update
+        importance: Importance
+            .low, // low importance so it doesn't alert/sound on every update
         priority: Priority.low,
         showProgress: true,
         maxProgress: 100,
@@ -195,7 +202,7 @@ class AppNotifier {
       );
       final details = NotificationDetails(android: androidDetails);
       await _plugin.show(
-        name.hashCode ^ 3,
+        id,
         'Receiving file',
         '$name ($percent%)',
         details,
@@ -208,7 +215,9 @@ class AppNotifier {
   Future<void> cancelReceiveProgress(String name) async {
     if (!Platform.isAndroid || !_ready) return;
     try {
-      await _plugin.cancel(name.hashCode ^ 3);
+      final id = name.hashCode ^ 3;
+      _receiveProgress.remove(id);
+      await _plugin.cancel(id);
     } catch (_) {}
   }
 
@@ -216,7 +225,9 @@ class AppNotifier {
   Future<void> cancelSendProgress(String name) async {
     if (!Platform.isAndroid || !_ready) return;
     try {
-      await _plugin.cancel(name.hashCode ^ 4);
+      final id = name.hashCode ^ 4;
+      _sendProgress.remove(id);
+      await _plugin.cancel(id);
     } catch (_) {}
   }
 
@@ -225,6 +236,9 @@ class AppNotifier {
     if (!Platform.isAndroid || !_ready) return;
     try {
       final percent = total > 0 ? (sent * 100) ~/ total : 0;
+      final id = name.hashCode ^ 4;
+      if (_sendProgress[id] == percent && sent < total) return;
+      _sendProgress[id] = percent;
       final androidDetails = AndroidNotificationDetails(
         _androidChannelId,
         _androidChannelName,
@@ -240,7 +254,7 @@ class AppNotifier {
       );
       final details = NotificationDetails(android: androidDetails);
       await _plugin.show(
-        name.hashCode ^ 4,
+        id,
         'Sending file',
         '$name ($percent%)',
         details,
@@ -253,6 +267,7 @@ class AppNotifier {
   /// [name] is the file name (no path). [peerName] is the connected peer's
   /// display name. Best-effort — swallows errors.
   Future<void> showFileSent(String name, String peerName) async {
+    _sendProgress.remove(name.hashCode ^ 4);
     try {
       if (Platform.isAndroid && _ready) {
         await _plugin.cancel(name.hashCode ^ 4);
@@ -276,6 +291,7 @@ class AppNotifier {
     String peerName, {
     String? treeUri,
   }) async {
+    _receiveProgress.remove(name.hashCode ^ 3);
     try {
       if (Platform.isAndroid && _ready) {
         await _plugin.cancel(name.hashCode ^ 3);
@@ -283,9 +299,8 @@ class AppNotifier {
     } catch (_) {}
     // Encode the file location as the notification payload only when we have
     // a SAF tree URI — on Windows there's no notification payload mechanism.
-    final payload = (treeUri != null && treeUri.isNotEmpty)
-        ? '$treeUri\n$name'
-        : null;
+    final payload =
+        (treeUri != null && treeUri.isNotEmpty) ? '$treeUri\n$name' : null;
     await _showWithPayload(
       id: name.hashCode ^ 2,
       title: 'File received',
@@ -304,7 +319,8 @@ class AppNotifier {
   ///
   /// The notification auto-dismisses after 10 s so it never lingers — the
   /// user either taps it to open the app and paste, or it disappears on its own.
-  Future<void> showClipboardSyncReceived(String preview, String peerName) async {
+  Future<void> showClipboardSyncReceived(
+      String preview, String peerName) async {
     if (!Platform.isAndroid || !_ready) return;
     try {
       final androidDetails = AndroidNotificationDetails(
@@ -331,7 +347,8 @@ class AppNotifier {
     required int id,
     required String title,
     required String body,
-  }) => _showWithPayload(id: id, title: title, body: body);
+  }) =>
+      _showWithPayload(id: id, title: title, body: body);
 
   Future<void> _showWithPayload({
     required int id,

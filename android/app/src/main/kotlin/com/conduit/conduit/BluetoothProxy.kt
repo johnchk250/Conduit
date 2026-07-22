@@ -62,7 +62,10 @@ object BluetoothProxy {
                     if (device != null) emitDevice(device)
                 }
                 BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-                    if (running) main.postDelayed({ startDiscovery() }, 30_000)
+                    // Paired fallback endpoints come from bondedDevices and the
+                    // RFCOMM listener remains active. Repeating inquiry here
+                    // only burns radio/CPU after the initial device refresh.
+                    if (running) emitStatus("Bluetooth ready - LAN remains preferred")
                 }
             }
         }
@@ -81,6 +84,12 @@ object BluetoothProxy {
                     }
                     "stop" -> {
                         stop()
+                        result.success(null)
+                    }
+                    "refreshDiscovery" -> {
+                        emitKnownDevices()
+                        try { adapter?.cancelDiscovery() } catch (_: Throwable) {}
+                        startDiscovery()
                         result.success(null)
                     }
                     "requestPermissions" -> {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:meta/meta.dart';
+import 'package:path/path.dart' as p;
 
 import '../core/config_store.dart';
 import '../diag.dart';
@@ -18,11 +19,18 @@ import 'scanner.dart';
 import 'sync_preview.dart';
 import 'vault_log.dart';
 import 'watcher.dart';
+import 'work_scheduler.dart';
 import '../transfers/transfer_receipt.dart';
 
 /// Conservative folder-sync transfer pipeline. This changes only block request
 /// scheduling; reconciliation, index state, and conflict resolution stay as-is.
 const int _syncPipelineDepth = 4;
+
+class _IndexSendResult {
+  const _IndexSendResult(this.sent, this.maxSequence);
+  final int sent;
+  final int maxSequence;
+}
 
 /// A folder-pair invite received from a peer, surfaced to the UI for the user
 /// to accept (by picking a local folder) or decline.
@@ -334,6 +342,7 @@ class SyncEngine {
   final _activeReconcileSessions = <String, PeerSession?>{};
   final _pendingReconnectReconciles = <String>{};
   final _restoreBarriers = <String, Completer<void>>{};
+  final _lastProgressEmit = <String, DateTime>{};
 
   Stream<PairSyncState> get stateChanges => _stateController.stream;
   Stream<SyncEvent> get events => _eventController.stream;
@@ -399,17 +408,23 @@ class SyncEngine {
 
   static const _watcherIntervalFast = Duration(seconds: 4);
   static const _watcherIntervalSlow = Duration(seconds: 30);
+  static const _watcherIntervalSafOnline = Duration(minutes: 10);
+  static const _watcherIntervalSafOffline = Duration(hours: 1);
   static const _watcherIntervalBatterySaver = Duration(hours: 1);
 
   /// The interval to use for a peer that is currently ONLINE, accounting for
   /// battery-saver mode.
-  Duration get _onlineInterval =>
-      _batterySaverMode ? _watcherIntervalBatterySaver : _watcherIntervalFast;
+  Duration get _onlineInterval {
+    if (_batterySaverMode) return _watcherIntervalBatterySaver;
+    return fs.isAndroidSAF ? _watcherIntervalSafOnline : _watcherIntervalFast;
+  }
 
   /// The interval to use for a peer that is currently OFFLINE, accounting for
   /// battery-saver mode.
-  Duration get _offlineInterval =>
-      _batterySaverMode ? _watcherIntervalBatterySaver : _watcherIntervalSlow;
+  Duration get _offlineInterval {
+    if (_batterySaverMode) return _watcherIntervalBatterySaver;
+    return fs.isAndroidSAF ? _watcherIntervalSafOffline : _watcherIntervalSlow;
+  }
 
   /// Toggle battery-saver mode at runtime (called from [AppState] when the
   /// user flips the setting). Immediately re-applies watcher intervals to all
@@ -445,13 +460,13 @@ class SyncEngine {
     final startsOffline = pair.peerDeviceId == null ||
         registry.openSessionFor(pair.peerDeviceId!)?.isLinkReady != true;
     w.setInterval(startsOffline ? _offlineInterval : _onlineInterval);
-    w.start();
-
     // Phase 0.1: arm the periodic reconcile safety-net for this pair. It only
     // fires while a live session exists (see _periodicTick) and is a no-op on an
     // already-in-sync folder (reconcile's re-entrancy guard + no-op-invariant).
     _periodicTimers.remove(pair.id)?.cancel();
-    _periodicTimers[pair.id] = Timer.periodic(_periodicInterval, (_) {
+    final periodicInterval =
+        fs.isAndroidSAF ? const Duration(hours: 1) : _periodicInterval;
+    _periodicTimers[pair.id] = Timer.periodic(periodicInterval, (_) {
       _periodicTick(pair);
     });
 
@@ -461,7 +476,13 @@ class SyncEngine {
     final candidate = peerId == null ? null : registry.openSessionFor(peerId);
     final session = candidate?.isLinkReady == true ? candidate : null;
     // Use reconcile's per-pair guard for the initial seed as well.
-    await reconcile(pair, session);
+    try {
+      await reconcile(pair, session);
+    } finally {
+      // The reconcile scanner seeds the watcher signature, so this starts
+      // event/poll observation without immediately traversing the tree again.
+      w.start();
+    }
     log(pair.id, 'Index seeded', SyncEventLevel.info);
   }
 
@@ -573,17 +594,18 @@ class SyncEngine {
     if (!_disposed) _stateController.add(st);
     try {
       final db = await _indexDbFor(pair);
-      final scan = await _scanner.scan(
-        fs: fs,
-        db: db,
-        rootPath: pair.localPath,
-        deviceId: deviceId,
-        batchListWithStat: batchListWithStat,
-        hashFileOverride: hashFileOverride,
-        ignoreGlobs: pair.ignoreGlobs,
-        ignoreExtensions: pair.ignoreExtensions,
-        maxFileSizeBytes: pair.maxFileSizeBytes,
-      );
+      final scan = await heavyWorkScheduler.runScan(() => _scanner.scan(
+            fs: fs,
+            db: db,
+            rootPath: pair.localPath,
+            deviceId: deviceId,
+            batchListWithStat: batchListWithStat,
+            hashFileOverride: hashFileOverride,
+            ignoreGlobs: pair.ignoreGlobs,
+            ignoreExtensions: pair.ignoreExtensions,
+            maxFileSizeBytes: pair.maxFileSizeBytes,
+            onDiskSignature: _watchers[pair.id]?.seedSignature,
+          ));
       if (scan.changed.isNotEmpty) {
         _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
       }
@@ -621,32 +643,27 @@ class SyncEngine {
       if (await fs.stat(pair.localPath, entry.vaultPath) == null) {
         failure = RestoreResult.sourceMissing;
       } else {
-        final restoredBytes = <int>[];
-        await for (final chunk
-            in fs.openRead(pair.localPath, entry.vaultPath)) {
-          restoredBytes.addAll(chunk);
-        }
-
         await vaultBeforeDestructiveChange(
           pair: pair,
           relPath: normalized,
           reason: VaultReason.restoreReplacement,
         );
-        await fs.write(pair.localPath, normalized, restoredBytes);
+        await _restoreFromStream(pair.localPath, entry.vaultPath, normalized);
         await markVaultEntryRestored(pair, entry.entryId);
 
         final db = await _indexDbFor(pair);
-        final scan = await _scanner.scan(
-          fs: fs,
-          db: db,
-          rootPath: pair.localPath,
-          deviceId: deviceId,
-          batchListWithStat: batchListWithStat,
-          hashFileOverride: hashFileOverride,
-          ignoreGlobs: pair.ignoreGlobs,
-          ignoreExtensions: pair.ignoreExtensions,
-          maxFileSizeBytes: pair.maxFileSizeBytes,
-        );
+        final scan = await heavyWorkScheduler.runScan(() => _scanner.scan(
+              fs: fs,
+              db: db,
+              rootPath: pair.localPath,
+              deviceId: deviceId,
+              batchListWithStat: batchListWithStat,
+              hashFileOverride: hashFileOverride,
+              ignoreGlobs: pair.ignoreGlobs,
+              ignoreExtensions: pair.ignoreExtensions,
+              maxFileSizeBytes: pair.maxFileSizeBytes,
+              onDiskSignature: _watchers[pair.id]?.seedSignature,
+            ));
         if (scan.changed.isNotEmpty) {
           _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
         }
@@ -681,6 +698,53 @@ class SyncEngine {
     return connected
         ? RestoreResult.restoredAndQueued
         : RestoreResult.restoredOffline;
+  }
+
+  Future<void> _restoreFromStream(
+    String rootPath,
+    String sourceRelPath,
+    String destinationRelPath,
+  ) async {
+    final temporaryRelPath = '$destinationRelPath$syncPartSuffix';
+    await fs.delete(rootPath, temporaryRelPath);
+    var wrote = false;
+    await for (final chunk in fs.openRead(rootPath, sourceRelPath)) {
+      if (!wrote) {
+        await fs.write(rootPath, temporaryRelPath, chunk);
+        wrote = true;
+      } else {
+        await fs.append(rootPath, temporaryRelPath, chunk);
+      }
+    }
+    if (!wrote) await fs.write(rootPath, temporaryRelPath, const <int>[]);
+
+    if (fs is TemporaryFileFinalizer) {
+      await (fs as TemporaryFileFinalizer).replaceFromTemporary(
+        rootPath,
+        temporaryRelPath,
+        destinationRelPath,
+      );
+    } else if (fs is LocalFileSystemAccess) {
+      final destination = File(p.join(rootPath, destinationRelPath));
+      await Directory(p.dirname(destination.path)).create(recursive: true);
+      if (await destination.exists()) await destination.delete();
+      await File(p.join(rootPath, temporaryRelPath)).rename(destination.path);
+    } else {
+      // Test/custom backends still stream to the destination rather than
+      // retaining the restored version in one giant Dart list.
+      await fs.delete(rootPath, destinationRelPath);
+      var first = true;
+      await for (final chunk in fs.openRead(rootPath, temporaryRelPath)) {
+        if (first) {
+          await fs.write(rootPath, destinationRelPath, chunk);
+          first = false;
+        } else {
+          await fs.append(rootPath, destinationRelPath, chunk);
+        }
+      }
+      if (first) await fs.write(rootPath, destinationRelPath, const <int>[]);
+      await fs.delete(rootPath, temporaryRelPath);
+    }
   }
 
   /// Records a vault event directly.
@@ -934,6 +998,18 @@ class SyncEngine {
     if (st == null) return;
     st.status = s;
     _stateController.add(st);
+  }
+
+  void _emitProgress(PairSyncState state) {
+    if (_disposed) return;
+    final now = DateTime.now();
+    final prior = _lastProgressEmit[state.pairId];
+    if (prior != null &&
+        now.difference(prior) < const Duration(milliseconds: 100)) {
+      return;
+    }
+    _lastProgressEmit[state.pairId] = now;
+    _stateController.add(state);
   }
 
   Future<void> _onLocalChange(FolderPair pair) async {
@@ -1245,17 +1321,18 @@ class SyncEngine {
     // 2. Scan local → DB. upsertLocal/markDeletedLocal are no-ops on unchanged
     //    files, so this burns no sequence on an idle folder (the key invariant
     //    that keeps a no-op reconcile from re-advertising the whole folder).
-    final scan = await _scanner.scan(
-      fs: fs,
-      db: db,
-      rootPath: pair.localPath,
-      deviceId: deviceId,
-      batchListWithStat: batchListWithStat,
-      hashFileOverride: hashFileOverride,
-      ignoreGlobs: pair.ignoreGlobs,
-      ignoreExtensions: pair.ignoreExtensions,
-      maxFileSizeBytes: pair.maxFileSizeBytes,
-    );
+    final scan = await heavyWorkScheduler.runScan(() => _scanner.scan(
+          fs: fs,
+          db: db,
+          rootPath: pair.localPath,
+          deviceId: deviceId,
+          batchListWithStat: batchListWithStat,
+          hashFileOverride: hashFileOverride,
+          ignoreGlobs: pair.ignoreGlobs,
+          ignoreExtensions: pair.ignoreExtensions,
+          maxFileSizeBytes: pair.maxFileSizeBytes,
+          onDiskSignature: _watchers[pair.id]?.seedSignature,
+        ));
     if (scan.changed.isNotEmpty) {
       _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
     }
@@ -1316,25 +1393,76 @@ class SyncEngine {
     final fromSeq = _sentSeq[peerKey] ?? 0;
     // Only advertise rows WE wrote — rows from applyRemote belong to the peer
     // and re-advertising them is wasteful.
-    final delta = await db.changesSinceLocal(fromSeq, deviceId);
-    if (delta.isEmpty && !isFirstAdvertise) {
-      // Already advertised up to this watermark and no new changes. Skip!
-      return;
-    }
-    final maxSeq = delta.isEmpty ? await db.maxSequence() : delta.last.sequence;
-    session.send({
-      't': Msg.indexUpdate,
-      'pairId': pair.id,
-      'folderId': pair.id,
-      'entries': delta.map((e) => e.toJson()).toList(),
-      'fromSequence': fromSeq,
-    });
+    final result = await _sendIndexDeltaFromDb(
+      session,
+      pair.id,
+      db,
+      fromSeq,
+      sendEmpty: isFirstAdvertise,
+    );
+    final maxSeq = result.maxSequence;
     _sentSeq[peerKey] = maxSeq;
+    if (result.sent == 0 && !isFirstAdvertise) return;
     Diag.log('v2_advertise',
         peer: session.peer.deviceId,
         pairId: pair.id,
-        fields: {'sent': delta.length, 'fromSeq': fromSeq, 'toSeq': maxSeq});
+        fields: {'sent': result.sent, 'fromSeq': fromSeq, 'toSeq': maxSeq});
   }
+
+  Future<_IndexSendResult> _sendIndexDeltaFromDb(
+    PeerSession session,
+    String pairId,
+    IndexDb db,
+    int fromSequence, {
+    required bool sendEmpty,
+  }) async {
+    List<IndexEntry>? pending;
+    var sent = 0;
+    var maxSequence = fromSequence;
+    await for (final page
+        in db.changesSinceLocalPages(fromSequence, deviceId)) {
+      if (pending != null) {
+        await _sendIndexPage(session, pairId, pending, fromSequence, true);
+        sent += pending.length;
+        maxSequence = pending.last.sequence;
+      }
+      pending = page;
+    }
+    if (pending != null) {
+      await _sendIndexPage(session, pairId, pending, fromSequence, false);
+      sent += pending.length;
+      maxSequence = pending.last.sequence;
+    } else {
+      if (sendEmpty) {
+        await session.sendAsync({
+          't': Msg.indexUpdate,
+          'pairId': pairId,
+          'folderId': pairId,
+          'entries': const <Map<String, dynamic>>[],
+          'fromSequence': fromSequence,
+          'more': false,
+        });
+      }
+      maxSequence = await db.maxSequence();
+    }
+    return _IndexSendResult(sent, maxSequence);
+  }
+
+  Future<void> _sendIndexPage(
+    PeerSession session,
+    String pairId,
+    List<IndexEntry> entries,
+    int fromSequence,
+    bool more,
+  ) =>
+      session.sendAsync({
+        't': Msg.indexUpdate,
+        'pairId': pairId,
+        'folderId': pairId,
+        'entries': entries.map((entry) => entry.toJson()).toList(),
+        'fromSequence': fromSequence,
+        'more': more,
+      });
 
   /// Compute needs from the live snapshots and fetch each one block-by-block.
   /// A [TerminalFetchError] (peer's source file vanished) drops that one file
@@ -1394,6 +1522,7 @@ class SyncEngine {
     st.transferring = true;
     st.progress = 0;
     _stateController.add(st);
+    final transferLease = await heavyWorkScheduler.acquireTransfer();
     _beginTransfer(); // Phase 0.4: hold a wake lock only while bytes move
     var done = 0;
     final total = transferable.length;
@@ -1418,7 +1547,7 @@ class SyncEngine {
                 session.isBandwidthConstrained ? 1 : _syncPipelineDepth,
             onProgress: (recv, tot) {
               st.progress = total == 0 ? null : (done + recv / tot) / total;
-              if (!_disposed) _stateController.add(st);
+              _emitProgress(st);
             },
             // Roadmap Phase 6.4 (version-restore) — best-effort, fire-and-
             // forget (same unawaited pattern already used elsewhere in this
@@ -1489,6 +1618,7 @@ class SyncEngine {
       // Phase 0.4: release the wake lock the moment no fetch is in flight, so
       // Doze is free to take over on an idle folder.
       _endTransfer();
+      transferLease.release();
     }
     st.transferring = false;
     st.progress = null;
@@ -1543,11 +1673,11 @@ class SyncEngine {
     }
   }
 
-  /// Start the hourly DB backup timer (Roadmap Phase 0.5). Called once after
+  /// Start the six-hour DB backup timer (Roadmap Phase 0.5). Called once after
   /// the engine is wired. Safe to call repeatedly — it replaces the timer.
   void startBackupTimer() {
     _backupTimer?.cancel();
-    _backupTimer = Timer.periodic(const Duration(hours: 1), (_) {
+    _backupTimer = Timer.periodic(const Duration(hours: 6), (_) {
       if (_disposed) return;
       backupAllDbs();
     });
@@ -1617,8 +1747,8 @@ class SyncEngine {
           rootPath: pair.localPath,
           relPath: name,
           requests: ctrl.stream,
-          respond: (resp) {
-            session.send({
+          respond: (resp) async {
+            await session.sendAsync({
               ...resp,
               't': Msg.response,
               'pairId': pair.id,
@@ -2153,7 +2283,7 @@ class SyncEngine {
           'toSeq': maxSeq,
           'first': entriesRaw.isEmpty,
         });
-    if (maxSeq > priorSeq || wasLiveEmpty) {
+    if (msg['more'] != true && (maxSeq > priorSeq || wasLiveEmpty)) {
       await reconcile(pair, session);
     }
   }
@@ -2175,21 +2305,20 @@ class SyncEngine {
     final fromSeq = (msg['fromSequence'] as num?)?.toInt() ?? 0;
     final db = await _indexDbFor(pair);
     // Only send rows WE wrote — the peer already has its own.
-    final delta = await db.changesSinceLocal(fromSeq, deviceId);
-    final maxSeq = delta.isEmpty ? await db.maxSequence() : delta.last.sequence;
-    session.send({
-      't': Msg.indexUpdate,
-      'pairId': pairId,
-      'folderId': pairId,
-      'entries': delta.map((e) => e.toJson()).toList(),
-      'fromSequence': fromSeq,
-    });
+    final result = await _sendIndexDeltaFromDb(
+      session,
+      pairId,
+      db,
+      fromSeq,
+      sendEmpty: true,
+    );
+    final maxSeq = result.maxSequence;
     final peerKey = _peerKey(session.peer.deviceId, pairId);
     _sentSeq[peerKey] = maxSeq;
     Diag.log('v2_index_reply',
         peer: session.peer.deviceId,
         pairId: pairId,
-        fields: {'sent': delta.length, 'fromSeq': fromSeq, 'toSeq': maxSeq});
+        fields: {'sent': result.sent, 'fromSeq': fromSeq, 'toSeq': maxSeq});
   }
 
   // ---- Delete propagation to disk (Bug #6 / REDESIGN.md Phase 4) ----------

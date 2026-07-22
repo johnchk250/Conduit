@@ -61,9 +61,13 @@ void main() {
       receiveNoncePrefix: Uint8List.fromList([1, 2, 3, 4]),
     ));
     final received = <int>[];
+    Uint8List? receivedData;
     final done = Completer<void>();
     b.onMessage = (message) {
       received.add(message['n'] as int);
+      if (message['data'] case final List<int> data) {
+        receivedData = Uint8List.fromList(data);
+      }
       if (received.length == 3) done.complete();
     };
     a.listen();
@@ -71,10 +75,12 @@ void main() {
 
     a.send({'t': 'test', 'n': 1});
     a.send({'t': 'test', 'n': 2});
-    a.send({'t': 'test', 'n': 3});
+    final binary = Uint8List.fromList(List<int>.generate(4096, (i) => i % 251));
+    a.send({'t': 'test', 'n': 3, 'data': binary});
     await done.future.timeout(const Duration(seconds: 5));
 
     expect(received, [1, 2, 3]);
+    expect(receivedData, binary);
     await a.close();
     await b.close();
     await server.close();

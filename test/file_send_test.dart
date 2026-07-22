@@ -90,7 +90,7 @@ void main() {
       expect(dataMsg['offerId'], offerId);
       expect(dataMsg['offset'], 0);
       expect(dataMsg['length'], fileBytes.length);
-      expect(base64.decode(dataMsg['data'] as String), fileBytes);
+      expect(dataMsg['data'] as List<int>, fileBytes);
 
       // Let the serve loop complete naturally.
       await Future<void>.delayed(const Duration(milliseconds: 50));

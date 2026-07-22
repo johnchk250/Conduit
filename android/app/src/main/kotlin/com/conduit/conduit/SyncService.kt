@@ -102,14 +102,11 @@ class SyncService : Service() {
          * false = release. */
         const val EXTRA_LOCK_ENABLED = "enabled"
 
-        // Timed safety-net durations for the two renewable locks. The Dart side
-        // renews well before either deadline (see app_state.dart's
-        // _renewTransferWakeLock / _renewConnectionWakeLock, both on 45s
-        // periodic timers) — the timeout only protects against a lost
-        // release/renew call (e.g. a crashed isolate), it is not the intended
-        // hold duration.
+        // Timed safety nets for the two renewable locks. Transfers renew every
+        // 45 seconds; clipboard-realtime connections renew every 10 minutes.
+        // A timeout protects against a crashed isolate losing its release call.
         private const val TRANSFER_LOCK_TIMEOUT_MS = 120_000L
-        private const val CONNECTION_LOCK_TIMEOUT_MS = 120_000L
+        private const val CONNECTION_LOCK_TIMEOUT_MS = 15 * 60 * 1000L
 
         // Delay before restarting the service after a task-removal.
         private const val RESTART_DELAY_MS = 1_000L
@@ -121,7 +118,7 @@ class SyncService : Service() {
         // case promptly; this repeating alarm is the long-haul fallback.
         // Inexact → battery-friendly (Android 12+ may batch it to ~15 min; that's
         // fine for a watchdog, the FGS is the primary survival mechanism).
-        private const val WATCHDOG_INTERVAL_MS = 2 * 60 * 1000L // 2 min
+        private const val WATCHDOG_INTERVAL_MS = 15 * 60 * 1000L // 15 min
         private const val WATCHDOG_RC = 42
 
         fun start(ctx: Context) {

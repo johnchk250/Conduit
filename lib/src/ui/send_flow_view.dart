@@ -212,10 +212,11 @@ class _SendFlowViewState extends State<SendFlowView> {
   /// tree intact (e.g. "MyFolder/sub/photo.jpg").
   Future<void> _onDropItems(DropDoneDetails details) async {
     final picked = <_PickedFile>[];
+    var enumerated = 0;
 
     for (final xfile in details.files) {
       final fsPath = xfile.path;
-      final entity = FileSystemEntity.typeSync(fsPath);
+      final entity = await FileSystemEntity.type(fsPath, followLinks: false);
 
       if (entity == FileSystemEntityType.directory) {
         // Recursively walk the folder and collect all files, preserving their
@@ -236,6 +237,10 @@ class _SendFlowViewState extends State<SendFlowView> {
               path: sub.path,
               size: size,
             ));
+            enumerated++;
+            if (enumerated % 100 == 0) {
+              await Future<void>.delayed(Duration.zero);
+            }
           }
         }
       } else if (entity == FileSystemEntityType.file) {
