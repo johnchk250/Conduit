@@ -54,7 +54,8 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
               subtitle: enabled
                   ? hasPeer
                       ? (isAndroid
-                          ? 'PC→phone auto · Phone→PC manual (tap below)'
+                          ? 'PC→phone auto · always-on background connection · '
+                              'Phone→PC manual'
                           : 'PC→phone auto · clipboard changes sync '
                               'automatically')
                       : 'Enabled, but no peer connected'

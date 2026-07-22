@@ -1,6 +1,5 @@
 package com.conduit.conduit
 
-import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,15 +8,19 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import io.flutter.embedding.engine.FlutterEngine
 import androidx.core.app.NotificationCompat
+import io.flutter.plugin.common.MethodChannel
 
 /**
  * Foreground service that keeps the sync engine alive while the app is in the
@@ -39,9 +42,10 @@ import androidx.core.app.NotificationCompat
  *     transitions of the engine's transfer-burst counter, and renews every
  *     45s while a burst is in progress so multi-file bursts longer than the
  *     lock's timeout don't silently lose protection.
- *   - **Connection lock** (`Conduit::Connection`): held whenever at least one
- *     peer session is live (and battery-saver mode is off), independently of
- *     whether bytes are moving at that instant. Same 45s Dart renewal.
+ *   - **Clipboard/recovery lock** (`Conduit::Connection`): held while the
+ *     opt-in clipboard feature has a live peer, or during a bounded reconnect
+ *     boost. It is absent from normal folder-only idle operation and renews
+ *     every 10 minutes while needed.
  *
  * Both locks are reference-counted OFF (a single timed acquisition per
  * enable/renew, not nested), and both were moved here from MainActivity: an
@@ -52,24 +56,16 @@ import androidx.core.app.NotificationCompat
  * to the foreground service instead, which is what's actually meant to
  * outlive the UI — mirroring how [multicastLock] already worked correctly.
  *
- * ## Restart on task removal (Roadmap Phase 1)
- *
- * `onTaskRemoved` (swipe-from-recents) schedules a one-shot restart via
- * AlarmManager so the service comes back ~1s later. This is the standard
- * pattern for surviving the recents gesture on stock Android; OEM killers
- * (MIUI/EMUI/ColorOS) still require the user's battery/autostart whitelist,
- * documented in the in-app Survival screen.
- *
  * ## Notification visibility toggle (Polish)
  *
  * Two notification channels exist:
  *   - CH_ID_NORMAL (IMPORTANCE_DEFAULT): full notification with status-bar icon.
- *   - CH_ID_SILENT (IMPORTANCE_MIN): silent entry in the drawer only; the
- *     status-bar icon is hidden by the OS. This satisfies the FGS requirement
- *     while minimising visual clutter when the user opts out.
+ *   - CH_ID_SILENT (IMPORTANCE_MIN): a quieter foreground-service entry.
+ *     Android may still expose it in the notification drawer or Active apps,
+ *     as required for user-visible background work.
  *
- * The Dart side calls `setNotificationVisibility(bool)` via MainActivity's
- * CH_SYNC channel, which sends ACTION_SET_VISIBILITY to this service.
+ * The Dart side calls `setNotificationVisibility(bool)` through the shared
+ * method channel; the update is applied directly to the running service.
  */
 class SyncService : Service() {
 
@@ -78,178 +74,76 @@ class SyncService : Service() {
         private const val CH_ID_SILENT = "conduit_fg_silent"
         private const val NOTIF_ID = 1
         private const val ACTION_START = "com.conduit.conduit.START"
-        private const val ACTION_STOP = "com.conduit.conduit.STOP"
-        /** Sent by MainActivity to flip the notification channel (visible/silent). */
-        const val ACTION_SET_VISIBILITY = "com.conduit.conduit.SET_VISIBILITY"
-        /** Boolean extra on ACTION_SET_VISIBILITY: true = normal, false = silent. */
-        const val EXTRA_VISIBLE = "visible"
-        /** Sent by MainActivity when Dart's live-peer-session state changes
-         * (Roadmap Phase 0.6 — battery). See [multicastLock] doc. */
-        const val ACTION_SET_DISCOVERY_NEEDED = "com.conduit.conduit.SET_DISCOVERY_NEEDED"
-        /** Boolean extra on ACTION_SET_DISCOVERY_NEEDED: true = no peer session
-         * is live, (re)acquire the MulticastLock; false = at least one is,
-         * release it. */
-        const val EXTRA_NEEDED = "needed"
+        @Volatile
+        private var instance: SyncService? = null
+        @Volatile
+        private var desiredNotificationVisible = true
+        @Volatile
+        private var desiredDiscoveryNeeded = true
+        @Volatile
+        private var desiredTransferLock = false
+        @Volatile
+        private var desiredConnectionLock = false
 
-        /** Sent by MainActivity, forwarding the engine's transfer start/stop
-         * signal (Roadmap Phase 0.4, fixed post-audit — see [transferWakeLock]
-         * doc for why this lives here instead of on the Activity). */
-        const val ACTION_SET_TRANSFER_LOCK = "com.conduit.conduit.SET_TRANSFER_LOCK"
-        /** Sent by MainActivity, forwarding Dart's "at least one live peer
-         * session" signal (Roadmap Phase 0.6). See [connectionWakeLock] doc. */
-        const val ACTION_SET_CONNECTION_LOCK = "com.conduit.conduit.SET_CONNECTION_LOCK"
-        /** Boolean extra shared by both SET_*_LOCK actions: true = acquire,
-         * false = release. */
-        const val EXTRA_LOCK_ENABLED = "enabled"
-
-        // Timed safety nets for the two renewable locks. Transfers renew every
-        // 45 seconds; clipboard-realtime connections renew every 10 minutes.
-        // A timeout protects against a crashed isolate losing its release call.
+        // Timed safety nets for renewable locks. Transfers renew every 45s;
+        // the lower-churn clipboard/recovery lock renews every 10 minutes.
+        // Timeouts protect against a crashed isolate losing its release call.
         private const val TRANSFER_LOCK_TIMEOUT_MS = 120_000L
         private const val CONNECTION_LOCK_TIMEOUT_MS = 15 * 60 * 1000L
 
-        // Delay before restarting the service after a task-removal.
-        private const val RESTART_DELAY_MS = 1_000L
-
-        // Watchdog (Phase 1, Issue #8): a repeating inexact alarm that re-launches
-        // the service if it has been killed AFTER the one-shot onTaskRemoved
-        // restart — i.e. OOM kill, OEM battery killer, or the Android 14+ 6-hour
-        // dataSync FGS daily cap. The one-shot handles the common recents-swipe
-        // case promptly; this repeating alarm is the long-haul fallback.
-        // Inexact → battery-friendly (Android 12+ may batch it to ~15 min; that's
-        // fine for a watchdog, the FGS is the primary survival mechanism).
-        private const val WATCHDOG_INTERVAL_MS = 15 * 60 * 1000L // 15 min
-        private const val WATCHDOG_RC = 42
-
         fun start(ctx: Context) {
-            val intent = Intent(ctx, SyncService::class.java).apply { action = ACTION_START }
+            if (instance != null) return
+            val intent = Intent(ctx, SyncService::class.java).apply {
+                action = ACTION_START
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(intent)
             } else {
                 ctx.startService(intent)
             }
         }
+
         fun stop(ctx: Context) {
-            val intent = Intent(ctx, SyncService::class.java).apply { action = ACTION_STOP }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent)
-            } else {
-                ctx.startService(intent)
+            ctx.stopService(Intent(ctx, SyncService::class.java))
+        }
+
+        /** Apply a control update directly to the already-running service.
+         * No control method attempts to create a foreground service from the
+         * background; [start] is the sole creation path. Desired state is kept
+         * in process memory so calls racing onCreate are applied there. */
+        private fun applyToRunning(block: SyncService.() -> Unit) {
+            val service = instance ?: return
+            service.mainHandler.post {
+                if (instance === service) service.block()
             }
         }
 
-        /**
-         * Ask the running service to change its notification visibility.
-         * [visible] true = normal importance (status-bar icon shown),
-         *           false = min importance (silent; no status-bar icon).
-         */
         fun setVisibility(ctx: Context, visible: Boolean) {
-            val intent = Intent(ctx, SyncService::class.java).apply {
-                action = ACTION_SET_VISIBILITY
-                putExtra(EXTRA_VISIBLE, visible)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent)
-            } else {
-                ctx.startService(intent)
-            }
+            desiredNotificationVisible = visible
+            applyToRunning { applyNotificationVisibility(visible) }
         }
 
-        /**
-         * Ask the running service to acquire or release its MulticastLock.
-         * See [multicastLock] doc for the battery rationale. [needed] true =
-         * no peer session is live, false = at least one is.
-         */
         fun setDiscoveryNeeded(ctx: Context, needed: Boolean) {
-            val intent = Intent(ctx, SyncService::class.java).apply {
-                action = ACTION_SET_DISCOVERY_NEEDED
-                putExtra(EXTRA_NEEDED, needed)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent)
-            } else {
-                ctx.startService(intent)
+            desiredDiscoveryNeeded = needed
+            applyToRunning {
+                if (needed) acquireMulticastLock() else releaseMulticastLock()
             }
         }
 
-        /**
-         * Ask the running service to acquire/renew or release the
-         * transfer-tied wake lock. [enabled] true = a transfer burst is in
-         * progress (acquire/renew); false = the burst ended (release).
-         */
         fun setTransferLockEnabled(ctx: Context, enabled: Boolean) {
-            val intent = Intent(ctx, SyncService::class.java).apply {
-                action = ACTION_SET_TRANSFER_LOCK
-                putExtra(EXTRA_LOCK_ENABLED, enabled)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent)
-            } else {
-                ctx.startService(intent)
+            desiredTransferLock = enabled
+            applyToRunning {
+                if (enabled) acquireTransferWakeLock() else releaseTransferWakeLock()
             }
         }
 
-        /**
-         * Ask the running service to acquire/renew or release the
-         * connection-tied wake lock. [enabled] true = at least one peer
-         * session is live; false = none are.
-         */
         fun setConnectionLockEnabled(ctx: Context, enabled: Boolean) {
-            val intent = Intent(ctx, SyncService::class.java).apply {
-                action = ACTION_SET_CONNECTION_LOCK
-                putExtra(EXTRA_LOCK_ENABLED, enabled)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(intent)
-            } else {
-                ctx.startService(intent)
+            desiredConnectionLock = enabled
+            applyToRunning {
+                if (enabled) acquireConnectionWakeLock() else releaseConnectionWakeLock()
             }
         }
 
-        /**
-         * Arm the repeating watchdog alarm (idempotent). Fired in [onStartCommand]
-         * so every entry path sets it up; re-arming with FLAG_UPDATE_CURRENT
-         * replaces any existing alarm rather than stacking. Also (re)armed in
-         * [onTaskRemoved] as a defensive guarantee.
-         */
-        fun scheduleWatchdog(ctx: Context) {
-            val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val intent = Intent(ctx, RestartReceiver::class.java).apply {
-                setPackage(ctx.packageName)
-            }
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            else
-                PendingIntent.FLAG_UPDATE_CURRENT
-            val pi = PendingIntent.getBroadcast(ctx, WATCHDOG_RC, intent, flags)
-            // ELAPSED_REALTIME_WAKEUP + SystemClock.elapsedRealtime() keeps the
-            // trigger in the same time base (using wall-clock millis here would
-            // fire at the wrong time — see audit Issue #3).
-            am.setInexactRepeating(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + WATCHDOG_INTERVAL_MS,
-                WATCHDOG_INTERVAL_MS,
-                pi,
-            )
-        }
-
-        /**
-         * Cancel the repeating watchdog alarm. Called on an intentional stop so
-         * the watchdog doesn't keep relaunching a service the user meant to kill.
-         */
-        fun cancelWatchdog(ctx: Context) {
-            val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val intent = Intent(ctx, RestartReceiver::class.java).apply {
-                setPackage(ctx.packageName)
-            }
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            else
-                PendingIntent.FLAG_UPDATE_CURRENT
-            val pi = PendingIntent.getBroadcast(ctx, WATCHDOG_RC, intent, flags)
-            am.cancel(pi)
-            pi.cancel()
-        }
     }
 
     private var baseWakeLock: PowerManager.WakeLock? = null
@@ -258,25 +152,117 @@ class SyncService : Service() {
 
     /**
      * Network changes are system callbacks, so they still arrive when Dart
-     * timers are deferred by Doze. Give the reconnect supervisor a short CPU
-     * window whenever connectivity returns.
+     * timers are deferred by Doze. Besides a bounded CPU wake window, forward
+     * a monotonically increasing route generation to Dart. AppState uses it to
+     * invalidate stale LAN sockets, rebind UDP discovery, clear reconnect
+     * backoff, and announce on the new interface immediately.
      */
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val networkEpoch = SystemClock.elapsedRealtimeNanos().toString()
+    private var currentNetwork: Network? = null
+    private var networkGeneration = 0L
+    private var lastLinkSignature: String? = null
+    private var pendingNetworkSignal: Runnable? = null
+
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
+            val changed = currentNetwork != network
+            currentNetwork = network
+            if (changed) {
+                networkGeneration += 1
+                lastLinkSignature = null
+            }
+            acquireMulticastLock()
             wakeForReconnect()
+            scheduleNetworkSignal("available", available = true)
+            // A cold Flutter engine may still be registering its Dart handler.
+            // Re-send the same generation once after startup; duplicate
+            // generations are harmless and do not tear down sessions.
+            mainHandler.postDelayed({
+                if (currentNetwork == network) {
+                    emitNetworkSignal("available_confirmed", true, networkGeneration)
+                }
+            }, 4_000L)
+        }
+
+        override fun onLost(network: Network) {
+            if (currentNetwork != network) return
+            currentNetwork = null
+            lastLinkSignature = null
+            networkGeneration += 1
+            scheduleNetworkSignal("lost", available = false, delayMs = 100L)
+        }
+
+        override fun onLinkPropertiesChanged(
+            network: Network,
+            linkProperties: LinkProperties,
+        ) {
+            if (currentNetwork != network) return
+            val signature = buildLinkSignature(linkProperties)
+            val previous = lastLinkSignature
+            lastLinkSignature = signature
+            if (previous != null && previous != signature) {
+                networkGeneration += 1
+                acquireMulticastLock()
+                wakeForReconnect()
+                scheduleNetworkSignal("link_properties", available = true)
+            }
+        }
+    }
+
+    private fun buildLinkSignature(link: LinkProperties): String {
+        val addresses = link.linkAddresses.map { it.toString() }.sorted().joinToString(",")
+        val routes = link.routes.map {
+            "${it.destination}/${it.gateway?.hostAddress ?: "-"}"
+        }.sorted().joinToString(",")
+        // DNS-only updates do not invalidate an established TCP route and must
+        // not cause visible reconnect churn. Interface, address, and route
+        // changes are the signals that matter for LAN socket reachability.
+        return "${link.interfaceName}|$addresses|$routes"
+    }
+
+    private fun scheduleNetworkSignal(
+        reason: String,
+        available: Boolean,
+        delayMs: Long = 750L,
+    ) {
+        pendingNetworkSignal?.let { mainHandler.removeCallbacks(it) }
+        val generation = networkGeneration
+        val signal = Runnable {
+            pendingNetworkSignal = null
+            emitNetworkSignal(reason, available, generation)
+        }
+        pendingNetworkSignal = signal
+        mainHandler.postDelayed(signal, delayMs)
+    }
+
+    private fun emitNetworkSignal(reason: String, available: Boolean, generation: Long) {
+        val engine = flutterEngine ?: return
+        try {
+            MethodChannel(engine.dartExecutor.binaryMessenger, "conduit/network_events")
+                .invokeMethod(
+                    "networkChanged",
+                    mapOf(
+                        "reason" to reason,
+                        "available" to available,
+                        "generation" to generation,
+                        "epoch" to networkEpoch,
+                    ),
+                )
+        } catch (_: Throwable) {
+            // Dart may still be starting. onAvailable's delayed confirmation
+            // and future network callbacks provide another opportunity.
         }
     }
 
     private fun wakeForReconnect() {
         try {
             if (baseWakeLock?.isHeld == true) baseWakeLock?.release()
-            baseWakeLock?.acquire(30_000L)
+            baseWakeLock?.acquire(45_000L)
         } catch (_: Throwable) {
             // Best-effort; the foreground service still protects the process.
         }
     }
-
-    private var intentionalStop = false
 
     /**
      * Transfer-tied partial wake lock (Roadmap Phase 0.4).
@@ -299,17 +285,16 @@ class SyncService : Service() {
     private var transferWakeLock: PowerManager.WakeLock? = null
 
     /**
-     * Connection-tied partial wake lock (Roadmap Phase 0.6), held whenever at
-     * least one peer session is live. Same ownership fix and rationale as
-     * [transferWakeLock] above — previously Activity-scoped and released on
-     * `MainActivity.onDestroy()`. Dart renews this every 45s (see
-     * `_renewConnectionWakeLock`); [CONNECTION_LOCK_TIMEOUT_MS] is a safety
-     * net only.
+     * Clipboard/recovery partial wake lock (Roadmap Phase 0.6). It is held only
+     * while the user-enabled clipboard feature has a live peer, or during an
+     * explicit reconnect/network-transition boost. Folder-only idle operation
+     * remains lock-free. Dart renews it every 10 minutes; the timeout is a
+     * safety net only.
      */
     private var connectionWakeLock: PowerManager.WakeLock? = null
 
-    // Current notification channel: true = normal (status-bar visible),
-    // false = silent (IMPORTANCE_MIN, no status-bar icon).
+    // Current notification channel: true = normal importance, false = the
+    // quieter IMPORTANCE_MIN channel. Android may still show either entry.
     private var notifVisible = true
 
     // MulticastLock so the Dart isolate actually receives UDP discovery
@@ -324,27 +309,31 @@ class SyncService : Service() {
     // the many hours a day a peer session is already live and no beacon can
     // do anything useful (an established session is a unicast TCP socket,
     // unaffected by this lock either way). Now acquired here as the correct
-    // startup default (no session is live yet), then toggled by
-    // ACTION_SET_DISCOVERY_NEEDED — sent by AppState._setDiscoveryLockEnabled
-    // via MainActivity's conduit/wakelock channel every time the set of live
-    // peer sessions changes empty <-> non-empty. onDestroy still releases it
+    // startup default (no session is live yet), then toggled directly by
+    // AppState._setDiscoveryLockEnabled whenever any paired peer still needs
+    // discovery. onDestroy still releases it
     // unconditionally as a final safety net.
     private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
+        notifVisible = desiredNotificationVisible
         ensureChannels()
         val notif = buildNotification("Conduit is running", notifVisible)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            startForeground(
+                NOTIF_ID,
+                notif,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+            )
         } else {
             startForeground(NOTIF_ID, notif)
         }
         // NOTE (Roadmap Phase 0.4, ownership fixed post-audit): a long-held
         // blanket wake lock was removed. The transfer- and connection-tied
         // wake locks are owned by THIS service (acquire/release/renew
-        // forwarded from MainActivity over the conduit/wakelock channel — see
-        // ACTION_SET_TRANSFER_LOCK / ACTION_SET_CONNECTION_LOCK), so they
+        // forwarded over the conduit/wakelock channel), so they
         // survive Activity destruction (e.g. swipe-from-recents) as long as
         // this service is alive. No blanket lock is held while idle.
         val pm = getSystemService(POWER_SERVICE) as PowerManager
@@ -364,7 +353,9 @@ class SyncService : Service() {
         } catch (_: Throwable) {}
         wakeForReconnect()
 
-        acquireMulticastLock()
+        if (desiredDiscoveryNeeded) acquireMulticastLock()
+        if (desiredTransferLock) acquireTransferWakeLock()
+        if (desiredConnectionLock) acquireConnectionWakeLock()
     }
 
     /**
@@ -402,7 +393,10 @@ class SyncService : Service() {
     private fun acquireTransferWakeLock() {
         if (transferWakeLock == null) {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
-            transferWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Conduit::Transfer")
+            transferWakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "Conduit::Transfer",
+            )
             transferWakeLock?.setReferenceCounted(false)
         }
         if (transferWakeLock?.isHeld == true) {
@@ -417,11 +411,14 @@ class SyncService : Service() {
         }
     }
 
-    /** Acquire (or renew) the connection-tied lock. See [acquireTransferWakeLock]. */
+    /** Acquire (or renew) the clipboard/recovery lock. */
     private fun acquireConnectionWakeLock() {
         if (connectionWakeLock == null) {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
-            connectionWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Conduit::Connection")
+            connectionWakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "Conduit::Connection",
+            )
             connectionWakeLock?.setReferenceCounted(false)
         }
         if (connectionWakeLock?.isHeld == true) {
@@ -436,95 +433,29 @@ class SyncService : Service() {
         }
     }
 
+    private fun applyNotificationVisibility(visible: Boolean) {
+        notifVisible = visible
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIF_ID, buildNotification("Conduit is running", visible))
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                intentionalStop = true
-                cancelWatchdog(this)
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            ACTION_SET_VISIBILITY -> {
-                val visible = intent.getBooleanExtra(EXTRA_VISIBLE, true)
-                notifVisible = visible
-                // Re-post the notification on the appropriate channel.
-                val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(NOTIF_ID, buildNotification("Conduit is running", notifVisible))
-            }
-            ACTION_SET_DISCOVERY_NEEDED -> {
-                val needed = intent.getBooleanExtra(EXTRA_NEEDED, true)
-                if (needed) acquireMulticastLock() else releaseMulticastLock()
-            }
-            ACTION_SET_TRANSFER_LOCK -> {
-                val enabled = intent.getBooleanExtra(EXTRA_LOCK_ENABLED, false)
-                if (enabled) acquireTransferWakeLock() else releaseTransferWakeLock()
-            }
-            ACTION_SET_CONNECTION_LOCK -> {
-                val enabled = intent.getBooleanExtra(EXTRA_LOCK_ENABLED, false)
-                if (enabled) acquireConnectionWakeLock() else releaseConnectionWakeLock()
-            }
-            else -> {
-                // ACTION_START or START_STICKY recreation (null intent).
-                // Arm the repeating watchdog on every entry — covers the first start,
-                // START_STICKY recreations, and the one-shot restart. Idempotent via
-                // FLAG_UPDATE_CURRENT.
-                scheduleWatchdog(this)
-            }
-        }
+        // ACTION_START or START_STICKY recreation (null intent). Control updates
+        // are applied directly through the in-process service instance, so they
+        // never create/restart a foreground service from a background isolate.
         return START_STICKY
     }
 
-    /**
-     * The user swiped the app from recents. Schedule a restart so the service
-     * (and therefore the Dart sync engine via the persistent notification)
-     * survives the gesture on stock Android. OEM killers still need the user's
-     * whitelist; this only covers the standard platform behaviour.
-     *
-     * Two layers: (1) the one-shot alarm below for an immediate ~1s restart,
-     * and (2) [scheduleWatchdog] re-armed here as a defensive guarantee so the
-     * long-haul repeating fallback is definitely running even if onStartCommand
-     * never saw an explicit start action.
-     */
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        scheduleWatchdog(this)
-        val restart = Intent(applicationContext, this::class.java).apply {
-            setPackage(packageName)
-            // Carry over the original intent's extras, if any. (Intent.putAll
-            // resolves to replaceExtras(source: Intent), but the parameter is
-            // non-null while onTaskRemoved's rootIntent is nullable, so we copy
-            // explicitly.)
-            if (rootIntent != null) replaceExtras(rootIntent)
-        }
-        val flags = PendingIntent.FLAG_ONE_SHOT or
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-                PendingIntent.FLAG_IMMUTABLE else 0
-        val pi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            PendingIntent.getForegroundService(this, 1, restart, flags)
-        } else {
-            PendingIntent.getService(this, 1, restart, flags)
-        }
-        val am = getSystemService(ALARM_SERVICE) as AlarmManager
-        am.set(
-            AlarmManager.ELAPSED_REALTIME_WAKEUP,
-            SystemClock.elapsedRealtime() + RESTART_DELAY_MS,
-            pi,
-        )
-        // Do not call super: the platform default may stop the service for a
-        // task-removal, which is exactly the behavior this override prevents.
-    }
-
     override fun onDestroy() {
+        if (instance === this) instance = null
         try {
             val connectivity = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
             connectivity.unregisterNetworkCallback(networkCallback)
         } catch (_: Throwable) {}
+        mainHandler.removeCallbacksAndMessages(null)
+        pendingNetworkSignal = null
+        currentNetwork = null
         flutterEngine = null
-        // Cancel the watchdog only for an intentional Quit. If OxygenOS or the
-        // system destroys the service, leaving the watchdog armed is what lets
-        // Conduit come back instead of silently disappearing.
-        if (intentionalStop) cancelWatchdog(this)
         if (baseWakeLock?.isHeld == true) {
             try { baseWakeLock?.release() } catch (_: Throwable) {}
         }
@@ -552,8 +483,8 @@ class SyncService : Service() {
             }
             nm.createNotificationChannel(normal)
 
-            // Silent channel: no status-bar icon, no sound, minimal drawer entry.
-            // Used when the user turns off "Show in status bar" in Settings.
+            // Quieter channel: no sound, minimal interruption. Android may
+            // still show the foreground-service entry or list it in Active apps.
             val silent = NotificationChannel(
                 CH_ID_SILENT, "Conduit (silent)", NotificationManager.IMPORTANCE_MIN
             ).apply {
@@ -568,8 +499,8 @@ class SyncService : Service() {
 
     /**
      * Build the foreground notification on the appropriate channel.
-     * [visible] true → CH_ID_NORMAL (status-bar icon shown),
-     *           false → CH_ID_SILENT (no status-bar icon).
+     * [visible] true → CH_ID_NORMAL (normal importance),
+     *           false → CH_ID_SILENT (minimal interruption).
      */
     private fun buildNotification(text: String, visible: Boolean): Notification {
         val channelId = if (visible) CH_ID_NORMAL else CH_ID_SILENT

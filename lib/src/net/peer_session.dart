@@ -274,6 +274,21 @@ class PeerSession {
     }
   }
 
+  /// Send a heartbeat immediately without waiting for the next periodic tick.
+  /// Used after a long app suspension to validate a session without eagerly
+  /// destroying a healthy socket. The normal periodic schedule is restored
+  /// after the probe.
+  void probeHeartbeatNow() {
+    if (_onHeartbeatDead == null || codec.isClosed) return;
+    _heartbeat?.cancel();
+    _tick();
+    if (_onHeartbeatDead != null &&
+        !codec.isClosed &&
+        _missed < _hbMissedThreshold) {
+      _heartbeat = Timer.periodic(_hbInterval, (_) => _tick());
+    }
+  }
+
   void stopHeartbeat() {
     _heartbeat?.cancel();
     _heartbeat = null;

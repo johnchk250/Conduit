@@ -217,6 +217,56 @@ void main() {
       sync.dispose();
     });
 
+    test('rejects oversized clipboard payloads without sending', () async {
+      final registry = PeerConnectionRegistry();
+      final session = _FakeSession();
+      registry.publish(_bobDeviceId, session);
+      final oversized = 'x' * (maxAutomaticClipboardBytes + 1);
+
+      final sync = ClipboardSync(
+        registry: registry,
+        pairedPeerIds: () => {_bobDeviceId},
+        onLog: (_, __) {},
+        onRemoteReceived: (_) {},
+        now: DateTime.now,
+        readClipboard: () async => oversized,
+        writeClipboard: (_) async {},
+      );
+      sync.setEnabled(true);
+
+      expect(await sync.sendCurrentClipboard(), isFalse);
+      expect(session.sent, isEmpty);
+      sync.dispose();
+    });
+
+    test('received clipboard fans out without echoing to its source', () async {
+      const charlieId = 'CHARLIE-DEVICE-0001';
+      final registry = PeerConnectionRegistry();
+      final bob = _FakeSession();
+      final charlie = _FakeSession();
+      registry.publish(_bobDeviceId, bob);
+      registry.publish(charlieId, charlie);
+
+      final sync = ClipboardSync(
+        registry: registry,
+        pairedPeerIds: () => {_bobDeviceId, charlieId},
+        onLog: (_, __) {},
+        onRemoteReceived: (_) {},
+        now: DateTime.now,
+        readClipboard: () async => 'shared value',
+        writeClipboard: (_) async {},
+        isDesktopPlatform: () => false,
+      );
+      sync.setEnabled(true);
+
+      await sync.onPushReceived(_bobDeviceId, 'shared value');
+
+      expect(bob.sent, isEmpty);
+      expect(charlie.sent, hasLength(1));
+      expect(charlie.sent.single['text'], 'shared value');
+      sync.dispose();
+    });
+
     test('does not send to an unpaired peer', () async {
       final registry = PeerConnectionRegistry();
       final session = _FakeSession();
@@ -427,6 +477,71 @@ void main() {
 
         expect(session.sent, hasLength(1));
         expect(session.sent.single['text'], 'immediate value');
+        sync.dispose();
+      });
+    });
+
+    test('unchanged clipboard is not re-sent to the same peer on reconnect', () {
+      fakeAsync((async) {
+        final registry = PeerConnectionRegistry();
+        final session = _FakeSession();
+        final sync = ClipboardSync(
+          registry: registry,
+          pairedPeerIds: () => {_bobDeviceId},
+          onLog: (_, __) {},
+          onRemoteReceived: (_) {},
+          now: DateTime.now,
+          readClipboard: () async => 'stable value',
+          writeClipboard: (_) async {},
+          isDesktopPlatform: () => true,
+        );
+
+        sync.setEnabled(true);
+        registry.publish(_bobDeviceId, session);
+        sync.onPeerConnectivityChanged();
+        async.elapse(const Duration(milliseconds: 10));
+        expect(session.sent, hasLength(1));
+
+        registry.forceDrop(_bobDeviceId);
+        registry.publish(_bobDeviceId, session);
+        sync.onPeerConnectivityChanged();
+        async.elapse(const Duration(milliseconds: 10));
+        expect(session.sent, hasLength(1));
+        sync.dispose();
+      });
+    });
+
+    test('clipboard changed while offline is sent immediately on reconnect', () {
+      fakeAsync((async) {
+        final registry = PeerConnectionRegistry();
+        final session = _FakeSession();
+        var clipboardText = 'value A';
+        final sync = ClipboardSync(
+          registry: registry,
+          pairedPeerIds: () => {_bobDeviceId},
+          onLog: (_, __) {},
+          onRemoteReceived: (_) {},
+          now: DateTime.now,
+          readClipboard: () async => clipboardText,
+          writeClipboard: (_) async {},
+          isDesktopPlatform: () => true,
+        );
+
+        sync.setEnabled(true);
+        registry.publish(_bobDeviceId, session);
+        sync.onPeerConnectivityChanged();
+        async.elapse(const Duration(milliseconds: 10));
+        expect(session.sent.single['text'], 'value A');
+
+        registry.forceDrop(_bobDeviceId);
+        clipboardText = 'value B';
+        async.elapse(const Duration(seconds: 2));
+        registry.publish(_bobDeviceId, session);
+        sync.onPeerConnectivityChanged();
+        async.elapse(const Duration(milliseconds: 10));
+
+        expect(session.sent, hasLength(2));
+        expect(session.sent.last['text'], 'value B');
         sync.dispose();
       });
     });

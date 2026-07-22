@@ -140,6 +140,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Timer? _connectionBoostTimer;
   Timer? _connectionBoostRetryTimer;
   DateTime? _connectionBoostUntil;
+  Timer? _networkRecoveryTimer;
+  final List<Timer> _networkReannounceTimers = <Timer>[];
+  bool _networkRecoveryActive = false;
+  Timer? _resumeProbeTimer;
+  Timer? _highFrequencyUiTimer;
+  bool _networkingReady = false;
+  bool _supervisorInitialized = false;
+  Map<String, dynamic>? _pendingNativeNetworkEvent;
+  int? _lastNativeNetworkGeneration;
+  String? _lastNativeNetworkEpoch;
 
   bool get connectionBoostActive {
     final until = _connectionBoostUntil;
@@ -401,6 +411,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (_started) return;
     // Observe app lifecycle so we can recover from suspend/resume (Priority 8).
     WidgetsBinding.instance.addObserver(this);
+    if (Platform.isAndroid) {
+      _chNetworkEvents.setMethodCallHandler(_onNativeNetworkCall);
+    }
     final platform = Platform.isWindows
         ? 'windows'
         : Platform.isAndroid
@@ -490,7 +503,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     );
     _engine.stateChanges.listen((s) {
       _pairStates[s.pairId] = s;
-      notifyListeners();
+      _notifyHighFrequency();
     });
     _engine.events.listen((e) {
       _events.insert(0, e);
@@ -513,17 +526,31 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       self: _identity,
       listenPort: port,
       onPeer: (peer) {
+        final previous = _discoveredPeers[peer.deviceId];
+        final changed = previous == null ||
+            previous.address.address != peer.address.address ||
+            previous.port != peer.port ||
+            previous.transport != peer.transport ||
+            previous.transportEndpoint != peer.transportEndpoint ||
+            previous.name != peer.name;
         _discoveredPeers[peer.deviceId] = peer;
-        unawaited(_config
-            .rememberPeerEndpoint(
-              deviceId: peer.deviceId,
-              address: peer.address.address,
-              port: peer.port,
-            )
-            .catchError((_) {}));
-        notifyListeners();
-        _maybeAutoConnect(peer);
+        if (changed) {
+          unawaited(_config
+              .rememberPeerEndpoint(
+                deviceId: peer.deviceId,
+                address: peer.address.address,
+                port: peer.port,
+              )
+              .catchError((_) {}));
+          notifyListeners();
+        }
+        if (_networkingReady) {
+          _supervisor.notePeerSeen(peer, endpointChanged: changed);
+        } else {
+          unawaited(_maybeAutoConnect(peer));
+        }
       },
+      onNetworkChanged: _onHostInterfaceChanged,
     );
     await _discovery!.start();
     if (_config.bluetoothEnabled) {
@@ -549,7 +576,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       isConnecting: (id) => _connectingPeerIds.contains(id),
       isSuppressed: (id) => _suppressedPeerIds.contains(id),
     );
+    _supervisorInitialized = true;
     _supervisor.start();
+    _networkingReady = true;
+    final pendingNetworkEvent = _pendingNativeNetworkEvent;
+    _pendingNativeNetworkEvent = null;
+    if (pendingNetworkEvent != null) {
+      _handleNativeNetworkEvent(pendingNetworkEvent);
+    }
     if (Platform.isWindows) {
       _windowsLanUpgradeTimer = Timer.periodic(
         const Duration(seconds: 10),
@@ -936,10 +970,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// including the deterministic stagger that prevents both devices from
   /// issuing authenticated takeovers at the same time on every sweep.
   Future<void> _maybeAutoConnectFor(DiscoveredPeer peer) =>
-      _dialPeer(peer, allowStagger: true);
+      _dialPeer(peer, allowStagger: true, propagateFailure: true);
 
-  Future<void> _dialPeer(DiscoveredPeer peer,
-      {required bool allowStagger}) async {
+  Future<void> _dialPeer(
+    DiscoveredPeer peer, {
+    required bool allowStagger,
+    bool propagateFailure = false,
+  }) async {
     final id = peer.deviceId;
 
     // Respect a user-intentional disconnect: once you tap Disconnect, neither
@@ -961,7 +998,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           allowStagger &&
           _identity.deviceId.compareTo(id) > 0) {
         await Future<void>.delayed(const Duration(milliseconds: 3500));
-        // Re-check after the delay: the other side may have already connected.
+        // Re-check after the delay: the other side may have already connected
+        // or the user may have explicitly disconnected while this dial waited.
+        if (_suppressedPeerIds.contains(id)) return;
         final e2 = _registry.openSessionFor(id);
         if (e2 != null) return;
       }
@@ -973,7 +1012,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     } catch (e) {
       Diag.session('auto_dial_failed',
           peer: id, fields: {'error': e.toString()});
-      // transient - supervisor (and next beacon) will retry
+      // Discovery-triggered attempts are opportunistic and suppress failures.
+      // Supervisor-triggered attempts MUST propagate the failure so its
+      // exponential backoff bookkeeping remains accurate.
+      if (propagateFailure) rethrow;
     } finally {
       _setConnecting(_connectingPeerIds, id, false);
     }
@@ -1128,7 +1170,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       dstate.recentRttMs = List<int>.from(session.recentRttMs);
       dstate.missedHeartbeats = session.missedHeartbeats;
       dstate.lastSeenAt = DateTime.now();
-      notifyListeners();
+      _notifyHighFrequency();
     };
 
     _engine.onPeerConnected(session);
@@ -1187,30 +1229,33 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     return session.initiatedByUs == thisDeviceShouldInitiate;
   }
 
-  /// Phase 0.3 beacon backoff. While at least one peer session is live we slow
-  /// the UDP beacon (the persistent session + ConnectionSupervisor cover
-  /// re-acquisition, so the slow cadence just lets a newly-appeared peer notice
-  /// us without keeping the Wi-Fi radio perpetually awake). When no session is
-  /// live we run fast so a reconnect (or a brand-new peer) finds us quickly.
+  /// Phase 0.3 beacon backoff. Once every paired peer is ready we slow the
+  /// UDP beacon. While any paired peer is missing, discovery stays active but
+  /// backs off from 3s to 15s and then 1m to avoid keeping Wi-Fi busy forever.
   void _applyBeaconMode() {
-    final anyLive = _registry.readyPeerIds.isNotEmpty;
-    final boosted = connectionBoostActive;
-    _discovery?.setBeaconMode(anyLive ? BeaconMode.stable : BeaconMode.fast);
+    final readyPeerIds = _registry.readyPeerIds.toSet();
+    final pairedPeerIds = _pairedPeerIds();
+    final anyLive = readyPeerIds.isNotEmpty;
+    final allPairedPeersReady = pairedPeerIds.isNotEmpty &&
+        pairedPeerIds.every(readyPeerIds.contains);
+    final needsDiscovery = !allPairedPeersReady;
+    final boosted = connectionBoostActive || _networkRecoveryActive;
+
+    // Do not slow or disable discovery merely because ONE device is online.
+    // Every paired peer must be reachable before discovery can enter its stable
+    // cadence; otherwise a second device that changed IP can stay offline.
+    _discovery
+        ?.setBeaconMode(needsDiscovery ? BeaconMode.fast : BeaconMode.stable);
     _discovery?.setBoosted(boosted);
-    // Clipboard sync promises immediate delivery while connected. Preserve the
-    // continuous CPU lock for that opt-in feature; other sync work uses short
-    // reconnect and transfer-scoped wake windows.
-    _setConnectionWakeLockEnabled(
-        boosted || (anyLive && _config.clipboardSyncEnabled));
-    // Phase 0.6: the Android MulticastLock only gates RECEIVING broadcast/
-    // multicast UDP — i.e. discovery beacons on port 41827. It has no effect
-    // on an already-live peer session, which is a unicast TCP socket
-    // (peer_session.dart / secure_frame.dart), so releasing it once connected
-    // doesn't touch clipboard sync or file transfer either way. Previously
-    // held for the SyncService's entire lifetime; now held only while it can
-    // actually do something useful (no session live, so a new or returning
-    // peer still needs to be discovered).
-    _setDiscoveryLockEnabled(boosted || !anyLive);
+
+    // Clipboard sync is explicitly opt-in and promises immediate delivery even
+    // while Android is deeply idle. Keep the partial CPU lock only while that
+    // feature is enabled AND a paired session is live. Folder-only operation
+    // remains lock-free while idle; transfers retain their own scoped lock.
+    final needsRealtimeClipboardLock =
+        anyLive && _config.clipboardSyncEnabled;
+    _setConnectionWakeLockEnabled(boosted || needsRealtimeClipboardLock);
+    _setDiscoveryLockEnabled(boosted || needsDiscovery);
 
     if (anyLive) {
       _startAndroidStatusSampling();
@@ -1220,17 +1265,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   /// Roadmap Phase 0.6 — battery: toggles the Android SyncService's
-  /// MulticastLock. [needed] should be true exactly when no paired peer
-  /// session is currently live (a beacon might still find someone); false
-  /// once at least one is (nothing left for a beacon to do). Idempotent —
+  /// MulticastLock. [needed] remains true while any paired peer is missing,
+  /// because another device can have moved to a new IP even when one peer is
+  /// already online. It becomes false only when every paired peer is ready.
+  /// Idempotent —
   /// skips the channel call when already in the requested state.
   ///
-  /// Only affects SyncService's own lock. MainActivity holds a second,
-  /// separate MulticastLock for the narrow pre-service bootstrap window
-  /// (first launch, before the foreground-service notification permission is
-  /// granted) that is intentionally left untouched here — it's only live
-  /// while the app UI itself is open, a small cost next to the 24/7 service
-  /// lock this fixes.
+  /// SyncService is the sole MulticastLock owner, avoiding duplicate Wi-Fi
+  /// locks while MainActivity is visible.
   void _setDiscoveryLockEnabled(bool needed) {
     if (!Platform.isAndroid) return;
     if (needed == _discoveryLockHeld) return; // already in the right state
@@ -1303,22 +1345,27 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    // `_supervisor` is `late` and only assigned in start(). If dispose() runs
-    // without a successful start() (e.g. the widget smoke test pumps only the
-    // shell, or early init threw before start() finished), touching it throws
-    // LateInitializationError — which then masks any real disposal error and
-    // fails the test/provider teardown. Guard it.
-    if (!_started) {
-      _windowsLanUpgradeTimer?.cancel();
-      _windowsLanUpgradeTimer = null;
-      super.dispose();
-      return;
-    }
     _windowsLanUpgradeTimer?.cancel();
     _windowsLanUpgradeTimer = null;
     _connectionBoostTimer?.cancel();
     _connectionBoostRetryTimer?.cancel();
-    _supervisor.stop();
+    _networkRecoveryTimer?.cancel();
+    _resumeProbeTimer?.cancel();
+    _highFrequencyUiTimer?.cancel();
+    _cancelNetworkReannounces();
+    _networkingReady = false;
+    if (Platform.isAndroid) {
+      _chNetworkEvents.setMethodCallHandler(null);
+    }
+    if (_supervisorInitialized) {
+      _supervisor.stop();
+      _supervisorInitialized = false;
+    }
+    // Other late-owned resources are guaranteed only after a successful start.
+    if (!_started) {
+      super.dispose();
+      return;
+    }
     _discovery?.stop();
     _connections.stop();
     _clipboard?.dispose();
@@ -1333,12 +1380,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // ---- App lifecycle (Priority 8: suspend/resume recovery) ---------------
   //
   // On mobile (Android Doze, iOS backgrounding) and after the OS has
-  // throttled/suspended the app, any open sockets are suspect: the network
-  // may have changed (new Wi-Fi, cellular handoff) and half-dead sockets can
-  // linger until the heartbeat notices (~72s). Rather than wait, on resume we
-  // treat every session as stale: stop its heartbeat, drop it from the
-  // registry, destroy the socket, and tell the engine it's gone. The next
-  // discovery beacon (≤3s, accelerated by an immediate reannounce) reconnects
+  // throttled/suspended the app, open sockets may be suspect: the network
+  // may have changed and half-dead sockets can linger until heartbeat cleanup.
+  // Rather than destroy every session, on resume we actively probe them. Only
+  // sessions that miss both probes are closed and handed to the reconnect
+  // supervisor; healthy service-owned sockets are preserved without UI churn.
   // cleanly.
   //
   // GATING (critical — this was the root cause of session churn): Android
@@ -1388,44 +1434,230 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         dependencies.now().difference(bgStart) < _minBgForReset) {
       return; // too brief — sockets are fine
     }
-    _resetAllSessionsOnResume();
+    _probeSessionsOnResume();
   }
 
-  /// Tear down every live session and force a discovery re-broadcast. Safe to
-  /// call when there are zero sessions (no-op).
-  ///
-  /// This runs after a genuine backgrounding (paused/hidden/detached for ≥10s),
-  /// where any open socket is suspect (network may have changed, half-dead
-  /// sockets can linger). Previously it did a hard `socket.destroy()` — an RST
-  /// with no FIN and no bye — which left the PEER holding a half-dead session
-  /// (its isClosed stayed false until a ~72s heartbeat), seeding exactly the
-  /// "PC disconnected / phone still connected" mismatch the owner reported.
-  /// It also skipped [SyncEngine.onPeerSessionLost], so in-flight sync work for
-  /// the dropped session wasn't cancelled cleanly.
-  ///
-  /// Now it tears down gracefully: drop from the registry (identity-guarded),
-  /// cancel in-flight engine work, send a `bye` via [PeerSession.close] so the
-  /// peer learns promptly (its new bye handler mirrors the disconnect), then
-  /// mark the peer disconnected. Same end state, but symmetric and prompt on
-  /// both sides.
-  void _resetAllSessionsOnResume() {
-    final peerIds = _registry.connectedPeerIds.toList(growable: false);
-    for (final id in peerIds) {
-      final session = _registry.sessionFor(id);
+  /// Validate existing sessions after a long suspension without destroying
+  /// healthy sockets. An immediate heartbeat probe is followed by a second
+  /// probe; only sessions that miss both are torn down and redialled.
+  void _probeSessionsOnResume() {
+    final candidates = <String, PeerSession>{};
+    for (final id in _registry.readyPeerIds) {
+      final session = _registry.openSessionFor(id);
       if (session == null) continue;
-      _registry.drop(id, session); // identity-guarded; no-op if already gone
-      _engine.onPeerSessionLost(id); // cancel in-flight sync work
-      _engine.onPeerDisconnected(id);
-      session.stopHeartbeat();
-      // Send bye + close (FIN) so the peer tears down promptly instead of
-      // holding a half-dead socket. Best-effort: a destroy() follows in the
-      // finally so we never strand a socket even if close() stalls.
-      session.close().catchError((Object _) {});
+      candidates[id] = session;
+      session.probeHeartbeatNow();
     }
-    Diag.session('resume_reset', fields: {'peers': peerIds.length});
-    _discovery?.reannounce(); // peers learn our (possibly new) address now
-    _applyBeaconMode(); // Phase 0.3: sessions dropped → fast beacon
+
+    _activateNetworkRecovery(const Duration(seconds: 20));
+    _discovery?.reannounce();
+    _supervisor.retryNow();
+
+    _resumeProbeTimer?.cancel();
+    _resumeProbeTimer = Timer(const Duration(seconds: 3), () {
+      for (final entry in candidates.entries) {
+        final current = _registry.openSessionFor(entry.key);
+        if (!identical(current, entry.value)) continue;
+        current?.probeHeartbeatNow();
+      }
+      _resumeProbeTimer = Timer(const Duration(seconds: 2), () {
+        var dropped = 0;
+        for (final entry in candidates.entries) {
+          final current = _registry.openSessionFor(entry.key);
+          if (!identical(current, entry.value)) continue;
+          if (current!.missedHeartbeats < 2) continue;
+          if (_dropSessionForReconnect(
+            entry.key,
+            current,
+            reason: 'resume_probe_failed',
+          )) {
+            dropped++;
+          }
+        }
+        Diag.session('resume_probe_complete', fields: {
+          'probed': candidates.length,
+          'dropped': dropped,
+        });
+        _discovery?.reannounce();
+        _supervisor.retryNow();
+        _applyBeaconMode();
+        notifyListeners();
+      });
+    });
+  }
+
+  void _onHostInterfaceChanged() {
+    if (!_networkingReady) return;
+    Diag.log('host_network_interfaces_changed');
+    _cancelNetworkReannounces();
+    _activateNetworkRecovery(const Duration(seconds: 30));
+    _invalidateLanSessionsForNetworkChange('host_interface_change');
+    _supervisor.retryNow();
+    _discovery?.reannounce();
+    _scheduleNetworkReannounce(
+      const Duration(seconds: 3),
+      retryConnections: true,
+    );
+    _applyBeaconMode();
     notifyListeners();
+  }
+
+  Future<dynamic> _onNativeNetworkCall(MethodCall call) async {
+    if (call.method != 'networkChanged') return null;
+    final raw = call.arguments;
+    if (raw is! Map) return null;
+    final event = Map<String, dynamic>.from(raw);
+    if (!_networkingReady) {
+      _pendingNativeNetworkEvent = event;
+      return null;
+    }
+    _handleNativeNetworkEvent(event);
+    return null;
+  }
+
+  void _handleNativeNetworkEvent(Map<String, dynamic> event) {
+    final available = event['available'] == true;
+    final generation = (event['generation'] as num?)?.toInt() ?? 0;
+    final reason = event['reason']?.toString() ?? 'unknown';
+    final epoch = event['epoch']?.toString() ?? 'legacy';
+    final previousGeneration = _lastNativeNetworkGeneration;
+    final previousEpoch = _lastNativeNetworkEpoch;
+    final routeChanged = available &&
+        previousEpoch != null &&
+        (epoch != previousEpoch || generation > (previousGeneration ?? -1));
+    _lastNativeNetworkEpoch = epoch;
+    _lastNativeNetworkGeneration = generation;
+
+    Diag.log('android_network_event', fields: {
+      'available': available,
+      'generation': generation,
+      'reason': reason,
+      'epoch': epoch,
+      'routeChanged': routeChanged,
+    });
+
+    if (!available) {
+      _activateNetworkRecovery(const Duration(seconds: 20));
+      _applyBeaconMode();
+      return;
+    }
+
+    _cancelNetworkReannounces();
+    _activateNetworkRecovery(const Duration(seconds: 45));
+    if (routeChanged) {
+      _invalidateLanSessionsForNetworkChange(reason);
+    }
+
+    // Rebind UDP discovery to the new interface before broadcasting. Android
+    // can leave an any-address datagram socket attached to the old Wi-Fi link.
+    unawaited((_discovery?.refreshNetwork() ?? Future<void>.value()).then((_) {
+      _discovery?.reannounce();
+      _supervisor.retryNow();
+    }).catchError((Object error) {
+      Diag.log('network_discovery_refresh_failed',
+          fields: {'error': error.toString()});
+    }));
+    _supervisor.retryNow();
+    if (_config.bluetoothEnabled) {
+      unawaited(_bluetooth?.refreshDiscovery());
+    }
+
+    // Some routers need a moment to finish DHCP/routing after onAvailable.
+    // Reannounce twice without bypassing supervisor backoff in a tight loop.
+    _scheduleNetworkReannounce(const Duration(seconds: 2));
+    _scheduleNetworkReannounce(
+      const Duration(seconds: 8),
+      retryConnections: true,
+    );
+    _applyBeaconMode();
+    notifyListeners();
+  }
+
+  void _cancelNetworkReannounces() {
+    for (final timer in _networkReannounceTimers) {
+      timer.cancel();
+    }
+    _networkReannounceTimers.clear();
+  }
+
+  void _scheduleNetworkReannounce(
+    Duration delay, {
+    bool retryConnections = false,
+  }) {
+    late final Timer timer;
+    timer = Timer(delay, () {
+      _networkReannounceTimers.remove(timer);
+      if (!_networkingReady) return;
+      _discovery?.reannounce();
+      if (retryConnections) _supervisor.retryNow();
+    });
+    _networkReannounceTimers.add(timer);
+  }
+
+  void _activateNetworkRecovery(Duration duration) {
+    _networkRecoveryActive = true;
+    _networkRecoveryTimer?.cancel();
+    _networkRecoveryTimer = Timer(duration, () {
+      _networkRecoveryActive = false;
+      _applyBeaconMode();
+    });
+    _applyBeaconMode();
+  }
+
+  void _invalidateLanSessionsForNetworkChange(String reason) {
+    final sessions = <MapEntry<String, PeerSession>>[];
+    for (final id in _registry.connectedPeerIds) {
+      final session = _registry.sessionFor(id);
+      if (session != null && session.transport == ConnectionTransport.lan) {
+        sessions.add(MapEntry(id, session));
+      }
+    }
+    var dropped = 0;
+    for (final entry in sessions) {
+      if (_dropSessionForReconnect(
+        entry.key,
+        entry.value,
+        reason: 'network_change:$reason',
+      )) {
+        dropped++;
+      }
+    }
+    Diag.session('network_sessions_invalidated', fields: {
+      'reason': reason,
+      'dropped': dropped,
+    });
+  }
+
+  bool _dropSessionForReconnect(
+    String id,
+    PeerSession session, {
+    required String reason,
+  }) {
+    if (!_registry.drop(id, session)) return false;
+    final wasReady = session.hasReceivedLinkReady;
+    session.stopHeartbeat();
+    _engine.onPeerSessionLost(id);
+    if (wasReady) {
+      _engine.onPeerDisconnected(id);
+      final dashboard = getOrCreateDashboardState(id);
+      dashboard.lastDisconnectedAt = dependencies.now();
+      _persistDashboardState(id);
+    }
+    _supervisor.noteDisconnected(id);
+    unawaited(session.close().catchError((Object _) {}));
+    _clipboard?.onPeerConnectivityChanged();
+    Diag.session('session_dropped_for_reconnect',
+        peer: id,
+        session: session.generation,
+        fields: {'reason': reason});
+    return true;
+  }
+
+  void _notifyHighFrequency() {
+    _highFrequencyUiTimer ??= Timer(const Duration(milliseconds: 120), () {
+      _highFrequencyUiTimer = null;
+      notifyListeners();
+    });
   }
 
   // ---- Folder pair management -------------------------------------------
@@ -1690,6 +1922,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   static const _chSync = MethodChannel('conduit/sync_service');
   static const _chWakelock = MethodChannel('conduit/wakelock');
   static const _chPhoneDashboard = MethodChannel('conduit/phone_dashboard');
+  static const _chNetworkEvents = MethodChannel('conduit/network_events');
   // Phase 3d: share channel — native pushes content:// or file-path URIs when
   // the user shares into Conduit from another app (Android share sheet) or
   // the Windows "Send to" context menu.

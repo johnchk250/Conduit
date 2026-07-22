@@ -82,6 +82,13 @@ class ClipboardController {
     _suppressUntil = _now().add(_suppressWindow);
   }
 
+  /// Clear remembered content when the feature is disabled. Re-enabling then
+  /// treats the current clipboard as a fresh value and synchronizes it once.
+  void reset() {
+    _lastHandledHash = null;
+    _suppressUntil = null;
+  }
+
   /// Decide what to do with a polled clipboard whose content hashes to [hash].
   /// Use the SAME hash function the caller uses (see [hashOf]).
   ClipboardPollDecision onPolled(String hash) {
@@ -101,6 +108,11 @@ class ClipboardController {
 /// SHA-256 of [text], hex-encoded. Used as the clipboard identity so two
 /// identical copies are recognised as "no change" without comparing raw text.
 String hashOf(String text) => sha256.convert(utf8.encode(text)).toString();
+
+/// Automatic clipboard payload ceiling. This keeps an accidentally copied
+/// multi-megabyte document from causing large allocations and protocol frames
+/// on every connected device.
+const maxAutomaticClipboardBytes = 256 * 1024;
 
 /// Host-facing clipboard sync orchestrator. Owns the poll timer and the
 /// outbound/inbound paths. The poll runs ONLY while all of: enabled, this is
@@ -149,8 +161,12 @@ class ClipboardSync {
 
   final _controller = ClipboardController();
   Timer? _timer;
+  bool _pollInProgress = false;
   bool _enabled = false;
   String? _pendingRemoteText;
+  String? _lastObservedHash;
+  bool _allowFanoutForObservedValue = false;
+  final Map<String, String> _lastSentHashByPeer = <String, String>{};
 
   bool get isEnabled => _enabled;
 
@@ -164,6 +180,10 @@ class ClipboardSync {
     if (!enabled) {
       stopPolling();
       _pendingRemoteText = null;
+      _lastObservedHash = null;
+      _allowFanoutForObservedValue = false;
+      _lastSentHashByPeer.clear();
+      _controller.reset();
     } else {
       _maybeStartPolling();
     }
@@ -179,11 +199,10 @@ class ClipboardSync {
   /// connected — but correctness no longer depends on AppState calling this
   /// for every single connect/disconnect transition.
   void onPeerConnectivityChanged() {
-    if (_enabled) {
-      _maybeStartPolling();
-      if (hasConnectedPeer()) {
-        unawaited(sendCurrentClipboard());
-      }
+    if (!_enabled) return;
+    _maybeStartPolling();
+    if (hasConnectedPeer() && _isDesktopPlatform()) {
+      unawaited(_syncAfterConnectivityChange());
     }
   }
 
@@ -225,24 +244,74 @@ class ClipboardSync {
 
   Future<void> _pollOnce() async {
     // Only stop the timer because the FEATURE was turned off. A missing peer
-    // is just "nothing to push this tick" — it must never tear the timer
-    // down, or we're back to the permanent-stall bug (see
-    // _maybeStartPolling doc). setEnabled(false) already calls stopPolling()
-    // directly, so this is a belt-and-suspenders guard against the timer
-    // firing one more time in the same event-loop turn as a disable.
+    // is just "nothing to push this tick" — it must never tear the timer down.
     if (!_enabled) {
       stopPolling();
       return;
     }
-    if (!hasConnectedPeer()) return;
-    final text = await readClipboard();
-    if (text == null) return;
-    final hash = hashOf(text);
+    if (!hasConnectedPeer() || _pollInProgress) return;
+    _pollInProgress = true;
+    try {
+      final text = await readClipboard();
+      if (text == null || !_isPayloadAllowed(text, outbound: true)) return;
+      final hash = hashOf(text);
+      final changed = hash != _lastObservedHash;
 
-    if (_controller.onPolled(hash) == ClipboardPollDecision.push) {
-      if (_broadcast(text)) {
-        _controller.markOutboundPushed(hash);
+      if (changed) {
+        if (_controller.onPolled(hash) != ClipboardPollDecision.push) {
+          // A different value copied during the short echo-suppression window
+          // must be retried on the next tick. Do not remember it as observed
+          // until the controller actually permits the push.
+          _allowFanoutForObservedValue = false;
+          return;
+        }
+        _lastObservedHash = hash;
+        _allowFanoutForObservedValue = true;
       }
+
+      if (_allowFanoutForObservedValue) {
+        final sent = _broadcastToMissingPeers(text, hash);
+        if (sent.isNotEmpty) _controller.markOutboundPushed(hash);
+      }
+    } finally {
+      _pollInProgress = false;
+    }
+  }
+
+  /// Reconcile the current desktop clipboard with per-peer delivery state. An
+  /// unchanged value is not re-sent to a peer that already received it, but a
+  /// new peer (or a clipboard change made during an outage) gets the latest
+  /// value immediately instead of waiting for the next timer tick.
+  Future<void> _syncAfterConnectivityChange() async {
+    if (!_enabled || !hasConnectedPeer() || _pollInProgress) return;
+    _pollInProgress = true;
+    try {
+      final text = await readClipboard();
+      if (text == null || !_isPayloadAllowed(text, outbound: true)) return;
+      final hash = hashOf(text);
+      final changed = hash != _lastObservedHash;
+
+      if (changed) {
+        if (_controller.onPolled(hash) != ClipboardPollDecision.push) {
+          // A different value copied during the short echo-suppression window
+          // must be retried on the next tick. Do not remember it as observed
+          // until the controller actually permits the push.
+          _allowFanoutForObservedValue = false;
+          return;
+        }
+        _lastObservedHash = hash;
+        _allowFanoutForObservedValue = true;
+      }
+
+      // Per-peer hashes suppress unchanged reconnect re-sends. A clipboard
+      // value copied while the peer was offline still has no delivery record,
+      // so it is sent immediately when that peer returns.
+      if (_allowFanoutForObservedValue) {
+        final sent = _broadcastToMissingPeers(text, hash);
+        if (sent.isNotEmpty) _controller.markOutboundPushed(hash);
+      }
+    } finally {
+      _pollInProgress = false;
     }
   }
 
@@ -252,13 +321,18 @@ class ClipboardSync {
   /// Returns true if at least one peer received it.
   Future<bool> sendCurrentClipboard({String? targetPeerId}) async {
     final text = await readClipboard();
-    if (text == null || text.isEmpty) return false;
-    if (!hasConnectedPeer()) return false;
-    final success = _broadcast(text, targetPeerId: targetPeerId);
-    if (success) {
-      _controller.markOutboundPushed(hashOf(text));
+    if (text == null || text.isEmpty || !_isPayloadAllowed(text, outbound: true)) {
+      return false;
     }
-    return success;
+    if (!hasConnectedPeer()) return false;
+    final hash = hashOf(text);
+    final sent = _broadcast(text, targetPeerId: targetPeerId, hash: hash);
+    if (sent.isNotEmpty) {
+      _lastObservedHash = hash;
+      _allowFanoutForObservedValue = targetPeerId == null;
+      _controller.markOutboundPushed(hash);
+    }
+    return sent.isNotEmpty;
   }
 
   /// A peer pushed its clipboard — write ours and record the hash so our own
@@ -286,6 +360,7 @@ class ClipboardSync {
   ///     readback comparison remains a valid (and slightly stronger) check.
   Future<void> onPushReceived(String peerId, String text) async {
     if (!_enabled) return; // feature off → ignore
+    if (!_isPayloadAllowed(text, outbound: false)) return;
     final hash = hashOf(text);
     _pendingRemoteText = text;
     try {
@@ -305,6 +380,14 @@ class ClipboardSync {
       return;
     }
     _controller.markLocallyWritten(hash);
+    _lastObservedHash = hash;
+    // The source peer already has this value. Keep fan-out enabled so a third
+    // paired device receives it, while the per-peer delivery map prevents an
+    // echo back to the sender now or after a reconnect.
+    _allowFanoutForObservedValue = true;
+    _lastSentHashByPeer[peerId] = hash;
+    final forwarded = _broadcastToMissingPeers(text, hash);
+    if (forwarded.isNotEmpty) _controller.markOutboundPushed(hash);
 
     onRemoteReceived(peerId);
   }
@@ -334,30 +417,56 @@ class ClipboardSync {
     return false;
   }
 
-  /// Send [text] to every open session whose peer is paired. Returns true if
-  /// at least one send succeeded.
-  bool _broadcast(String text, {String? targetPeerId}) {
-    var sent = false;
+  Set<String> _broadcastToMissingPeers(String text, String hash) {
+    final missing = registry.readyPeerIds
+        .where((id) => _lastSentHashByPeer[id] != hash)
+        .toSet();
+    return _broadcast(text, targetPeerIds: missing, hash: hash);
+  }
+
+  /// Send [text] to paired, ready peers. Returns the ids whose send call
+  /// succeeded and records the per-peer hash for reconnect deduplication.
+  Set<String> _broadcast(
+    String text, {
+    String? targetPeerId,
+    Set<String>? targetPeerIds,
+    required String hash,
+  }) {
+    final sent = <String>{};
     final paired = pairedPeerIds();
-    final peerIds = targetPeerId != null
-        ? registry.readyPeerIds.where((id) => id == targetPeerId).toList()
-        : registry.readyPeerIds.toList();
+    final peerIds = targetPeerIds ??
+        (targetPeerId != null
+            ? registry.readyPeerIds.where((id) => id == targetPeerId).toSet()
+            : registry.readyPeerIds.toSet());
     for (final id in peerIds) {
       if (!paired.contains(id)) continue;
       final session = registry.openSessionFor(id);
-      if (session == null) continue;
+      if (session == null || !session.isLinkReady) continue;
       try {
         session.send({'t': Msg.clipboardPush, 'text': text});
-        sent = true;
+        sent.add(id);
+        _lastSentHashByPeer[id] = hash;
       } catch (e) {
         onLog('Failed to send clipboard to $id: $e', true);
       }
     }
-    if (sent) {
+    if (sent.isNotEmpty) {
       onLog(
-          'Sent clipboard (${text.length} chars) to connected peer(s)', false);
+          'Sent clipboard (${text.length} chars) to ${sent.length} peer(s)',
+          false);
     }
     return sent;
+  }
+
+  bool _isPayloadAllowed(String text, {required bool outbound}) {
+    final bytes = utf8.encode(text).length;
+    if (bytes <= maxAutomaticClipboardBytes) return true;
+    onLog(
+      '${outbound ? 'Clipboard' : 'Received clipboard'} ignored: '
+      '$bytes bytes exceeds the $maxAutomaticClipboardBytes-byte limit',
+      true,
+    );
+    return false;
   }
 
   /// Poll cadence for the automatic PC→phone watcher. Tuned for "feels
@@ -367,6 +476,7 @@ class ClipboardSync {
 
   void dispose() {
     stopPolling();
+    _lastSentHashByPeer.clear();
   }
 }
 

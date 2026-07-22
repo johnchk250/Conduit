@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
@@ -125,7 +124,6 @@ class MainActivity : FlutterActivity() {
         FlutterEngineCache.getInstance().put(ENGINE_ID, flutterEngine)
 
         super.configureFlutterEngine(flutterEngine)
-        acquireMulticastLock()
         BluetoothProxy.install(
             applicationContext,
             flutterEngine.dartExecutor.binaryMessenger,
@@ -509,27 +507,6 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    // MulticastLock so the Dart isolate's UDP discovery listener actually
-    // receives broadcast beacons. Mirrors the lock held by SyncService so
-    // auto-discovery works even before/independent of the foreground service
-    // (e.g. on first launch before notification permission is granted). The
-    // WifiManager hands out one named lock per process; we use a different name
-    // than the service so the two don't share reference counts. Released in
-    // onDestroy.
-    private var multicastLock: WifiManager.MulticastLock? = null
-
-    private fun acquireMulticastLock() {
-        if (multicastLock != null) return
-        try {
-            val wifi = getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
-            val lock = wifi.createMulticastLock("Conduit::DiscoveryActivity")
-            lock.setReferenceCounted(false)
-            lock.acquire()
-            multicastLock = lock
-        } catch (_: Throwable) {
-            // Best-effort: discovery degrades gracefully to manual pairing.
-        }
-    }
 
     private fun playAlertSoundAndVibration(context: Context): Boolean {
         stopAlertSoundAndVibration()
@@ -612,11 +589,6 @@ class MainActivity : FlutterActivity() {
         // here. They now live in SyncService (see its class doc for why),
         // so they correctly survive this Activity's destruction — e.g. a
         // swipe-from-recents mid-transfer no longer kills the lock.
-        val mlock = multicastLock
-        multicastLock = null
-        try {
-            if (mlock != null && mlock.isHeld) mlock.release()
-        } catch (_: Throwable) {}
         super.onDestroy()
     }
 

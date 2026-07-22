@@ -940,10 +940,10 @@ class _SettingsHubPage extends StatelessWidget {
               GlassListTile(
                 leadingIcon: Icons.notifications_outlined,
                 accentColor: c.teal,
-                title: 'Show in status bar',
+                title: 'Prominent sync notification',
                 subtitle:
-                    'Display a Conduit icon in the Android status bar while '
-                    'sync is running in the background.',
+                    'Use a normal Android notification. When off, Android may '
+                    'still list Conduit under Active apps while sync is running.',
                 trailing: Switch(
                   value: state.showPersistentNotification,
                   onChanged: (v) => state.setShowPersistentNotification(v),

@@ -60,6 +60,9 @@ class ConnectionSupervisor {
   // failure. The next-attempt time gates whether a sweep tries this peer.
   final _failures = <String, int>{};
   final _nextAttemptAt = <String, DateTime>{};
+  final _lastBeaconSeenAt = <String, DateTime>{};
+
+  static const _peerReappearedAfter = Duration(seconds: 20);
 
   void start() {
     _timer?.cancel();
@@ -74,6 +77,7 @@ class ConnectionSupervisor {
     _timer = null;
     _failures.clear();
     _nextAttemptAt.clear();
+    _lastBeaconSeenAt.clear();
   }
 
   /// Called by AppState when a session becomes live for [peerId]. Resets that
@@ -89,8 +93,31 @@ class ConnectionSupervisor {
     _nextAttemptAt.remove(peerId); // eligible again immediately
   }
 
-  /// Clear reconnect backoff and run an immediate sweep. Used only by the
-  /// explicit user-triggered connection boost.
+  /// Record a discovery beacon without letting every repeated UDP packet
+  /// bypass connection backoff. A changed endpoint or a peer that reappeared
+  /// after being absent gets one immediate retry; continuous beacons from an
+  /// unreachable peer continue to respect exponential backoff.
+  void notePeerSeen(
+    DiscoveredPeer peer, {
+    required bool endpointChanged,
+  }) {
+    final paired = _config.pairedPeers.any(
+      (candidate) => candidate.deviceId == peer.deviceId,
+    );
+    if (!paired) return;
+    final now = DateTime.now();
+    final previous = _lastBeaconSeenAt[peer.deviceId];
+    _lastBeaconSeenAt[peer.deviceId] = now;
+    final reappeared = previous == null ||
+        now.difference(previous) >= _peerReappearedAfter;
+    if (!endpointChanged && !reappeared) return;
+    _failures.remove(peer.deviceId);
+    _nextAttemptAt.remove(peer.deviceId);
+    _sweepPeer(peer.deviceId, now);
+  }
+
+  /// Clear reconnect backoff and run an immediate sweep. Used by explicit
+  /// reconnect boosts and by a confirmed network-route change.
   void retryNow() {
     _failures.clear();
     _nextAttemptAt.clear();
@@ -106,23 +133,22 @@ class ConnectionSupervisor {
   void _sweep() {
     final now = DateTime.now();
     for (final peer in _config.pairedPeers) {
-      final id = peer.deviceId;
-      if (_isSuppressed(id)) {
-        continue; // user-intentional disconnect — respect it
-      }
-      final existing = _registry.openSessionFor(id);
-      if (existing != null) continue; // already connected
-      if (_isConnecting(id)) continue; // a dial is already in flight
-      final next = _nextAttemptAt[id];
-      if (next != null && now.isBefore(next)) continue; // backoff not elapsed
-
-      // We need a reachable address. Prefer the last discovery beacon; if we
-      // haven't seen one yet, we can't dial — wait for discovery.
-      final discovered = _discoveredPeers.forPeer(id);
-      if (discovered == null) continue;
-
-      _attemptConnect(discovered);
+      _sweepPeer(peer.deviceId, now);
     }
+  }
+
+  void _sweepPeer(String id, DateTime now) {
+    if (_isSuppressed(id)) return;
+    if (_registry.openSessionFor(id) != null) return;
+    if (_isConnecting(id)) return;
+    final next = _nextAttemptAt[id];
+    if (next != null && now.isBefore(next)) return;
+
+    // We need a reachable address. Prefer the last discovery beacon; if we
+    // haven't seen one yet, wait for discovery or a saved endpoint seed.
+    final discovered = _discoveredPeers.forPeer(id);
+    if (discovered == null) return;
+    _attemptConnect(discovered);
   }
 
   Future<void> _attemptConnect(DiscoveredPeer peer) async {
@@ -135,9 +161,10 @@ class ConnectionSupervisor {
       _nextAttemptAt.remove(peer.deviceId);
     } catch (_) {
       // Transient failure — back off exponentially, capped at [_maxBackoff].
-      final n = (_failures[peer.deviceId] ?? 0) + 1;
+      final previous = _failures[peer.deviceId] ?? 0;
+      final n = previous >= 6 ? 6 : previous + 1;
       _failures[peer.deviceId] = n;
-      final delayMs = (1 << n) * 1000; // 2s, 4s, 8s, 16s, 32s, 60s, 60s, ...
+      final delayMs = (1 << n) * 1000; // 2s, 4s, 8s, 16s, 32s, 60s, ...
       final delay = Duration(milliseconds: delayMs) > _maxBackoff
           ? _maxBackoff
           : Duration(milliseconds: delayMs);

@@ -47,6 +47,7 @@ class Discovery {
     this.port = 41827, // Conduit discovery UDP port
     this.interval = const Duration(seconds: 3),
     required this.onPeer,
+    this.onNetworkChanged,
   });
 
   final DeviceIdentity self;
@@ -55,10 +56,20 @@ class Discovery {
   final Duration interval;
   final void Function(DiscoveredPeer peer) onPeer;
 
+  /// Called when the host's IPv4 interface set changes. Android has a richer
+  /// native NetworkCallback path; this fallback primarily covers Windows
+  /// laptops moving between home, office, VPN, and dock networks.
+  final void Function()? onNetworkChanged;
+
   RawDatagramSocket? _socket;
+  StreamSubscription<RawSocketEvent>? _socketSubscription;
+  Future<void>? _networkRefresh;
+  bool _running = false;
   Timer? _broadcastTimer;
   final _seen = <String, DateTime>{}; // deviceId -> last seen
   Timer? _sweepTimer;
+  Timer? _interfaceWatchTimer;
+  String? _lastInterfaceSignature;
 
   static const _sweepInterval = Duration(minutes: 1);
   static const _staleAfter = Duration(minutes: 5);
@@ -121,29 +132,131 @@ class Discovery {
   }
 
   Future<void> start() async {
-    _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, port);
-    _socket!.broadcastEnabled = true;
+    _running = true;
+    await _bindSocket();
 
     _broadcast(); // immediate first beacon
     _scheduleBroadcast();
 
-    // sweep stale peers out periodically
+    // Sweep stale peers out periodically. On desktop, also watch the local
+    // interface set: Windows does not have the Android native network callback
+    // used by AppState, and a UDP socket can otherwise remain on the old route.
     _sweepTimer = Timer.periodic(_sweepInterval, (_) => _sweep());
+    if (Platform.isWindows) {
+      _lastInterfaceSignature = await _interfaceSignature();
+      _interfaceWatchTimer = Timer.periodic(
+        const Duration(seconds: 10),
+        (_) => unawaited(_checkNetworkInterfaces()),
+      );
+    }
+  }
 
-    _socket!.listen((event) {
-      if (event == RawSocketEvent.read) {
-        final dg = _socket!.receive();
-        if (dg == null) return;
-        _handleDatagram(dg);
+  /// Recreate the UDP socket after Android reports a default-network or link
+  /// change. A socket bound to `anyIPv4` often survives a Wi-Fi handoff, but on
+  /// several Android/OEM stacks it remains associated with the old interface
+  /// and silently stops receiving broadcasts. Rebinding is cheap and makes
+  /// office/home network transitions deterministic. Concurrent refresh calls
+  /// join the same operation.
+  Future<void> refreshNetwork() {
+    if (!_running) return Future<void>.value();
+    final active = _networkRefresh;
+    if (active != null) return active;
+    final operation = _refreshNetwork();
+    _networkRefresh = operation;
+    void clearRefresh() {
+      if (identical(_networkRefresh, operation)) _networkRefresh = null;
+    }
+
+    operation.then<void>(
+      (_) => clearRefresh(),
+      onError: (Object _, StackTrace __) => clearRefresh(),
+    );
+    return operation;
+  }
+
+  Future<void> _refreshNetwork() async {
+    _fastModeStartedAt = DateTime.now();
+    _mode = BeaconMode.fast;
+    await _bindSocket();
+    if (!_running) {
+      await _socketSubscription?.cancel();
+      _socketSubscription = null;
+      _socket?.close();
+      _socket = null;
+      return;
+    }
+    _broadcastTimer?.cancel();
+    _broadcast();
+    _scheduleBroadcast();
+  }
+
+  Future<void> _checkNetworkInterfaces() async {
+    if (!_running || _networkRefresh != null) return;
+    final signature = await _interfaceSignature();
+    final previous = _lastInterfaceSignature;
+    _lastInterfaceSignature = signature;
+    if (previous == null || previous == signature) return;
+    onNetworkChanged?.call();
+    try {
+      await refreshNetwork();
+    } catch (_) {
+      // The next 10-second check retries after transient adapter churn.
+    }
+  }
+
+  Future<String> _interfaceSignature() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+        includeLinkLocal: false,
+      );
+      final entries = <String>[];
+      for (final interface in interfaces) {
+        for (final address in interface.addresses) {
+          entries.add('${interface.name}:${address.address}');
+        }
       }
+      entries.sort();
+      return entries.join('|');
+    } catch (_) {
+      return _lastInterfaceSignature ?? '';
+    }
+  }
+
+  Future<void> _bindSocket() async {
+    final oldSubscription = _socketSubscription;
+    _socketSubscription = null;
+    if (oldSubscription != null) {
+      await oldSubscription.cancel();
+    }
+    _socket?.close();
+    _socket = null;
+
+    final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, port);
+    socket.broadcastEnabled = true;
+    _socket = socket;
+    _socketSubscription = socket.listen((event) {
+      if (event != RawSocketEvent.read || !identical(_socket, socket)) return;
+      final dg = socket.receive();
+      if (dg != null) _handleDatagram(dg);
     });
   }
 
   Future<void> stop() async {
+    _running = false;
     _broadcastTimer?.cancel();
+    _broadcastTimer = null;
     _sweepTimer?.cancel();
+    _sweepTimer = null;
+    _interfaceWatchTimer?.cancel();
+    _interfaceWatchTimer = null;
+    _lastInterfaceSignature = null;
+    await _socketSubscription?.cancel();
+    _socketSubscription = null;
     _socket?.close();
     _socket = null;
+    _networkRefresh = null;
     _seen.clear();
   }
 
@@ -157,8 +270,9 @@ class Discovery {
   }
 
   void _scheduleBroadcast() {
+    if (!_running) return;
     _broadcastTimer = Timer(_currentInterval, () {
-      if (_socket == null) return;
+      if (!_running || _socket == null) return;
       _broadcast();
       _scheduleBroadcast();
     });

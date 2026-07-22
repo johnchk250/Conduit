@@ -35,11 +35,8 @@
          reboot, so a phone that was powered off resumes syncing on its own. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 
-    <!-- NOTE: no SCHEDULE_EXACT_ALARM / USE_EXACT_ALARM declared. onTaskRemoved
-         uses AlarmManager.set(ELAPSED_REALTIME, ...) which is an inexact alarm
-         and requires neither permission on any API level. Declaring them would
-         be dead permissions (and SCHEDULE_EXACT_ALARM needs user grant on
-         Android 12+). -->
+    <!-- No alarm permission is required: connection recovery is driven by the
+         foreground service, network callbacks, heartbeats, and boot recovery. -->
 
     <!-- Optional: all-files access is NOT requested. We use SAF document trees. -->
 
@@ -95,21 +92,9 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
-                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED"/>
                 <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
             </intent-filter>
         </receiver>
-
-        <!-- Phase 1 background survival (audit Issue #8): watchdog receiver
-             fired by the repeating inexact alarm armed in
-             SyncService.scheduleWatchdog. Relaunches the foreground service if
-             it was killed after the one-shot onTaskRemoved restart (OOM, OEM
-             killer, or the Android 14+ 6h dataSync cap). Not exported — only
-             the system AlarmManager delivers to it. -->
-        <receiver
-            android:name=".RestartReceiver"
-            android:enabled="true"
-            android:exported="false"/>
 
         <!-- Required by flutter_local_notifications for notification action
              buttons. Routes the receiving-transfer "Cancel" action to the

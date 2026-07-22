@@ -408,7 +408,7 @@ class SyncEngine {
 
   static const _watcherIntervalFast = Duration(seconds: 4);
   static const _watcherIntervalSlow = Duration(seconds: 30);
-  static const _watcherIntervalSafOnline = Duration(minutes: 10);
+  static const _watcherIntervalSafOnline = Duration(minutes: 1);
   static const _watcherIntervalSafOffline = Duration(hours: 1);
   static const _watcherIntervalBatterySaver = Duration(hours: 1);
 

@@ -20,8 +20,8 @@ import io.flutter.plugin.common.MethodChannel
  *
  * Activity recreation is handled by [FlutterEngineCache], but that cache is
  * process memory and therefore cannot restore anything after Android kills the
- * process. [SyncService] calls [ensureEngine] on every creation. A sticky,
- * watchdog, or boot restart can consequently create a fresh engine, execute
+ * process. [SyncService] calls [ensureEngine] on every creation. A sticky or
+ * boot restart can consequently create a fresh engine, execute
  * Dart's normal entrypoint, reload AppState from disk, and reconnect without an
  * Activity ever being opened.
  */
