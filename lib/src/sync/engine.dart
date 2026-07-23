@@ -149,6 +149,7 @@ class SyncEngine {
     this.onFolderInvite,
     this.onTransferState,
     this.onClipboardPush,
+    this.onClipboardRequest,
     this.onRunCommand,
     this.onDeviceStatus,
     this.onPhoneAction,
@@ -197,6 +198,11 @@ class SyncEngine {
   /// none of the V2 load-bearing invariants. The text never enters the Index DB
   /// or the version-vector machinery.
   final void Function(String peerId, String text)? onClipboardPush;
+
+  /// Notifies the host when a peer asks for our current clipboard. The host
+  /// only fulfills this automatically on desktop, where background clipboard
+  /// reads are permitted. Like [onClipboardPush], this stays outside sync state.
+  final void Function(String peerId)? onClipboardRequest;
 
   /// Notifies the host when a peer sends a remote-control command (Roadmap
   /// Phase 4). The host validates the name against the allowlist and executes
@@ -2129,6 +2135,9 @@ class SyncEngine {
       case Msg.clipboardPush:
         final text = msg['text'] as String? ?? '';
         onClipboardPush?.call(session.peer.deviceId, text);
+        break;
+      case Msg.clipboardRequest:
+        onClipboardRequest?.call(session.peer.deviceId);
         break;
       // ---- Remote command (Roadmap Phase 4) --------------------------------
       //

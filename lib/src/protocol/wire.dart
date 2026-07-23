@@ -52,6 +52,12 @@ class Msg {
   // it never touches indexDiff / upsertLocal / the needs-queue.
   static const clipboardPush = 'clipboard_push'; // {text<String>}
 
+  // A clipboard-enabled phone asks a connected desktop to send its current
+  // clipboard. This closes the enable-order/restart gap: if the desktop sent
+  // while the phone setting was still off, enabling the phone immediately
+  // requests a fresh copy instead of waiting for the user to copy again.
+  static const clipboardRequest = 'clipboard_request';
+
   // ---- Remote command (Roadmap Phase 4) ------------------------------------
   //
   // Phone → PC only. The phone sends a named command from the fixed allowlist;

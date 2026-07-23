@@ -126,6 +126,7 @@ class ClipboardSync {
     required this.onLog,
     required this.onRemoteReceived,
     required this.now,
+    this.onStateChanged,
     this.readClipboard = _defaultReadClipboard,
     this.writeClipboard = _defaultWriteClipboard,
     bool Function()? isDesktopPlatform,
@@ -148,6 +149,10 @@ class ClipboardSync {
   /// Injectable clock for tests.
   final DateTime Function() now;
 
+  /// Optional host callback used to refresh settings/diagnostic UI whenever
+  /// clipboard state changes. Clipboard text is never exposed through it.
+  final void Function()? onStateChanged;
+
   /// Injectable clipboard read/write seams. Default to Flutter's Clipboard;
   /// tests pass fakes so they don't depend on a system clipboard round-trip.
   final Future<String?> Function() readClipboard;
@@ -167,8 +172,17 @@ class ClipboardSync {
   String? _lastObservedHash;
   bool _allowFanoutForObservedValue = false;
   final Map<String, String> _lastSentHashByPeer = <String, String>{};
+  DateTime? _lastSentAt;
+  DateTime? _lastReceivedAt;
+  String? _lastReceivedPeerId;
+  String? _lastError;
 
   bool get isEnabled => _enabled;
+  bool get isPolling => _timer != null;
+  DateTime? get lastSentAt => _lastSentAt;
+  DateTime? get lastReceivedAt => _lastReceivedAt;
+  String? get lastReceivedPeerId => _lastReceivedPeerId;
+  String? get lastError => _lastError;
 
   /// Exposed for testing pending background writes
   String? get pendingRemoteText => _pendingRemoteText;
@@ -186,7 +200,13 @@ class ClipboardSync {
       _controller.reset();
     } else {
       _maybeStartPolling();
+      if (_isDesktopPlatform() && hasConnectedPeer()) {
+        unawaited(_syncAfterConnectivityChange());
+      } else if (!_isDesktopPlatform() && hasConnectedPeer()) {
+        requestCurrentClipboardFromPeers();
+      }
     }
+    onStateChanged?.call();
   }
 
   /// Called by AppState whenever peer connectivity changes (connect/disconnect).
@@ -201,8 +221,11 @@ class ClipboardSync {
   void onPeerConnectivityChanged() {
     if (!_enabled) return;
     _maybeStartPolling();
-    if (hasConnectedPeer() && _isDesktopPlatform()) {
+    if (!hasConnectedPeer()) return;
+    if (_isDesktopPlatform()) {
       unawaited(_syncAfterConnectivityChange());
+    } else {
+      requestCurrentClipboardFromPeers();
     }
   }
 
@@ -315,6 +338,26 @@ class ClipboardSync {
     }
   }
 
+  /// Ask connected paired peers for their current clipboard. This is used by
+  /// Android when clipboard sync is enabled or a peer reconnects, so the
+  /// desktop re-sends even when its clipboard text itself has not changed.
+  void requestCurrentClipboardFromPeers() {
+    if (!_enabled) return;
+    final paired = pairedPeerIds();
+    for (final id in registry.readyPeerIds) {
+      if (!paired.contains(id)) continue;
+      final session = registry.openSessionFor(id);
+      if (session == null || !session.isLinkReady) continue;
+      try {
+        session.send({'t': Msg.clipboardRequest});
+      } catch (e) {
+        _lastError = 'Failed to request clipboard from $id: $e';
+        onLog(_lastError!, true);
+        onStateChanged?.call();
+      }
+    }
+  }
+
   /// Manual send: read the CURRENT clipboard (legal because the app is
   /// foreground when the user taps this) and push to all connected peers,
   /// or to a single [targetPeerId] if specified.
@@ -376,9 +419,14 @@ class ClipboardSync {
         }
       }
     } catch (e) {
-      onLog('Failed to write clipboard: $e', true);
+      _lastError = 'Failed to write clipboard: $e';
+      onLog(_lastError!, true);
+      onStateChanged?.call();
       return;
     }
+    _lastReceivedAt = now();
+    _lastReceivedPeerId = peerId;
+    _lastError = null;
     _controller.markLocallyWritten(hash);
     _lastObservedHash = hash;
     // The source peer already has this value. Keep fan-out enabled so a third
@@ -390,6 +438,7 @@ class ClipboardSync {
     if (forwarded.isNotEmpty) _controller.markOutboundPushed(hash);
 
     onRemoteReceived(peerId);
+    onStateChanged?.call();
   }
 
   /// Recover a pending clipboard write when the app is resumed (foregrounded).
@@ -401,10 +450,14 @@ class ClipboardSync {
         final verify = await readClipboard();
         if (verify == pending) {
           _pendingRemoteText = null;
+          _lastError = null;
           onLog('Successfully wrote pending remote clipboard on resume', false);
+          onStateChanged?.call();
         }
       } catch (e) {
-        onLog('Failed to write pending clipboard on resume: $e', true);
+        _lastError = 'Failed to write pending clipboard on resume: $e';
+        onLog(_lastError!, true);
+        onStateChanged?.call();
       }
     }
   }
@@ -451,9 +504,12 @@ class ClipboardSync {
       }
     }
     if (sent.isNotEmpty) {
+      _lastSentAt = now();
+      _lastError = null;
       onLog(
           'Sent clipboard (${text.length} chars) to ${sent.length} peer(s)',
           false);
+      onStateChanged?.call();
     }
     return sent;
   }

@@ -43,6 +43,10 @@ const _bobDeviceId = 'BBBB-2222';
 void main() {
   DbFactory.init();
 
+  test('secure handshake advertises clipboard support', () {
+    expect(supportedPeerFeatures, contains('clipboard_v1'));
+  });
+
   group('ClipboardController (echo-loop guard)', () {
     test('pushes a genuinely new clipboard value', () {
       final c = ClipboardController();
@@ -142,6 +146,26 @@ void main() {
       expect(received, [(_bobDeviceId, 'hello from Bob')]);
     });
 
+    test('fires onClipboardRequest for a current-value refresh', () async {
+      h.connectAlice();
+      String? requestedBy;
+      h.alice = SyncEngine(
+        fs: h.aliceFs,
+        config: h.cfg,
+        stateDir: h.stateDir,
+        registry: h.registry,
+        deviceId: _aliceDeviceId,
+        onClipboardRequest: (peerId) => requestedBy = peerId,
+      );
+      h.alice.onPeerConnected(h.session);
+
+      await h.alice.handlePeerMessageForTest(h.session, {
+        't': Msg.clipboardRequest,
+      });
+
+      expect(requestedBy, _bobDeviceId);
+    });
+
     test('handles missing text field gracefully (empty string)', () async {
       h.connectAlice();
       var got = '';
@@ -214,6 +238,30 @@ void main() {
       final push = session.sent.single;
       expect(push['t'], Msg.clipboardPush);
       expect(push['text'], 'hello from test');
+      expect(sync.lastSentAt, isNotNull);
+      sync.dispose();
+    });
+
+    test('Android requests the desktop clipboard when enabled', () {
+      final registry = PeerConnectionRegistry();
+      final session = _FakeSession();
+      registry.publish(_bobDeviceId, session);
+
+      final sync = ClipboardSync(
+        registry: registry,
+        pairedPeerIds: () => {_bobDeviceId},
+        onLog: (_, __) {},
+        onRemoteReceived: (_) {},
+        now: DateTime.now,
+        readClipboard: () async => null,
+        writeClipboard: (_) async {},
+        isDesktopPlatform: () => false,
+      );
+
+      sync.setEnabled(true);
+
+      expect(session.sent, hasLength(1));
+      expect(session.sent.single['t'], Msg.clipboardRequest);
       sync.dispose();
     });
 
@@ -661,6 +709,8 @@ void main() {
           reason:
               'Write verified successfully — no pending text should remain');
       expect(await clip.read(), 'hello world');
+      expect(sync.lastReceivedPeerId, _bobDeviceId);
+      expect(sync.lastReceivedAt, isNotNull);
     });
 
     test('pendingRemoteText is set when the write call itself genuinely fails',

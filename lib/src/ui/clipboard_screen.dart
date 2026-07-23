@@ -23,8 +23,6 @@ class ClipboardScreen extends StatefulWidget {
 }
 
 class _ClipboardScreenState extends State<ClipboardScreen> {
-  DateTime? _lastReceivedAt;
-  String? _lastReceivedFrom;
   bool _sending = false;
   bool _sendResultShown = false;
 
@@ -36,6 +34,11 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     final enabled = state.config.clipboardSyncEnabled;
     final hasPeer = clipboard?.hasConnectedPeer() ?? false;
     final isAndroid = state.identity.platform == 'android';
+    final lastReceivedAt = clipboard?.lastReceivedAt;
+    final lastReceivedFrom =
+        _peerName(state, clipboard?.lastReceivedPeerId);
+    final lastSentAt = clipboard?.lastSentAt;
+    final lastError = clipboard?.lastError;
 
     // Shell matches _OverviewPage's pattern — see THINKING.md.
     return Scaffold(
@@ -54,10 +57,9 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
               subtitle: enabled
                   ? hasPeer
                       ? (isAndroid
-                          ? 'PC→phone auto · always-on background connection · '
-                              'Phone→PC manual'
-                          : 'PC→phone auto · clipboard changes sync '
-                              'automatically')
+                          ? 'Receive from PC automatically · Phone→PC manual'
+                          : 'Watching this PC clipboard automatically · '
+                              'incoming clipboard is applied automatically')
                       : 'Enabled, but no peer connected'
                   : 'Off — clipboard is not shared',
               trailing: Switch(
@@ -193,15 +195,15 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
               const SizedBox(height: 12),
             ],
 
-            // ---- Last received (content-free) ---------------------------------
-            if (enabled)
+            // ---- Live, content-free diagnostics -----------------------------
+            if (enabled) ...[
               GlassPanel(
                 padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Last received',
+                      'Clipboard status',
                       style: AppTypography.manrope(
                         textStyle: TextStyle(
                           color: c.textPrimary,
@@ -210,26 +212,51 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                         ),
                       ),
                     ),
-                    const SizedBox(height: 4),
-                    _lastReceivedAt != null
-                        ? Text(
-                            'From ${_lastReceivedFrom ?? "a device"} at '
-                            '${_formatTime(_lastReceivedAt!)}',
-                            style: AppTypography.inter(
-                              textStyle: TextStyle(
-                                  color: c.textPrimary, fontSize: 12.5),
-                            ),
-                          )
-                        : Text(
-                            'Nothing received yet',
-                            style: AppTypography.inter(
-                              textStyle: TextStyle(
-                                  color: c.textSecondary, fontSize: 12.5),
-                            ),
-                          ),
+                    const SizedBox(height: 8),
+                    _statusRow(
+                      c,
+                      icon: isAndroid
+                          ? Icons.phone_android_rounded
+                          : Icons.visibility_outlined,
+                      label: isAndroid
+                          ? 'Automatic watcher'
+                          : 'Desktop watcher',
+                      value: isAndroid
+                          ? 'Incoming only'
+                          : (clipboard?.isPolling == true ? 'Running' : 'Idle'),
+                    ),
+                    const SizedBox(height: 7),
+                    _statusRow(
+                      c,
+                      icon: Icons.upload_rounded,
+                      label: 'Last sent',
+                      value: lastSentAt == null
+                          ? 'Nothing sent yet'
+                          : _formatTime(lastSentAt),
+                    ),
+                    const SizedBox(height: 7),
+                    _statusRow(
+                      c,
+                      icon: Icons.download_rounded,
+                      label: 'Last received',
+                      value: lastReceivedAt == null
+                          ? 'Nothing received yet'
+                          : '${lastReceivedFrom ?? "a device"} · '
+                              '${_formatTime(lastReceivedAt)}',
+                    ),
                   ],
                 ),
               ),
+              if (lastError != null) ...[
+                const SizedBox(height: 12),
+                GlassListTile(
+                  leadingIcon: Icons.error_outline_rounded,
+                  accentColor: c.danger,
+                  title: 'Clipboard error',
+                  subtitle: lastError,
+                ),
+              ],
+            ],
           ],
         ),
       ),
@@ -273,6 +300,50 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     } finally {
       if (mounted) setState(() => _sending = false);
     }
+  }
+
+  Widget _statusRow(
+    GlassColors c, {
+    required IconData icon,
+    required String label,
+    required String value,
+  }) {
+    return Row(
+      children: [
+        Icon(icon, size: 16, color: c.textTertiary),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            label,
+            style: AppTypography.inter(
+              textStyle: TextStyle(color: c.textSecondary, fontSize: 12.5),
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Flexible(
+          child: Text(
+            value,
+            textAlign: TextAlign.right,
+            style: AppTypography.inter(
+              textStyle: TextStyle(
+                color: c.textPrimary,
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  String? _peerName(AppState state, String? peerId) {
+    if (peerId == null) return null;
+    for (final peer in state.config.pairedPeers) {
+      if (peer.deviceId == peerId) return peer.name;
+    }
+    return peerId;
   }
 
   String _formatTime(DateTime dt) {

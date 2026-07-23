@@ -21,6 +21,7 @@ import 'send_widget_screen.dart';
 import 'remote_control_screen.dart';
 import 'glass.dart';
 import 'connection_doctor_screen.dart';
+import 'clipboard_screen.dart';
 import 'onboarding_screen.dart';
 
 enum AppDestination { home, folders, devices, remote, settings }
@@ -625,36 +626,23 @@ class _OverviewPage extends StatelessWidget {
           else
             ...discovered.map((d) => Padding(
                   padding: const EdgeInsets.only(bottom: 10),
-                  child: GlassListTile(
-                    leadingIcon: d.platform == 'android'
-                        ? Icons.phone_android
-                        : Icons.computer,
-                    accentColor: c.blue,
-                    title: d.name,
-                    // Reference `.tile-sub.mono` — JetBrains Mono, no
-                    // status dot (device rows aren't a live/idle state).
-                    subtitle: '${d.deviceId} · ${d.address.address}',
-                    subtitleMono: true,
-                    trailing: state.isPeerConnected(d.deviceId)
-                        ? GlassChip(
-                            label: 'Connected',
-                            icon: Icons.link,
-                            accentColor: c.mint,
-                            filled: true,
-                          )
-                        : state.pairedPeers.any((p) => p.deviceId == d.deviceId)
-                            ? GlassChip(
-                                // Reference's one `.badge` example is
-                                // exactly this: "Paired", accent-violet.
-                                label: 'Paired',
-                                icon: Icons.handshake_outlined,
-                                accentColor: c.violet,
-                              )
-                            : GlassChip(
-                                label: 'New',
-                                accentColor: c.textSecondary,
-                              ),
-                    onTap: () => _goToDevices(ctx),
+                  child: _OverviewDeviceCard(
+                    name: d.name,
+                    deviceId: d.deviceId,
+                    address: d.address.address,
+                    isAndroid: d.platform == 'android',
+                    isConnected: state.isPeerConnected(d.deviceId),
+                    isPaired: state.pairedPeers
+                        .any((peer) => peer.deviceId == d.deviceId),
+                    clipboardEnabled: state.config.clipboardSyncEnabled,
+                    clipboardSupported:
+                        state.peerHasFeature(d.deviceId, 'clipboard_v1'),
+                    onOpenDevices: () => _goToDevices(ctx),
+                    onOpenClipboard: () {
+                      Navigator.of(ctx).push(
+                        _fadeRoute((_) => const ClipboardScreen()),
+                      );
+                    },
                   ),
                 )),
         ],
@@ -667,6 +655,280 @@ class _OverviewPage extends StatelessWidget {
 
   void _navigate(BuildContext ctx, int i) {
     onNavigate(i);
+  }
+}
+
+/// Compact Home-screen device row with two deliberately non-overlapping tap
+/// targets:
+///
+/// * the large identity area opens the Devices tab, preserving the existing
+///   navigation behavior;
+/// * the 120×48 dp clipboard action opens Clipboard directly.
+///
+/// The right-side action is a real, full-size button rather than a tiny chip
+/// wrapped in an invisible gesture detector. This keeps it easy to hit while
+/// making the boundary between the two actions visually obvious.
+class _OverviewDeviceCard extends StatelessWidget {
+  const _OverviewDeviceCard({
+    required this.name,
+    required this.deviceId,
+    required this.address,
+    required this.isAndroid,
+    required this.isConnected,
+    required this.isPaired,
+    required this.clipboardEnabled,
+    required this.clipboardSupported,
+    required this.onOpenDevices,
+    required this.onOpenClipboard,
+  });
+
+  final String name;
+  final String deviceId;
+  final String address;
+  final bool isAndroid;
+  final bool isConnected;
+  final bool isPaired;
+  final bool clipboardEnabled;
+  final bool clipboardSupported;
+  final VoidCallback onOpenDevices;
+  final VoidCallback onOpenClipboard;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = GlassColors.of(context);
+    final canUseClipboard = isConnected && isPaired;
+
+    final String statusLabel;
+    final IconData? statusIcon;
+    final Color statusColor;
+    final bool statusFilled;
+    if (isConnected) {
+      statusLabel = 'Connected';
+      statusIcon = Icons.link;
+      statusColor = c.mint;
+      statusFilled = true;
+    } else if (isPaired) {
+      statusLabel = 'Paired';
+      statusIcon = Icons.handshake_outlined;
+      statusColor = c.violet;
+      statusFilled = false;
+    } else {
+      statusLabel = 'New';
+      statusIcon = null;
+      statusColor = c.textSecondary;
+      statusFilled = false;
+    }
+
+    final String clipboardLabel;
+    final Color clipboardColor;
+    if (!clipboardSupported) {
+      clipboardLabel = 'Clipboard setup';
+      clipboardColor = c.textSecondary;
+    } else if (clipboardEnabled) {
+      clipboardLabel = 'Clipboard On';
+      clipboardColor = c.violet;
+    } else {
+      clipboardLabel = 'Clipboard Off';
+      clipboardColor = c.textSecondary;
+    }
+
+    return GlassPanel(
+      padding: EdgeInsets.zero,
+      borderRadius: 18,
+      blur: false,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(18),
+        child: Material(
+          type: MaterialType.transparency,
+          child: IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: InkWell(
+                    onTap: onOpenDevices,
+                    hoverColor: c.glassFillHover,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 14, 10, 14),
+                      child: Row(
+                        children: [
+                          _OverviewDeviceIcon(
+                            icon: isAndroid
+                                ? Icons.phone_android
+                                : Icons.computer,
+                            color: c.blue,
+                          ),
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: AppTypography.manrope(
+                                    textStyle: TextStyle(
+                                      color: c.textPrimary,
+                                      fontSize: 14.5,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  '$deviceId · $address',
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: AppTypography.jetBrainsMono(
+                                    textStyle: TextStyle(
+                                      color: c.textSecondary,
+                                      fontSize: 11.5,
+                                      letterSpacing: 0.2,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                Container(
+                  width: 1,
+                  margin: const EdgeInsets.symmetric(vertical: 13),
+                  color: c.glassBorder,
+                ),
+                SizedBox(
+                  width: 132,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 10, 10, 10),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: GlassChip(
+                            label: statusLabel,
+                            icon: statusIcon,
+                            accentColor: statusColor,
+                            filled: statusFilled,
+                          ),
+                        ),
+                        if (canUseClipboard) ...[
+                          const SizedBox(height: 7),
+                          Semantics(
+                            button: true,
+                            label: '$clipboardLabel for $name',
+                            child: SizedBox(
+                              height: 48,
+                              child: Material(
+                                type: MaterialType.transparency,
+                                child: InkWell(
+                                  onTap: onOpenClipboard,
+                                  borderRadius: BorderRadius.circular(14),
+                                  hoverColor: clipboardColor.withValues(
+                                    alpha: 0.10,
+                                  ),
+                                  child: Ink(
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(14),
+                                      color: clipboardColor.withValues(
+                                        alpha: clipboardEnabled ? 0.17 : 0.10,
+                                      ),
+                                      border: Border.all(
+                                        color: clipboardColor.withValues(
+                                          alpha: clipboardEnabled ? 0.38 : 0.24,
+                                        ),
+                                      ),
+                                    ),
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 9,
+                                      ),
+                                      child: Row(
+                                        children: [
+                                          Icon(
+                                            Icons.content_copy_rounded,
+                                            size: 15,
+                                            color: clipboardColor,
+                                          ),
+                                          const SizedBox(width: 6),
+                                          Expanded(
+                                            child: Text(
+                                              clipboardLabel,
+                                              maxLines: 2,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: AppTypography.manrope(
+                                                textStyle: TextStyle(
+                                                  color: clipboardColor,
+                                                  fontSize: 10.5,
+                                                  height: 1.05,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                          Icon(
+                                            Icons.chevron_right_rounded,
+                                            size: 17,
+                                            color: clipboardColor,
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _OverviewDeviceIcon extends StatelessWidget {
+  const _OverviewDeviceIcon({required this.icon, required this.color});
+
+  final IconData icon;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 38,
+      height: 38,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(11),
+        gradient: RadialGradient(
+          center: const Alignment(-0.30, -0.40),
+          radius: 0.9,
+          colors: [
+            color.withValues(alpha: 0.32),
+            color.withValues(alpha: 0.18),
+          ],
+        ),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+        boxShadow: [
+          BoxShadow(color: color.withValues(alpha: 0.30), blurRadius: 14),
+        ],
+      ),
+      child: Icon(icon, size: 18, color: color),
+    );
   }
 }
 
@@ -815,6 +1077,38 @@ class _SettingsHubPage extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(20, 22, 20, 32),
           children: [
             const GlassPageTitle('Settings'),
+
+            // Clipboard is a first-class setting. Previously the only route to
+            // this toggle lived behind a peer capability tile, while the peer
+            // handshake forgot to advertise clipboard_v1, making the feature
+            // effectively impossible to enable from the UI.
+            GlassListTile(
+              leadingIcon: state.config.clipboardSyncEnabled
+                  ? Icons.content_copy_rounded
+                  : Icons.content_copy_outlined,
+              accentColor: state.config.clipboardSyncEnabled
+                  ? c.violet
+                  : c.textSecondary,
+              title: 'Clipboard sync',
+              subtitle: state.config.clipboardSyncEnabled
+                  ? (state.clipboard?.hasConnectedPeer() == true
+                      ? (Platform.isAndroid
+                          ? 'On · receive automatically · phone to PC uses Send clipboard'
+                          : 'On · watching this PC clipboard automatically')
+                      : 'On · waiting for a connected device')
+                  : 'Off · clipboard content is not shared',
+              trailing: Switch(
+                value: state.config.clipboardSyncEnabled,
+                onChanged: (value) => state.setClipboardSyncEnabled(value),
+                activeThumbColor: c.violet,
+              ),
+              onTap: () {
+                Navigator.of(context).push(
+                  _fadeRoute((_) => const ClipboardScreen()),
+                );
+              },
+            ),
+            const SizedBox(height: 10),
 
             // ---- Storage ----
             // Each former Card(ListTile) row is now its own GlassListTile —

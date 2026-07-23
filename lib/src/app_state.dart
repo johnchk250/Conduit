@@ -485,6 +485,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       onTransferState: _onTransferState,
       // Phase 2: route an inbound peer clipboard push to the host-side writer.
       onClipboardPush: _onClipboardPushReceived,
+      onClipboardRequest: _onClipboardRequestReceived,
       // Phase 4: route an inbound remote command to the PC executor.
       onRunCommand: _onRunCommandReceived,
       onDeviceStatus: _onDeviceStatusReceived,
@@ -651,6 +652,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       }),
       onRemoteReceived: _onClipboardRemoteReceived,
       now: DateTime.now,
+      onStateChanged: notifyListeners,
     );
     _clipboard!.setEnabled(_config.clipboardSyncEnabled);
 
@@ -2321,6 +2323,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       final preview = text.length > 40 ? '${text.substring(0, 40)}…' : text;
       unawaited(_notifier.showClipboardSyncReceived(preview, peerName));
     }
+  }
+
+  /// A clipboard-enabled peer asks this device to send its current clipboard.
+  /// Only desktop fulfills this automatically because Android background
+  /// clipboard reads are restricted by the OS.
+  void _onClipboardRequestReceived(String peerId) {
+    if (!_config.clipboardSyncEnabled || !Platform.isWindows) return;
+    unawaited(_clipboard?.sendCurrentClipboard(targetPeerId: peerId));
   }
 
   /// ClipboardSync → host: a peer's clipboard just landed locally. Surface a

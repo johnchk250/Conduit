@@ -22,6 +22,16 @@ import 'bluetooth_bridge.dart';
 /// false closes this just-handshaken socket without publishing it.
 typedef OnSessionReady = bool Function(PeerSession session);
 
+/// Capabilities advertised by every current Conduit peer during the secure
+/// hello/welcome handshake. Keep this list centralized so the initiator and
+/// responder cannot silently drift apart.
+const supportedPeerFeatures = <String>[
+  'clipboard_v1',
+  'device_status_v1',
+  'phone_alert_v1',
+  'transfer_receipt_v1',
+];
+
 /// State of an outgoing/incoming pairing attempt.
 enum PairingState { idle, awaitingPeerConfirm, confirmed, rejected }
 
@@ -614,11 +624,7 @@ class PeerConnectionManager {
       'name': identity.name,
       'platform': identity.platform,
       'pubKey': identity.publicKeyB64,
-      'features': [
-        'device_status_v1',
-        'phone_alert_v1',
-        'transfer_receipt_v1',
-      ],
+      'features': supportedPeerFeatures,
       ...secureOffer.toJson(),
     };
     final transcript = SecureHandshake.transcript(
@@ -924,11 +930,7 @@ class PeerConnectionManager {
       'name': identity.name,
       'platform': identity.platform,
       'pubKey': identity.publicKeyB64,
-      'features': [
-        'device_status_v1',
-        'phone_alert_v1',
-        'transfer_receipt_v1',
-      ],
+      'features': supportedPeerFeatures,
       ...secureOffer.toJson(),
     };
     if (pairCode != null) {

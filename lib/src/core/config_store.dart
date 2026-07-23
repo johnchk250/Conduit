@@ -283,8 +283,9 @@ class ConfigStore {
   /// Feature flag for clipboard sync (Roadmap Phase 2). Off by default for
   /// privacy: the clipboard can contain passwords / 2FA codes, so the user must
   /// opt in. When true, the PC watches its clipboard and pushes to a connected
-  /// phone automatically, and the phone surfaces a QuickShare-style chip on
-  /// copy. When false, no `clipboardPush` is ever sent or acted on.
+  /// phone automatically. Android receives those pushes in the background and
+  /// can send its current clipboard manually from the Clipboard screen. When
+  /// false, no `clipboardPush` is ever sent or acted on.
   bool get clipboardSyncEnabled => _data['clipboardSyncEnabled'] == true;
 
   Future<void> setClipboardSyncEnabled(bool value) async {
