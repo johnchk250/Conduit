@@ -33,6 +33,14 @@ import '../transfers/transfer_receipt.dart';
 /// keeps the default depth of 1.
 const int _adHocPipelineDepth = 8;
 
+/// Ad-hoc file data is carried inside encrypted JSON as base64. A 1-MiB file
+/// block therefore becomes a roughly 1.4-MiB JSON frame that must be decrypted,
+/// UTF-8 decoded, JSON parsed, base64 decoded, and hashed on Flutter's isolate.
+/// Splitting hashless ad-hoc offers into 256-KiB requests keeps each individual
+/// CPU burst short enough for frames and taps to be serviced between blocks.
+/// Eight pipelined requests still keep up to 2 MiB in flight on a fast LAN.
+const int _adHocRequestBlockSize = 256 * 1024;
+
 /// Metadata about an incoming file offer, kept on the receiver side while the
 /// transfer is in flight. Never surfaces to the UI (auto-receive — no dialog).
 class _InboundOffer {
@@ -696,6 +704,16 @@ class AdHocFileSend {
         TransferDirection.incoming,
         status: TransferStatus.transferring,
       );
+      // Publish a visible 0% state before requesting the first block. The old
+      // code emitted its first notification only after a full 1 MiB block had
+      // arrived, so small/fast transfers reached completion and immediately
+      // cancelled that first update before Android had time to display it.
+      await notifier.showReceiveProgress(
+        offer.name,
+        0,
+        offer.size,
+        offerId: offer.offerId,
+      );
       await fetchFileBlockLevel(
         fs: fs,
         rootPath: destPath,
@@ -720,11 +738,19 @@ class AdHocFileSend {
           return offer._sink.next();
         },
         onProgress: (received, total) {
-          notifier.showReceiveProgress(offer.name, received, total,
-              offerId: offer.offerId);
+          unawaited(notifier.showReceiveProgress(
+            offer.name,
+            received,
+            total,
+            offerId: offer.offerId,
+          ));
         },
         pipelineDepth:
             offer.session.isBandwidthConstrained ? 1 : _adHocPipelineDepth,
+        requestBlockSize: offer.blockHashes.isEmpty
+            ? _adHocRequestBlockSize
+            : blockSize,
+        yieldBetweenBlocks: Platform.isAndroid,
       );
 
       onLog(
@@ -745,10 +771,21 @@ class AdHocFileSend {
         null,
       );
       final peerName = offer.session.peer.name;
-      notifier.showFileReceived(offer.name, peerName, treeUri: destPath);
+      await notifier.cancelReceiveProgress(
+        offer.name,
+        offerId: offer.offerId,
+      );
+      await notifier.showFileReceived(
+        offer.name,
+        peerName,
+        treeUri: destPath,
+      );
     } catch (e) {
       onLog('Ad-hoc receive failed for ${offer.name}: $e', isError: true);
-      await notifier.cancelReceiveProgress(offer.name);
+      await notifier.cancelReceiveProgress(
+        offer.name,
+        offerId: offer.offerId,
+      );
       await _updateReceipt(
         offer.offerId,
         TransferDirection.incoming,
@@ -853,7 +890,10 @@ class AdHocFileSend {
     } catch (_) {}
 
     onLog('Ad-hoc receive cancelled locally: ${offer.name}');
-    notifier.cancelReceiveProgress(offer.name);
+    unawaited(notifier.cancelReceiveProgress(
+      offer.name,
+      offerId: offer.offerId,
+    ));
   }
 
   bool pauseOutboundForPeer(String peerId) {

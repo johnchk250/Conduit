@@ -6,7 +6,80 @@ versioning for published application releases.
 
 ## [Unreleased]
 
-No unreleased changes are currently documented.
+### Pairing
+
+- Added manual LAN pairing for when UDP discovery is unavailable: enter a
+  peer's address directly and complete the same authenticated secure-welcome
+  handshake discovery would normally provide.
+- Replaced numeric PIN-style manual pairing codes with a two-word,
+  pronounceable phrase (five syllables per word) carrying about 66 bits of
+  entropy, so it's easy to read aloud/type without weakening the secret.
+
+### Performance and battery
+
+- Moved SAF (Storage Access Framework) content-resolver and stream operations
+  off the Android UI thread, marshaling only the final reply back to it, to
+  reduce jank on large folder trees.
+- Replaced the always-on wake-lock/discovery pattern with short, purpose-scoped
+  renewable locks (transfers renew every 45s; clipboard/recovery connections
+  renew every 10 minutes), each with a timeout safety net in case a crashed
+  isolate misses its release call.
+- Scoped the Android `MulticastLock` to bounded startup, reconnect, and
+  network-transition windows instead of holding it continuously.
+- Added an explicit user-triggered "connection boost" mode that clears
+  reconnect backoff and re-dials only offline/incomplete sessions, leaving
+  healthy sessions untouched.
+- Added a slower Bluetooth beacon backoff (3s → 15s → 1m) once a peer has
+  been unavailable for a while, instead of polling at a constant fast interval.
+- Reworked the Android foreground service and notification channel handling to
+  avoid unnecessary restarts and to use a quieter, minimal-interruption channel
+  when appropriate.
+- Made LAN reconnect logic distinguish DNS-only network changes (ignored) from
+  actual interface/address/route changes (which do warrant a reconnect check),
+  cutting down on unnecessary reconnect churn.
+
+### Synchronization
+
+- Replaced full periodic SAF folder rescans with event-led watching via
+  Android content observers (registered on both the tree and child-documents
+  URIs, since providers differ in which one they notify), keeping the old
+  full-tree scan only as a long-interval fallback for non-conforming providers.
+- Fixed file-transfer progress notifications flooding the Android notification
+  channel/UI on fast LAN transfers: updates are now rate-limited (at most
+  ~4/second) and serialized per transfer, while still guaranteeing the 0% and
+  100% notifications are shown.
+- Made `.syncpart` resume verification read the previously-downloaded prefix
+  block-by-block from disk instead of loading the whole partial file into
+  memory, avoiding a memory/latency spike when resuming a large, mostly-complete
+  transfer.
+- Isolated per-device sync engine state so that device-level sync/discovery
+  handling doesn't cross-affect other paired devices.
+
+### Cross-device tools
+
+- Added a pull-based clipboard refresh: a clipboard-enabled peer can now ask a
+  connected peer to (re-)send its current clipboard, closing a gap where
+  enabling clipboard sync after the other side had already copied something
+  meant waiting for a fresh copy event.
+- Centralized the list of capabilities peers advertise during the secure
+  hello/welcome handshake so the initiator and responder can't silently drift
+  apart on what's supported.
+
+### Android sharing
+
+- Redesigned incoming share-intent delivery to attempt delivery immediately
+  and only queue on failure/no-listener, instead of gating all delivery behind
+  a one-time "handler ready" signal — the old gate could permanently strand
+  queued shares if a cached/headless Flutter engine had already completed that
+  handshake before the current Activity existed.
+- Added a native→Dart `shareHostAttached` notification sent whenever a new
+  Activity attaches to a retained Flutter engine, so Dart re-announces
+  readiness to the new channel host and any shares queued by the previous
+  Activity instance are still flushed.
+
+### Known follow-ups
+
+- These changes are not yet reflected in a tagged release or version bump.
 
 ## [2.0.0] - 2026-07-17
 

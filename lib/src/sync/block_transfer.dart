@@ -94,6 +94,8 @@ Future<String> fetchFileBlockLevel({
       sendRequest,
   void Function(int received, int total)? onProgress,
   int pipelineDepth = 1,
+  int requestBlockSize = blockSize,
+  bool yieldBetweenBlocks = false,
   // Roadmap Phase 6.4 (version-restore) — fires with the vault destination
   // path and the SIZE OF THE OLD FILE THAT WAS VAULTED (not the new
   // incoming size) whenever an existing file is vaulted before being
@@ -103,10 +105,18 @@ Future<String> fetchFileBlockLevel({
   void Function(String vaultPath, int oldSizeBytes)? onVaulted,
 }) async {
   final partRel = '$relPath$syncPartSuffix';
-  final totalBlocks = (expectedSize + blockSize - 1) ~/ blockSize;
+  // Peer-provided block hashes are defined over the protocol's standard
+  // 1-MiB blocks. Hashless ad-hoc transfers may request smaller blocks to
+  // reduce the longest uninterrupted JSON/base64/crypto burst on Flutter's
+  // isolate. That improves frame pacing without changing the wire format.
+  final transferBlockSize = blockHashes.isEmpty && requestBlockSize > 0
+      ? requestBlockSize
+      : blockSize;
+  final totalBlocks =
+      (expectedSize + transferBlockSize - 1) ~/ transferBlockSize;
 
-  final digestAcc = AccumulatorSink<Digest>();
-  final digestSink = sha256.startChunkedConversion(digestAcc);
+  var digestAcc = AccumulatorSink<Digest>();
+  var digestSink = sha256.startChunkedConversion(digestAcc);
 
   // Resume: reuse only a fully verified .syncpart prefix. If the part file is
   // absent, lacks peer block hashes, or contains extra/corrupt bytes, discard it
@@ -116,14 +126,14 @@ Future<String> fetchFileBlockLevel({
   int resumeBytes = 0;
   if (existingPart != null && blockHashes.isNotEmpty) {
     var okPrefix = 0;
-    final completeBlocks = existingPart.size ~/ blockSize;
+    final completeBlocks = existingPart.size ~/ transferBlockSize;
     for (var i = 0;
         i < completeBlocks && i < totalBlocks && i < blockHashes.length;
         i++) {
-      final start = i * blockSize;
-      final chunk =
-          await readFileBlock(fs, rootPath, partRel, start, blockSize);
-      if (chunk.length != blockSize) break;
+      final start = i * transferBlockSize;
+      final chunk = await readFileBlock(
+          fs, rootPath, partRel, start, transferBlockSize);
+      if (chunk.length != transferBlockSize) break;
       if (sha256.convert(chunk).toString() != blockHashes[i]) break;
       digestSink.add(chunk);
       okPrefix = start + chunk.length;
@@ -133,6 +143,12 @@ Future<String> fetchFileBlockLevel({
       onProgress?.call(resumeBytes, expectedSize);
     } else {
       await fs.delete(rootPath, partRel);
+      // A partially-verified prefix may already have been fed into
+      // `digestSink` above even though the overall resume was rejected here.
+      // Start the whole-file digest over so blocks re-fetched from scratch
+      // below aren't double-counted into the final hash.
+      digestAcc = AccumulatorSink<Digest>();
+      digestSink = sha256.startChunkedConversion(digestAcc);
     }
   } else if (existingPart != null) {
     await fs.delete(rootPath, partRel);
@@ -156,12 +172,13 @@ Future<String> fetchFileBlockLevel({
   // so firing several requests before awaiting any of them still yields
   // responses in the same order they were sent.
   final effectiveDepth = pipelineDepth < 1 ? 1 : pipelineDepth;
-  final startBlock = resumeBytes ~/ blockSize;
+  final startBlock = resumeBytes ~/ transferBlockSize;
 
   Map<String, dynamic> blockRequest(int i) {
-    final offset = i * blockSize;
-    final want =
-        (offset + blockSize > expectedSize) ? expectedSize - offset : blockSize;
+    final offset = i * transferBlockSize;
+    final want = (offset + transferBlockSize > expectedSize)
+        ? expectedSize - offset
+        : transferBlockSize;
     return {
       't': Msg.request,
       'name': relPath,
@@ -185,7 +202,7 @@ Future<String> fetchFileBlockLevel({
 
   topUpPipeline();
   for (var i = startBlock; i < totalBlocks; i++) {
-    final offset = i * blockSize;
+    final offset = i * transferBlockSize;
     final resp = await inFlight.removeAt(0);
     // A slot just freed — top up immediately so the window stays full while
     // this response is verified and written below.
@@ -211,6 +228,15 @@ Future<String> fetchFileBlockLevel({
     await fs.append(rootPath, partRel, data);
     digestSink.add(data);
     onProgress?.call(offset + data.length, expectedSize);
+    // With a pipelined ad-hoc receive, several response futures and SAF writes
+    // can already be complete. Awaiting those resumes through microtasks and
+    // can starve Flutter's event queue long enough to make animations and taps
+    // visibly lag. Mobile callers opt into one event-loop yield per 1 MiB
+    // block so a pending frame gets a chance to render without changing the
+    // transfer protocol or the default sync-engine behavior.
+    if (yieldBetweenBlocks) {
+      await Future<void>.delayed(Duration.zero);
+    }
   }
 
   digestSink.close();

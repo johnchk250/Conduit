@@ -194,6 +194,34 @@ void main() {
     expect(clientFs.files['a.txt'], newContent);
   });
 
+  test('hashless fetch can request smaller blocks for smoother ad-hoc I/O',
+      () async {
+    const smallBlock = 256 * 1024;
+    final content = bytes(smallBlock * 3 + 321);
+    final serverFs = FakeFs({'smooth.bin': content});
+    final clientFs = FakeFs({});
+    final requestedSizes = <int>[];
+
+    final b = bridge(serverFs: serverFs, relPath: 'smooth.bin');
+    await fetchFileBlockLevel(
+      fs: clientFs,
+      rootPath: 'r',
+      relPath: 'smooth.bin',
+      expectedSize: content.length,
+      expectedSha: sha(content),
+      blockHashes: const [],
+      sendRequest: (request) {
+        requestedSizes.add((request['size'] as num).toInt());
+        return b.sendRequest(request);
+      },
+      pipelineDepth: 4,
+      requestBlockSize: smallBlock,
+    );
+
+    expect(requestedSizes, [smallBlock, smallBlock, smallBlock, 321]);
+    expect(clientFs.files['smooth.bin'], content);
+  });
+
   test(
       'pipelined fetch (depth > 1): a multi-block file is reassembled and '
       'verified identically to the depth-1 default', () async {

@@ -681,7 +681,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         SafFileSystemAccess.openFile(treeUri, relPath);
       };
     }
-    unawaited(_notifier.init());
+    await _notifier.init();
 
     // Phase 3d: subscribe to the OS share/send channel so files shared into
     // Conduit from any file manager, gallery, or the Windows "Send to" menu
@@ -2220,17 +2220,35 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// WM_COPYDATA forwarding from a second instance.
   void _subscribeShareChannel() {
     _chShare.setMethodCallHandler((call) async {
-      if (call.method == 'incomingFiles') {
-        final uris = (call.arguments as Map)['uris'];
-        if (uris is List && uris.isNotEmpty) {
-          await _onIncomingSharedFiles(uris.cast<String>());
-        }
+      switch (call.method) {
+        case 'incomingFiles':
+          final uris = (call.arguments as Map)['uris'];
+          if (uris is List && uris.isNotEmpty) {
+            await _onIncomingSharedFiles(uris.cast<String>());
+          }
+          break;
+        case 'shareHostAttached':
+          // MainActivity can be recreated while the cached FlutterEngine and
+          // this AppState remain alive. Re-acknowledge every new native host so
+          // share URIs buffered by that Activity are flushed to this handler.
+          if (Platform.isAndroid) await _announceAndroidShareHandlerReady();
+          break;
       }
     });
     if (Platform.isWindows) {
       _chShell.invokeMethod<bool>('shareHandlerReady').catchError((_) => false);
     } else if (Platform.isAndroid) {
-      _chShare.invokeMethod<bool>('shareHandlerReady').catchError((_) => false);
+      unawaited(_announceAndroidShareHandlerReady());
+    }
+  }
+
+  Future<void> _announceAndroidShareHandlerReady() async {
+    try {
+      await _chShare.invokeMethod<bool>('shareHandlerReady');
+    } catch (e) {
+      // A headless engine can start before MainActivity installs its channel.
+      // The Activity's shareHostAttached callback retries after it attaches.
+      Diag.log('share_handler_ready_deferred', fields: {'error': e.toString()});
     }
   }
 

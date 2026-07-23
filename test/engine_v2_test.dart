@@ -338,6 +338,60 @@ void main() {
     expect(err['error'], isNotNull);
     expect(err['name'], 'whatever.txt');
   });
+
+  test('a different peer cannot activate or access another peer folder pair',
+      () async {
+    await h.alice.startPair(h.pair);
+    final originalStatus = h.alice.stateFor(h.pair.id)?.status;
+    final mallory = _FakeSession(
+      peer: PairedPeer(
+        deviceId: 'CCCC-3333',
+        name: 'Mallory',
+        platform: 'test',
+        publicKeyB64: '',
+      ),
+      bobFs: FakeFs(),
+    );
+
+    // A new device becoming link-ready must not reconcile or relabel Bob's
+    // pair. Only the ready acknowledgement itself may be emitted.
+    h.alice.onPeerConnected(mallory);
+    await h.alice.handlePeerMessageForTest(mallory, {
+      't': Msg.ready,
+      'deviceId': mallory.peer.deviceId,
+      'ack': false,
+    });
+    await h.pump();
+    expect(h.alice.stateFor(h.pair.id)?.status, originalStatus);
+    expect(mallory.sent.where((m) => m['pairId'] == h.pair.id), isEmpty);
+
+    mallory.sent.clear();
+    await h.alice.reconcile(h.pair, mallory);
+    expect(h.alice.stateFor(h.pair.id)?.status, originalStatus);
+    expect(mallory.sent, isEmpty);
+
+    // Direct pair-scoped frames from the wrong authenticated peer are also
+    // rejected at the inbound boundary.
+    mallory.sent.clear();
+    await h.alice.handlePeerMessageForTest(mallory, {
+      't': Msg.indexRequest,
+      'pairId': h.pair.id,
+      'fromSequence': 0,
+    });
+    expect(mallory.sent, isEmpty);
+
+    await h.alice.handlePeerMessageForTest(mallory, {
+      't': Msg.request,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'name': 'private.txt',
+      'offset': 0,
+      'size': 10,
+    });
+    final errors = mallory.sent.where((m) => m['t'] == Msg.response).toList();
+    expect(errors, hasLength(1));
+    expect(errors.single['error'], isNotNull);
+  });
 }
 
 // ---------------------------------------------------------------------------

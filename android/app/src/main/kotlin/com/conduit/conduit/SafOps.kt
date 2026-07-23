@@ -367,47 +367,70 @@ object SafOps {
                     val tree = call.argument<String>("treeUri")!!
                     val rel = call.argument<String>("relPath")!!
                     val data = call.argument<ByteArray>("data")!!
-                    val name = rel.substringAfterLast('/')
-                    val parentUri = ensureParents(ctx, tree, rel)
-                    // Overwrite in place if the exact-named file exists; only
-                    // create when genuinely absent (never mints "name (N)").
-                    val targetUri: Uri = findChildUri(ctx, parentUri, name)
-                        ?: DocumentsContract.createDocument(
-                            ctx.contentResolver,
-                            parentUri,
-                            "application/octet-stream",
-                            name
-                        ) ?: throw IllegalStateException(
-                            "SAF createDocument returned null for '$name'"
-                        )
-                    // "wt" = open for write, truncate to zero first.
-                    ctx.contentResolver.openOutputStream(targetUri, "wt").use { os ->
-                        os?.write(data)
-                        os?.flush()
+                    // ContentResolver queries plus a provider write/flush can take
+                    // tens or hundreds of milliseconds on some OEM SAF providers.
+                    // Method-channel handlers run on Android's main thread by
+                    // default, so doing this inline froze Flutter frames once per
+                    // transfer block. Keep all provider I/O on the serialized I/O
+                    // executor; result may be completed asynchronously.
+                    ioExecutor.execute {
+                        try {
+                            val name = rel.substringAfterLast('/')
+                            val parentUri = ensureParents(ctx, tree, rel)
+                            // Overwrite in place if the exact-named file exists;
+                            // only create when genuinely absent (never mints
+                            // "name (N)").
+                            val targetUri: Uri = findChildUri(ctx, parentUri, name)
+                                ?: DocumentsContract.createDocument(
+                                    ctx.contentResolver,
+                                    parentUri,
+                                    "application/octet-stream",
+                                    name
+                                ) ?: throw IllegalStateException(
+                                    "SAF createDocument returned null for '$name'"
+                                )
+                            // "wt" = open for write, truncate to zero first.
+                            ctx.contentResolver.openOutputStream(targetUri, "wt").use { os ->
+                                os?.write(data)
+                                os?.flush()
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("write_error", e.message, null)
+                        }
                     }
-                    result.success(true)
                 }
                 "append" -> {
                     val tree = call.argument<String>("treeUri")!!
                     val rel = call.argument<String>("relPath")!!
                     val data = call.argument<ByteArray>("data")!!
-                    val name = rel.substringAfterLast('/')
-                    val parentUri = ensureParents(ctx, tree, rel)
-                    val targetUri: Uri = findChildUri(ctx, parentUri, name)
-                        ?: DocumentsContract.createDocument(
-                            ctx.contentResolver,
-                            parentUri,
-                            "application/octet-stream",
-                            name
-                        ) ?: throw IllegalStateException(
-                            "SAF createDocument returned null for '$name'"
-                        )
-                    // "wa" = open for write, append (do NOT truncate).
-                    ctx.contentResolver.openOutputStream(targetUri, "wa").use { os ->
-                        os?.write(data)
-                        os?.flush()
+                    // Received blocks used to be opened, written, and flushed on
+                    // Android's main thread. A large transfer therefore blocked
+                    // both the native Activity and Flutter's frame delivery once
+                    // per block. Serialize the writes away from the UI thread.
+                    ioExecutor.execute {
+                        try {
+                            val name = rel.substringAfterLast('/')
+                            val parentUri = ensureParents(ctx, tree, rel)
+                            val targetUri: Uri = findChildUri(ctx, parentUri, name)
+                                ?: DocumentsContract.createDocument(
+                                    ctx.contentResolver,
+                                    parentUri,
+                                    "application/octet-stream",
+                                    name
+                                ) ?: throw IllegalStateException(
+                                    "SAF createDocument returned null for '$name'"
+                                )
+                            // "wa" = open for write, append (do NOT truncate).
+                            ctx.contentResolver.openOutputStream(targetUri, "wa").use { os ->
+                                os?.write(data)
+                                os?.flush()
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("append_error", e.message, null)
+                        }
                     }
-                    result.success(true)
                 }
                 "replaceFromTemporary" -> {
                     val tree = call.argument<String>("treeUri")!!
@@ -595,33 +618,43 @@ object SafOps {
                     val uriStr = call.argument<String>("uri")!!
                     val offset = call.argument<Number>("offset")?.toLong() ?: 0L
                     val length = call.argument<Number>("length")?.toInt() ?: (1024 * 1024)
-                    val uri = Uri.parse(uriStr)
-                    val fast = readSharedUriBlockFast(ctx, uri, offset, length)
-                    if (fast != null) {
-                        result.success(fast)
-                        return
-                    }
-                    ctx.contentResolver.openInputStream(uri).use { ins ->
-                        if (ins == null) {
-                            result.error("io", "cannot open shared URI: $uriStr", null)
-                            return
+                    // This is the phone-as-sender counterpart of append: reading
+                    // from a content provider can block unpredictably, so never do
+                    // it in the MethodChannel callback on Android's UI thread.
+                    ioExecutor.execute {
+                        try {
+                            val uri = Uri.parse(uriStr)
+                            val fast = readSharedUriBlockFast(ctx, uri, offset, length)
+                            if (fast != null) {
+                                result.success(fast)
+                            } else {
+                                ctx.contentResolver.openInputStream(uri).use { ins ->
+                                    if (ins == null) {
+                                        throw IllegalStateException(
+                                            "cannot open shared URI: $uriStr"
+                                        )
+                                    }
+                                    var remaining = offset
+                                    while (remaining > 0) {
+                                        val skipped = ins.skip(remaining)
+                                        if (skipped <= 0) break
+                                        remaining -= skipped
+                                    }
+                                    val buf = ByteArrayOutputStream(length)
+                                    val tmp = ByteArray(64 * 1024)
+                                    var toRead = length
+                                    while (toRead > 0) {
+                                        val n = ins.read(tmp, 0, minOf(tmp.size, toRead))
+                                        if (n <= 0) break
+                                        buf.write(tmp, 0, n)
+                                        toRead -= n
+                                    }
+                                    result.success(buf.toByteArray())
+                                }
+                            }
+                        } catch (e: Exception) {
+                            result.error("shared_read_error", e.message, null)
                         }
-                        var remaining = offset
-                        while (remaining > 0) {
-                            val skipped = ins.skip(remaining)
-                            if (skipped <= 0) break
-                            remaining -= skipped
-                        }
-                        val buf = ByteArrayOutputStream(length)
-                        val tmp = ByteArray(64 * 1024)
-                        var toRead = length
-                        while (toRead > 0) {
-                            val n = ins.read(tmp, 0, minOf(tmp.size, toRead))
-                            if (n <= 0) break
-                            buf.write(tmp, 0, n)
-                            toRead -= n
-                        }
-                        result.success(buf.toByteArray())
                     }
                 }
                 // Phase 3d: resolve the display name for a raw content:// URI.
