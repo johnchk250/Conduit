@@ -14,7 +14,7 @@ import 'peer_registry.dart';
 ///     nothing reconnected — a paired peer could stay disconnected until the
 ///     next lucky beacon.
 ///   - If a session went half-dead, `_maybeAutoConnect` saw `isClosed == false`
-///     and refused to redial, so recovery waited up to 36s for the heartbeat.
+///     and refused to redial, so recovery waited for the heartbeat timeout.
 ///
 /// The supervisor closes both gaps by running a periodic sweep (every
 /// [sweepInterval]) that, for every paired peer with no live session and no
@@ -54,7 +54,7 @@ class ConnectionSupervisor {
 
   Timer? _timer;
   static const sweepInterval = Duration(seconds: 5);
-  static const _maxBackoff = Duration(seconds: 60);
+  static const _maxBackoff = Duration(seconds: 30);
 
   // Per-peer connect bookkeeping. Cleared on [noteConnected]; grown on
   // failure. The next-attempt time gates whether a sweep tries this peer.
@@ -90,7 +90,11 @@ class ConnectionSupervisor {
   /// Called by AppState when a session for [peerId] is torn down. Schedules a
   /// reconnect attempt on the next sweep (subject to backoff).
   void noteDisconnected(String peerId) {
-    _nextAttemptAt.remove(peerId); // eligible again immediately
+    // A session that was previously established deserves a fresh recovery
+    // cycle. Keep exponential backoff for repeated failed dials, but do not
+    // carry that history across a real connected→disconnected transition.
+    _failures.remove(peerId);
+    _nextAttemptAt.remove(peerId);
   }
 
   /// Record a discovery beacon without letting every repeated UDP packet
@@ -116,8 +120,18 @@ class ConnectionSupervisor {
     _sweepPeer(peer.deviceId, now);
   }
 
+  /// Clear reconnect backoff and immediately retry one peer. A single broken
+  /// session should not reset the backoff of every other paired device that is
+  /// intentionally out of range.
+  void retryPeerNow(String peerId) {
+    _failures.remove(peerId);
+    _nextAttemptAt.remove(peerId);
+    _sweepPeer(peerId, DateTime.now());
+  }
+
   /// Clear reconnect backoff and run an immediate sweep. Used by explicit
-  /// reconnect boosts and by a confirmed network-route change.
+  /// reconnect boosts and by a confirmed network-route change, where every
+  /// saved endpoint may have become valid or invalid at once.
   void retryNow() {
     _failures.clear();
     _nextAttemptAt.clear();
@@ -162,9 +176,9 @@ class ConnectionSupervisor {
     } catch (_) {
       // Transient failure — back off exponentially, capped at [_maxBackoff].
       final previous = _failures[peer.deviceId] ?? 0;
-      final n = previous >= 6 ? 6 : previous + 1;
+      final n = previous >= 5 ? 5 : previous + 1;
       _failures[peer.deviceId] = n;
-      final delayMs = (1 << n) * 1000; // 2s, 4s, 8s, 16s, 32s, 60s, ...
+      final delayMs = (1 << n) * 1000; // 2s, 4s, 8s, 16s, 30s, ...
       final delay = Duration(milliseconds: delayMs) > _maxBackoff
           ? _maxBackoff
           : Duration(milliseconds: delayMs);

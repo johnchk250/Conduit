@@ -39,10 +39,9 @@ class FolderWatcher {
   /// Optional fast-path lister (Roadmap Phase 0.6 — battery). When supplied,
   /// [_computeSignature] uses this single batched metadata fetch instead of
   /// [FileSystemAccess.listFiles] + one [FileSystemAccess.stat] call per
-  /// file. This poll runs every [interval] (4s while a peer is connected —
-  /// see [setInterval]), so on Android the per-file stat loop meant several
-  /// SAF ContentResolver round trips per file, every 4 seconds, scaling with
-  /// folder size. On Android this is wired to
+  /// file. Earlier Android builds ran this traversal every few seconds; the
+  /// current event-led policy uses provider notifications and a long fallback
+  /// interval instead. On Android this is wired to
   /// [SafFileSystemAccess.listFilesWithStat] (one query per directory); null
   /// everywhere else, which preserves the exact original per-file loop.
   final Future<List<FileEntry>> Function(String rootPath)? batchListWithStat;
@@ -79,18 +78,21 @@ class FolderWatcher {
   /// Change the poll cadence at runtime (Roadmap Phase 0.2 — battery backoff).
   ///
   /// When no peer is connected there is nothing to sync a detected change
-  /// *toward*, so the engine stretches the interval (e.g. 4s→30s), cutting SAF
-  /// IPC ~8× in the common offline state. The moment a peer connects the
-  /// engine restores the snappy interval so a real edit is caught quickly.
+  /// *toward*, so the engine stretches the interval. On Android, provider
+  /// change notifications are the primary trigger and the poll is only a
+  /// long-interval correctness fallback; this avoids repeatedly traversing a
+  /// SAF tree merely because the connection state changed.
   ///
   /// Idempotent: a no-op if the interval is unchanged. Restarting the periodic
   /// timer reschedules the next tick from now (Timer.periodic has no reschedule
-  /// API), which is the desired behaviour — a freshly-restored fast interval
-  /// fires soon rather than waiting out the remainder of a slow one. The
-  /// debounce window and last-signature baseline are preserved, so a backoff
+  /// API), which is the desired behaviour. Local filesystems also get an
+  /// immediate catch-up scan when speeding up; Android SAF relies on the
+  /// engine's reconnect reconcile to avoid a duplicate tree traversal. The
+  /// debounce window and last-signature baseline are preserved, so a cadence
   /// change never emits a spurious change signal.
   void setInterval(Duration newInterval) {
     if (newInterval == _currentInterval) return;
+    final previousInterval = _currentInterval;
     _currentInterval = newInterval;
     final running = _timer;
     if (running == null) {
@@ -98,7 +100,14 @@ class FolderWatcher {
     }
     running.cancel();
     _schedulePoller();
-    _scan(); // Trigger immediate scan to capture pending changes instantly
+    // A local-filesystem reconnect (slow→fast) should immediately catch edits
+    // accumulated while offline. Android SAF reconnects already run a full
+    // engine reconcile and provider events remain armed, so firing a second
+    // tree traversal here only duplicates expensive ContentResolver work. A
+    // disconnect or battery-saver transition must never trigger a scan.
+    if (newInterval < previousInterval && !fs.isAndroidSAF) {
+      unawaited(_scan());
+    }
   }
 
   Future<void> stop() async {

@@ -369,7 +369,7 @@ class SyncEngine {
   /// an inbound IndexUpdate). If a watcher tick misses an edit — possible on a
   /// rapid edit that lands with an identical size/colliding mtime, or a lost
   /// SAF tick — the drift would sit until the next reconnect, which can be
-  /// hours. This map holds one long-interval (30 min) Timer per pair that
+  /// hours. This map holds one long-interval safety-net Timer per pair that
   /// calls [reconcile] while a session is live, closing that hole. Relies on
   /// the existing re-entrancy guard (`if (st.scanning) return;` at the top of
   /// [reconcile]) and the no-op-invariant (idle folder burns zero sequences),
@@ -397,20 +397,17 @@ class SyncEngine {
 
   /// Watcher poll intervals (Roadmap Phase 0.2 + Battery-Saver Polish).
   ///
-  /// Battery-saver mode replaces both the fast and slow intervals with a
-  /// 1-hour cadence. The Phase 0.1 30-min periodic reconcile continues to run
-  /// independently, catching peer-side changes regardless of local watcher
-  /// frequency. In battery-saver mode the watcher's sole remaining job is to
-  /// seed the index on startup (done once) and then provide one "something
-  /// changed locally" signal per hour — an adequate safety net for users who
-  /// prioritise battery over real-time local-change latency.
+  /// Android SAF watching is event-led: ContentObserver notifications trigger
+  /// immediate reconciliation, while these intervals are only fallback scans
+  /// for providers that miss an event. Battery-saver mode stretches that
+  /// safety net further; connection/clipboard liveness is unaffected.
   bool _batterySaverMode = false;
 
   static const _watcherIntervalFast = Duration(seconds: 4);
   static const _watcherIntervalSlow = Duration(seconds: 30);
-  static const _watcherIntervalSafOnline = Duration(minutes: 1);
-  static const _watcherIntervalSafOffline = Duration(hours: 1);
-  static const _watcherIntervalBatterySaver = Duration(hours: 1);
+  static const _watcherIntervalSafOnline = Duration(minutes: 15);
+  static const _watcherIntervalSafOffline = Duration(hours: 2);
+  static const _watcherIntervalBatterySaver = Duration(hours: 4);
 
   /// The interval to use for a peer that is currently ONLINE, accounting for
   /// battery-saver mode.
@@ -455,8 +452,8 @@ class SyncEngine {
     w.changes.listen((_) => _onLocalChange(pair));
     _watchers[pair.id] = w;
     // Phase 0.2 + Battery-Saver: start in the appropriate poll state. In
-    // battery-saver mode both online/offline use the 1-hour cadence. In normal
-    // mode: start fast if online (peer connected), slow if offline.
+    // battery-saver mode uses an event-led watcher with a very long fallback
+    // scan. In normal mode: start fast if online, slow if offline.
     final startsOffline = pair.peerDeviceId == null ||
         registry.openSessionFor(pair.peerDeviceId!)?.isLinkReady != true;
     w.setInterval(startsOffline ? _offlineInterval : _onlineInterval);
@@ -465,7 +462,7 @@ class SyncEngine {
     // already-in-sync folder (reconcile's re-entrancy guard + no-op-invariant).
     _periodicTimers.remove(pair.id)?.cancel();
     final periodicInterval =
-        fs.isAndroidSAF ? const Duration(hours: 1) : _periodicInterval;
+        fs.isAndroidSAF ? const Duration(hours: 4) : _periodicInterval;
     _periodicTimers[pair.id] = Timer.periodic(periodicInterval, (_) {
       _periodicTick(pair);
     });
@@ -488,12 +485,13 @@ class SyncEngine {
 
   /// One tick of the periodic reconcile safety-net (Roadmap Phase 0.1).
   ///
-  /// Fires every [_periodicInterval] per pair while a session is live. It is a
-  /// no-op when (a) no session exists (nothing to reconcile toward), (b) the
+  /// Fires on a long safety-net cadence per pair while a session is live. It is
+  /// a no-op when (a) no session exists (nothing to reconcile toward), (b) the
   /// engine is paused, or (c) a reconcile is already running (the re-entrancy
   /// guard inside [reconcile] also catches this). On an in-sync folder the
-  /// resulting reconcile burns zero sequences (the no-op-invariant), so this
-  /// closes the watcher-miss hole at effectively zero cost.
+  /// resulting reconcile burns zero sequences, but it can still traverse the
+  /// filesystem. Android therefore uses a four-hour fallback and relies on SAF
+  /// ContentObserver events for normal responsiveness.
   void _periodicTick(FolderPair pair) {
     if (_disposed) return;
     final peerId = pair.peerDeviceId;
@@ -1030,8 +1028,10 @@ class SyncEngine {
   /// callback slot and we are now it. Every subsequent message flows
   /// straight into `_handlePeerMessage` with zero drop window.
   ///
-  /// Step 1 fix: start the heartbeat so a half-dead peer is detected within
-  /// ~72s (6 x 12s intervals) instead of waiting for TCP keepalive.
+  /// Start the adaptive heartbeat. Desktop detects a fully silent peer in
+  /// about 45 seconds; Android uses a one-minute idle probe to reduce radio
+  /// wakeups, while authenticated reconnect takeover handles Doze-delayed
+  /// timers.
   void onPeerConnected(PeerSession session) {
     Diag.session('session_established',
         peer: session.peer.deviceId, session: session.generation);
@@ -1067,7 +1067,8 @@ class SyncEngine {
     // Heartbeat: drop the session if the peer stops responding.
     //
     // Generation guard: a heartbeat death-notice is asynchronous (it fires
-    // from a Timer ~72s after the session went silent). By the time it fires,
+    // from an adaptive Timer after the session has stayed silent). By the
+    // time it fires,
     // a NEW session for this peer may already be live (reconnect). The guard
     // compares the generation of the session that died against the registry's
     // current generation for this peer — if they differ, the dead session
@@ -1121,11 +1122,9 @@ class SyncEngine {
 
   /// Flip the watcher cadence for every pair bound to [deviceId] (Roadmap
   /// Phase 0.2 + Battery-Saver Polish). In battery-saver mode the interval
-  /// never changes — both online/offline use the 1-hour cadence, so
-  /// `online: true` and `online: false` are equivalent. In normal mode:
-  /// `online: true` restores the fast 4s poll; `online: false` stretches it
-  /// to 30s (a detected change has nowhere to go until the peer reconnects,
-  /// so the extra SAF scans are pure battery waste).
+  /// never changes — both online/offline use the four-hour SAF fallback. In
+  /// normal mode, local filesystems use 4s/30s and Android SAF uses 15m/2h;
+  /// provider events remain immediate in every mode.
   ///
   /// Safe against partial states: a pair whose peer matches [deviceId] but has
   /// no watcher yet is a no-op, as is a watcher whose interval is already the
@@ -1921,7 +1920,8 @@ class SyncEngine {
     }
     // ANY incoming message is proof of life — reset the heartbeat miss count.
     // This means a peer actively syncing never gets dropped; only a truly
-    // silent peer (no traffic for ~72s) triggers the dead path.
+    // silent peer eventually triggers the dead path. Authenticated reconnects
+    // may supersede the old socket earlier when Android defers timers.
     session.restartHeartbeat();
     // Idempotency guard: drop a message we've already processed. Heartbeat
     // control messages (ping/pong) are excluded — they're cheap, idempotent
@@ -1995,7 +1995,7 @@ class SyncEngine {
       case Msg.bye:
         // The peer is disconnecting intentionally (user tapped Disconnect /
         // Quit, or is shutting down). Handle it PROMPTLY rather than waiting
-        // for TCP's FIN or the ~72s heartbeat timeout, so this side's
+        // for TCP's FIN or the heartbeat timeout, so this side's
         // connected-state flips to "disconnected" in lockstep with the peer's
         // — this is the symmetric-disconnect half of the connection-state
         // mismatch fix. Closing our socket here fires socket.done, which runs

@@ -54,6 +54,68 @@ void main() {
     expect(attempts, 2);
   });
 
+  test('retryPeerNow does not reset unrelated offline peers', () async {
+    final temp = await Directory.systemTemp.createTemp('conduit-supervisor-');
+    addTearDown(() => temp.delete(recursive: true));
+    final peer1 = PairedPeer(
+      deviceId: 'peer-1',
+      name: 'Laptop',
+      platform: 'windows',
+      publicKeyB64: 'key-1',
+    );
+    final peer2 = PairedPeer(
+      deviceId: 'peer-2',
+      name: 'Tablet',
+      platform: 'android',
+      publicKeyB64: 'key-2',
+    );
+    final config = ConfigStore.forTest(
+      File('${temp.path}${Platform.pathSeparator}config.json'),
+      {
+        'pairedPeers': [peer1.toJson(), peer2.toJson()],
+      },
+    );
+    final discovered = <String, DiscoveredPeer>{
+      peer1.deviceId: DiscoveredPeer(
+        deviceId: peer1.deviceId,
+        name: peer1.name,
+        platform: peer1.platform,
+        address: InternetAddress.loopbackIPv4,
+        port: 41828,
+        publicKeyB64: peer1.publicKeyB64,
+      ),
+      peer2.deviceId: DiscoveredPeer(
+        deviceId: peer2.deviceId,
+        name: peer2.name,
+        platform: peer2.platform,
+        address: InternetAddress.loopbackIPv4,
+        port: 41828,
+        publicKeyB64: peer2.publicKeyB64,
+      ),
+    };
+    final attempts = <String, int>{};
+    final supervisor = ConnectionSupervisor(
+      registry: PeerConnectionRegistry(),
+      config: config,
+      discoveredPeers: _PeerMapCache(discovered),
+      connect: (peer) async {
+        attempts.update(peer.deviceId, (count) => count + 1, ifAbsent: () => 1);
+        throw const SocketException('offline');
+      },
+      isConnecting: (_) => false,
+      isSuppressed: (_) => false,
+    );
+
+    supervisor.start();
+    await Future<void>.delayed(Duration.zero);
+    expect(attempts, {'peer-1': 1, 'peer-2': 1});
+
+    supervisor.retryPeerNow('peer-1');
+    await Future<void>.delayed(Duration.zero);
+    supervisor.stop();
+    expect(attempts, {'peer-1': 2, 'peer-2': 1});
+  });
+
   test('unpaired discovery beacons are never dialled', () async {
     final temp = await Directory.systemTemp.createTemp('conduit-supervisor-');
     addTearDown(() => temp.delete(recursive: true));
@@ -151,4 +213,13 @@ class _PeerCache implements DiscoveredPeerCache {
   @override
   DiscoveredPeer? forPeer(String deviceId) =>
       deviceId == peer.deviceId ? peer : null;
+}
+
+class _PeerMapCache implements DiscoveredPeerCache {
+  const _PeerMapCache(this.peers);
+
+  final Map<String, DiscoveredPeer> peers;
+
+  @override
+  DiscoveredPeer? forPeer(String deviceId) => peers[deviceId];
 }

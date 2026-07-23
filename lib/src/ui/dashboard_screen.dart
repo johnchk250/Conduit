@@ -967,14 +967,15 @@ class _SettingsHubPage extends StatelessWidget {
               const SizedBox(height: 10),
             ],
 
-            // Battery-saver mode: 1-hour watcher cadence.
+            // Battery-saver mode: event-led watching with a long fallback scan.
             GlassListTile(
               leadingIcon: Icons.battery_saver_outlined,
               accentColor: c.teal,
               title: 'Battery saver mode',
               subtitle:
-                  'Scan folders every hour instead of every 4\u202fs — greatly '
-                  'reduces battery use. Local changes sync with up to 1-hour delay.',
+                  'Use provider change events and scan only every 4 hours as a '
+                  'fallback — greatly reduces battery use without affecting '
+                  'clipboard connectivity.',
               trailing: Switch(
                 value: state.batterySaverMode,
                 onChanged: (v) => state.setBatterySaverMode(v),

@@ -80,8 +80,8 @@ class Discovery {
   // radio active, and the radio stays up ~1–2s after each send, so at the 3s
   // fast cadence it essentially never sleeps. So we run FAST only when it
   // matters — for ~30s after startup or a reconnect, to (re)establish the link
-  // — and drop to SLOW while at least one session is live. The persistent
-  // session + ConnectionSupervisor already cover re-acquisition, so the slow
+  // — and drop to SLOW once all paired sessions are live. The persistent
+  // sessions + ConnectionSupervisor already cover re-acquisition, so the slow
   // cadence is purely for "let a newly-appeared peer notice us".
   //
   // [setBeaconMode] reschedules the broadcast timer with the new period. The
@@ -89,7 +89,7 @@ class Discovery {
   static const _fastInterval = Duration(seconds: 3);
   static const _recoveryInterval = Duration(seconds: 15);
   static const _idleInterval = Duration(minutes: 1);
-  static const _stableInterval = Duration(minutes: 1);
+  static const _stableInterval = Duration(minutes: 5);
   BeaconMode _mode = BeaconMode.fast;
   bool _boosted = false;
   DateTime _fastModeStartedAt = DateTime.now();
@@ -105,7 +105,7 @@ class Discovery {
 
   /// Switch the broadcast cadence between [BeaconMode.fast] (3s — used right
   /// after startup / a reconnect so peers find us quickly) and
-  /// [BeaconMode.stable] (1m — used once at least one session is live, so the
+  /// [BeaconMode.stable] (5m — used once every paired session is live, so the
   /// Wi-Fi radio gets to sleep between beacons). Idempotent: a no-op if the
   /// mode is already current. Fast mode automatically backs off from 3 seconds
   /// to 15 seconds and then 1 minute when a peer remains unavailable.
@@ -116,6 +116,21 @@ class Discovery {
     final running = _broadcastTimer;
     if (running == null) return; // not started — start() will pick it up
     running.cancel();
+    _scheduleBroadcast();
+  }
+
+  /// Start a fresh bounded discovery recovery cycle even when the current mode
+  /// is already [BeaconMode.fast]. This distinction matters after a peer has
+  /// been offline for several minutes: ordinary fast mode has already backed
+  /// off to one minute, so simply setting the same mode again would not make a
+  /// newly broken connection reconnect promptly.
+  void beginRecovery({bool reannounce = true}) {
+    _mode = BeaconMode.fast;
+    _fastModeStartedAt = DateTime.now();
+    final running = _broadcastTimer;
+    if (running == null) return;
+    running.cancel();
+    if (reannounce) _broadcast();
     _scheduleBroadcast();
   }
 
@@ -419,8 +434,8 @@ enum BeaconMode {
   /// the link quickly.
   fast,
 
-  /// Slower broadcast (1m) — used once a session is live, letting the Wi-Fi
-  /// radio sleep between beacons.
+  /// Sparse safety-net broadcast (5m) — used once all paired sessions are live,
+  /// letting the Wi-Fi radio sleep while the TCP sessions provide liveness.
   stable,
 }
 

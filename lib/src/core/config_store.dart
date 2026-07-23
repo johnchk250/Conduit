@@ -330,11 +330,10 @@ class ConfigStore {
     await _persist();
   }
 
-  /// Battery-saver mode (Polish). When true the folder watcher polls every
-  /// 1 hour instead of every 4 s. Massively reduces SAF IPC and Wi-Fi radio
-  /// wakeups in exchange for up to 1-hour latency on local file changes.
-  /// Peer-side changes still arrive within 30 min via the Phase 0.1 periodic
-  /// reconcile. Default false (current behaviour).
+  /// Battery-saver mode. Android provider events still trigger promptly, but
+  /// the fallback folder traversal is reduced to once every 4 hours. Peer-side
+  /// changes still arrive through the live connection / periodic reconcile.
+  /// Default false.
   bool get batterySaverMode => _data['batterySaverMode'] == true;
 
   Future<void> setBatterySaverMode(bool value) async {

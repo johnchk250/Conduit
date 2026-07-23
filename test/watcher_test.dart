@@ -82,6 +82,54 @@ void main() {
     expect(w.isRunning, isFalse);
   });
 
+  test('SAF cadence changes do not force duplicate tree scans', () async {
+    const root = 'content://tree/primary%3ABattery';
+    final fs = _CountingSafFs({'a.txt': _b('hello')});
+    final w = FolderWatcher(
+      fs: fs,
+      rootPath: root,
+      interval: const Duration(minutes: 15),
+    );
+
+    // The engine seeds the signature during its initial reconcile, so starting
+    // the watcher does not need another traversal.
+    w.seedSignature(1);
+    w.start();
+    expect(fs.listCalls, 0);
+
+    w.setInterval(const Duration(hours: 2));
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(fs.listCalls, 0,
+        reason: 'disconnect/battery backoff must not traverse the SAF tree');
+
+    w.setInterval(const Duration(minutes: 15));
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(fs.listCalls, 0,
+        reason: 'the engine reconcile owns SAF reconnect catch-up; the watcher '
+            'must not duplicate that full traversal');
+    await w.stop();
+  });
+
+  test('local watcher still performs immediate reconnect catch-up', () async {
+    final fs = _CountingLocalFs({'a.txt': _b('hello')});
+    final w = FolderWatcher(
+      fs: fs,
+      rootPath: '/fake/local',
+      interval: const Duration(minutes: 15),
+    );
+
+    w.seedSignature(1);
+    w.start();
+    w.setInterval(const Duration(hours: 2));
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(fs.listCalls, 0);
+
+    w.setInterval(const Duration(minutes: 15));
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(fs.listCalls, 1);
+    await w.stop();
+  });
+
   test('FolderWatcher emits from a provider hint without polling first',
       () async {
     const root = 'content://tree/primary%3AEvents';
@@ -197,4 +245,23 @@ class _EventSafFs extends _SafLikeFs implements FileSystemChangeSource {
     stopped.add(rootPath);
     await _changes.close();
   }
+}
+
+class _CountingSafFs extends _SafLikeFs {
+  _CountingSafFs(super.files);
+
+  int listCalls = 0;
+
+  @override
+  Future<List<String>> listFiles(String rootPath) async {
+    listCalls += 1;
+    return super.listFiles(rootPath);
+  }
+}
+
+class _CountingLocalFs extends _CountingSafFs {
+  _CountingLocalFs(super.files);
+
+  @override
+  bool get isAndroidSAF => false;
 }

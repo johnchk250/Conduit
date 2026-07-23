@@ -42,10 +42,10 @@ import io.flutter.plugin.common.MethodChannel
  *     transitions of the engine's transfer-burst counter, and renews every
  *     45s while a burst is in progress so multi-file bursts longer than the
  *     lock's timeout don't silently lose protection.
- *   - **Clipboard/recovery lock** (`Conduit::Connection`): held while the
- *     opt-in clipboard feature has a live peer, or during a bounded reconnect
- *     boost. It is absent from normal folder-only idle operation and renews
- *     every 10 minutes while needed.
+ *   - **Recovery lock** (`Conduit::Connection`): held only during a bounded
+ *     reconnect/network-transition burst. Healthy clipboard and folder-only
+ *     idle operation remain lock-free; the foreground service and TCP socket
+ *     provide the always-available lightweight path.
  *
  * Both locks are reference-counted OFF (a single timed acquisition per
  * enable/renew, not nested), and both were moved here from MainActivity: an
@@ -79,17 +79,19 @@ class SyncService : Service() {
         @Volatile
         private var desiredNotificationVisible = true
         @Volatile
-        private var desiredDiscoveryNeeded = true
+        private var desiredDiscoveryNeeded = false
         @Volatile
         private var desiredTransferLock = false
         @Volatile
         private var desiredConnectionLock = false
 
-        // Timed safety nets for renewable locks. Transfers renew every 45s;
-        // the lower-churn clipboard/recovery lock renews every 10 minutes.
-        // Timeouts protect against a crashed isolate losing its release call.
+        // Timed safety nets for renewable locks. Transfers renew every 45s.
+        // The recovery lock normally lasts only for the bounded Dart recovery
+        // window; its timeout protects against a crashed isolate losing the
+        // release call.
         private const val TRANSFER_LOCK_TIMEOUT_MS = 120_000L
         private const val CONNECTION_LOCK_TIMEOUT_MS = 15 * 60 * 1000L
+        private const val DISCOVERY_RECOVERY_MS = 75_000L
 
         fun start(ctx: Context) {
             if (instance != null) return
@@ -125,9 +127,7 @@ class SyncService : Service() {
 
         fun setDiscoveryNeeded(ctx: Context, needed: Boolean) {
             desiredDiscoveryNeeded = needed
-            applyToRunning {
-                if (needed) acquireMulticastLock() else releaseMulticastLock()
-            }
+            applyToRunning { applyDiscoveryLockState() }
         }
 
         fun setTransferLockEnabled(ctx: Context, enabled: Boolean) {
@@ -163,6 +163,8 @@ class SyncService : Service() {
     private var networkGeneration = 0L
     private var lastLinkSignature: String? = null
     private var pendingNetworkSignal: Runnable? = null
+    private var nativeDiscoveryRecovery = false
+    private var discoveryRecoveryRelease: Runnable? = null
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -172,7 +174,7 @@ class SyncService : Service() {
                 networkGeneration += 1
                 lastLinkSignature = null
             }
-            acquireMulticastLock()
+            startDiscoveryRecovery()
             wakeForReconnect()
             scheduleNetworkSignal("available", available = true)
             // A cold Flutter engine may still be registering its Dart handler.
@@ -190,6 +192,10 @@ class SyncService : Service() {
             currentNetwork = null
             lastLinkSignature = null
             networkGeneration += 1
+            // There is no Wi-Fi route on which multicast can help. Release the
+            // lock immediately; onAvailable starts a fresh bounded burst.
+            stopDiscoveryRecovery()
+            releaseMulticastLock()
             scheduleNetworkSignal("lost", available = false, delayMs = 100L)
         }
 
@@ -203,7 +209,7 @@ class SyncService : Service() {
             lastLinkSignature = signature
             if (previous != null && previous != signature) {
                 networkGeneration += 1
-                acquireMulticastLock()
+                startDiscoveryRecovery()
                 wakeForReconnect()
                 scheduleNetworkSignal("link_properties", available = true)
             }
@@ -258,7 +264,7 @@ class SyncService : Service() {
     private fun wakeForReconnect() {
         try {
             if (baseWakeLock?.isHeld == true) baseWakeLock?.release()
-            baseWakeLock?.acquire(45_000L)
+            baseWakeLock?.acquire(75_000L)
         } catch (_: Throwable) {
             // Best-effort; the foreground service still protects the process.
         }
@@ -285,11 +291,9 @@ class SyncService : Service() {
     private var transferWakeLock: PowerManager.WakeLock? = null
 
     /**
-     * Clipboard/recovery partial wake lock (Roadmap Phase 0.6). It is held only
-     * while the user-enabled clipboard feature has a live peer, or during an
-     * explicit reconnect/network-transition boost. Folder-only idle operation
-     * remains lock-free. Dart renews it every 10 minutes; the timeout is a
-     * safety net only.
+     * Reconnect partial wake lock (Roadmap Phase 0.6). It is held only during
+     * an explicit reconnect/network-transition boost. Healthy idle sockets,
+     * including clipboard sync, remain lock-free. The timeout is a safety net.
      */
     private var connectionWakeLock: PowerManager.WakeLock? = null
 
@@ -305,14 +309,12 @@ class SyncService : Service() {
     // lock is the runtime half that makes the permission do anything.
     //
     // Roadmap Phase 0.6 (battery): previously held for the service's entire
-    // life, released only in onDestroy — meaning it was held 24/7 even for
-    // the many hours a day a peer session is already live and no beacon can
-    // do anything useful (an established session is a unicast TCP socket,
-    // unaffected by this lock either way). Now acquired here as the correct
-    // startup default (no session is live yet), then toggled directly by
-    // AppState._setDiscoveryLockEnabled whenever any paired peer still needs
-    // discovery. onDestroy still releases it
-    // unconditionally as a final safety net.
+    // life. It is now acquired for startup/network recovery and toggled by
+    // AppState._setDiscoveryLockEnabled only during bounded recovery windows.
+    // Sparse outbound beacons and symmetric TCP dialing remain active after
+    // release, so an hours-long outage does not hold the Wi-Fi multicast
+    // receive path open continuously. onDestroy still releases it as a final
+    // safety net.
     private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate() {
@@ -353,9 +355,44 @@ class SyncService : Service() {
         } catch (_: Throwable) {}
         wakeForReconnect()
 
-        if (desiredDiscoveryNeeded) acquireMulticastLock()
+        applyDiscoveryLockState()
         if (desiredTransferLock) acquireTransferWakeLock()
         if (desiredConnectionLock) acquireConnectionWakeLock()
+    }
+
+    /** Start a bounded native discovery window for cold starts and route changes.
+     * Dart normally mirrors this with its own recovery state, but the native
+     * timeout guarantees the MulticastLock cannot leak indefinitely if a
+     * network callback races Dart startup or the isolate stops responding. */
+    private fun startDiscoveryRecovery() {
+        nativeDiscoveryRecovery = true
+        applyDiscoveryLockState()
+        discoveryRecoveryRelease?.let { mainHandler.removeCallbacks(it) }
+        lateinit var release: Runnable
+        release = Runnable {
+            if (discoveryRecoveryRelease !== release) return@Runnable
+            discoveryRecoveryRelease = null
+            nativeDiscoveryRecovery = false
+            applyDiscoveryLockState()
+        }
+        discoveryRecoveryRelease = release
+        mainHandler.postDelayed(release, DISCOVERY_RECOVERY_MS)
+    }
+
+    private fun stopDiscoveryRecovery() {
+        discoveryRecoveryRelease?.let { mainHandler.removeCallbacks(it) }
+        discoveryRecoveryRelease = null
+        nativeDiscoveryRecovery = false
+    }
+
+    private fun applyDiscoveryLockState() {
+        if (currentNetwork != null &&
+            (desiredDiscoveryNeeded || nativeDiscoveryRecovery)
+        ) {
+            acquireMulticastLock()
+        } else {
+            releaseMulticastLock()
+        }
     }
 
     /**
@@ -411,7 +448,7 @@ class SyncService : Service() {
         }
     }
 
-    /** Acquire (or renew) the clipboard/recovery lock. */
+    /** Acquire (or renew) the bounded reconnect-recovery lock. */
     private fun acquireConnectionWakeLock() {
         if (connectionWakeLock == null) {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
@@ -454,6 +491,8 @@ class SyncService : Service() {
         } catch (_: Throwable) {}
         mainHandler.removeCallbacksAndMessages(null)
         pendingNetworkSignal = null
+        discoveryRecoveryRelease = null
+        nativeDiscoveryRecovery = false
         currentNetwork = null
         flutterEngine = null
         if (baseWakeLock?.isHeld == true) {

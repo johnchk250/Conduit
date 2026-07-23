@@ -9,7 +9,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Parcelable
 import android.os.PowerManager
 import android.provider.DocumentsContract
 import android.provider.Settings
@@ -66,8 +65,7 @@ class MainActivity : FlutterActivity() {
     // Phase 3d: channel used to push incoming share URIs to the Dart side.
     // Lateinit because it is created inside configureFlutterEngine.
     private lateinit var shareChannel: MethodChannel
-    private var shareHandlerReady = false
-    private val pendingShareUris = mutableListOf<String>()
+    private val pendingShareUris = linkedSetOf<String>()
 
     private var activeRingtone: Ringtone? = null
     private var activeVibrator: Vibrator? = null
@@ -234,8 +232,8 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
                     // Roadmap Phase 0.6 (battery): toggles SyncService's
-                    // MulticastLock, driven by AppState whenever the set of
-                    // live peer sessions goes empty <-> non-empty. See
+                    // MulticastLock only for bounded startup, reconnect, and
+                    // network-transition recovery windows. See
                     // SyncService.multicastLock doc for the rationale.
                     "acquireDiscovery" -> {
                         SyncService.setDiscoveryNeeded(this, true)
@@ -258,7 +256,6 @@ class MainActivity : FlutterActivity() {
         shareChannel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "shareHandlerReady" -> {
-                    shareHandlerReady = true
                     flushPendingShareUris()
                     result.success(true)
                 }
@@ -371,52 +368,92 @@ class MainActivity : FlutterActivity() {
     // Phase 3d — share-sheet intent handling
     // -------------------------------------------------------------------------
 
-    /// Extracts content:// URIs from an incoming ACTION_SEND / ACTION_SEND_MULTIPLE
-    /// intent and forwards them to the Dart side via [shareChannel].
+    /// Extracts content:// URIs from an incoming ACTION_SEND /
+    /// ACTION_SEND_MULTIPLE intent and forwards them to Dart. Some Android
+    /// senders populate EXTRA_STREAM, others only ClipData, so both are read.
     /// Safe to call with any intent — non-share intents are silently ignored.
     private fun handleShareIntent(intent: Intent?) {
         if (intent == null) return
-        val uris = mutableListOf<String>()
+        if (intent.action != Intent.ACTION_SEND &&
+            intent.action != Intent.ACTION_SEND_MULTIPLE
+        ) return
 
-        when (intent.action) {
-            Intent.ACTION_SEND -> {
-                // Single file: URI is in EXTRA_STREAM
-                @Suppress("DEPRECATION")
-                val uri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
-                if (uri != null) uris.add(uri.toString())
-            }
-            Intent.ACTION_SEND_MULTIPLE -> {
-                // Multiple files: list of URIs in EXTRA_STREAM
-                val list: ArrayList<Parcelable>? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val uris = linkedSetOf<Uri>()
+        if (intent.action == Intent.ACTION_SEND) {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let(uris::add)
+        } else {
+            val list: ArrayList<Uri>? =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
-                        ?.let { ArrayList(it) }
                 } else {
                     @Suppress("DEPRECATION")
-                    intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+                    intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
                 }
-                list?.forEach { p -> (p as? Uri)?.let { uris.add(it.toString()) } }
-            }
-            else -> return // not a share intent — ignore
+            list?.forEach(uris::add)
         }
-
+        intent.clipData?.let { clip ->
+            for (i in 0 until clip.itemCount) {
+                clip.getItemAt(i).uri?.let(uris::add)
+            }
+        }
         if (uris.isEmpty()) return
 
-        if (!::shareChannel.isInitialized || !shareHandlerReady) {
-            pendingShareUris.addAll(uris)
-            return
+        // Retain permission when the sender explicitly allows it. Most share
+        // grants remain temporary, but this makes delayed peer selection safe
+        // for providers that support persistable grants.
+        if (intent.flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0) {
+            uris.forEach { uri ->
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
+                } catch (_: Throwable) {}
+            }
         }
 
-        // Invoke the Dart handler. invokeMethod is fire-and-forget from the
-        // native side; the Dart handler picks it up asynchronously.
-        shareChannel.invokeMethod("incomingFiles", mapOf("uris" to uris))
+        deliverShareUris(uris.map { it.toString() })
+    }
+
+    /// Try delivery immediately rather than relying solely on the one-time
+    /// ready handshake. A cached/headless Flutter engine may have completed
+    /// that handshake before this Activity existed; the old gate then buffered
+    /// shares forever. Failed/not-yet-registered delivery is queued and retried
+    /// when Dart announces readiness.
+    private fun deliverShareUris(uris: Collection<String>) {
+        val unique = uris.filter { it.isNotBlank() }.distinct()
+        if (unique.isEmpty()) return
+        if (!::shareChannel.isInitialized) {
+            pendingShareUris.addAll(unique)
+            return
+        }
+        shareChannel.invokeMethod(
+            "incomingFiles",
+            mapOf("uris" to unique),
+            object : MethodChannel.Result {
+                override fun success(result: Any?) {}
+
+                override fun error(
+                    errorCode: String,
+                    errorMessage: String?,
+                    errorDetails: Any?,
+                ) {
+                    pendingShareUris.addAll(unique)
+                }
+
+                override fun notImplemented() {
+                    pendingShareUris.addAll(unique)
+                }
+            },
+        )
     }
 
     private fun flushPendingShareUris() {
-        if (!::shareChannel.isInitialized || !shareHandlerReady) return
-        if (pendingShareUris.isEmpty()) return
+        if (!::shareChannel.isInitialized || pendingShareUris.isEmpty()) return
         val uris = pendingShareUris.toList()
         pendingShareUris.clear()
-        shareChannel.invokeMethod("incomingFiles", mapOf("uris" to uris))
+        deliverShareUris(uris)
     }
 
     // -------------------------------------------------------------------------

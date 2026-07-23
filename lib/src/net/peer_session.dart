@@ -96,20 +96,28 @@ class PeerSession {
   /// duplicate-connection guard to tell a genuine simultaneous-connect race
   /// (the existing session is brand-new and unproven) apart from a half-dead
   /// socket that the peer is legitimately trying to reconnect past: a session
-  /// that has received traffic within [_raceWindow] is considered live and is
-  /// protected from a competing dial; one that hasn't is treated as stale and
-  /// the new connection supersedes it.
+  /// that has received traffic within [_raceWindow] is protected from a
+  /// competing dial; after that, heartbeat misses or sustained silence can
+  /// allow an authenticated reconnect to supersede it.
   DateTime lastActivityAt = DateTime.now();
 
   /// Grace period during which a newly-established session is presumed to be
   /// the winning half of a simultaneous-connect race and a competing dial is
-  /// rejected. Picked to comfortably exceed the 3.5s connect stagger
+  /// rejected. Picked to comfortably exceed the short connect stagger
   /// (AppState._dialPeer) plus a full handshake + a heartbeat round-trip, so
   /// the *losing* dial of a real race still arrives inside this window and
-  /// gets rejected (preserving the original manifest-corruption fix), while a
-  /// reconnect that arrives once the session has gone silent for this long is
-  /// a genuine "peer reconnected past our half-dead socket" and is accepted.
+  /// gets rejected (preserving the original manifest-corruption fix). After
+  /// this race window, [_silentTakeoverAfter] and heartbeat state decide whether
+  /// an authenticated reconnect may supersede the socket.
   static const _raceWindow = Duration(seconds: 8);
+
+  /// A foreground-service isolate can have Dart timers deferred by Android
+  /// Doze even though the TCP listener still accepts an incoming reconnect.
+  /// After this much total silence, a newly authenticated connection may
+  /// supersede the old socket even if the heartbeat timer has not incremented
+  /// [_missed] yet. A duplicate from the initial simultaneous-dial race lands
+  /// well inside [_raceWindow], so this does not reintroduce connection churn.
+  static const _silentTakeoverAfter = Duration(seconds: 12);
 
   /// The single owner of incoming messages for this session. Reassigning
   /// this is synchronous and instant — see class docs.
@@ -153,17 +161,20 @@ class PeerSession {
     await codec.close();
   }
 
-  // ---- Heartbeat (Step 1 of the fix plan) --------------------------------
+  // ---- Adaptive heartbeat -------------------------------------------------
   //
-  // TCP keepalive is unreliable for detecting a half-dead peer (Windows
-  // defaults to ~2h). We run an app-level heartbeat: ping every [_hbInterval],
-  // drop the session after [_hbMissedThreshold] consecutive unanswered pings.
+  // TCP keepalive is too slow to detect a half-dead LAN peer, but a fixed
+  // 12-second application ping keeps an Android Wi-Fi radio awake all day. A
+  // healthy idle session therefore gets one sparse probe after
+  // [_heartbeatIdleInterval]. Any link involving Android uses a longer idle
+  // interval so the desktop side does not wake the phone twice as often; an
+  // authenticated incoming reconnect can supersede a silent socket
+  // even when Doze defers this timer. Once a probe is unanswered we temporarily
+  // switch to [_hbRetryInterval] and declare the link dead after
+  // [_hbMissedThreshold] misses.
   //
-  // The heartbeat timer is fully owned by the session. The engine's message
-  // handler calls [restartHeartbeat] every time any message arrives (any
-  // traffic = alive), which resets the miss counter AND the periodic timer.
-  // Only SILENCE for [_hbMissedThreshold] × [_hbInterval] triggers the dead
-  // path.
+  // Any inbound message is proof of life and calls [restartHeartbeat], which
+  // resets the miss counter and schedules the next sparse idle probe.
   Timer? _heartbeat;
   VoidCallback? _onHeartbeatDead;
   int _missed = 0;
@@ -175,38 +186,55 @@ class PeerSession {
   DateTime? _pendingPingSentAt;
   int _pingSeq = 0;
 
-  static const _hbInterval = Duration(seconds: 12);
-  static const _hbMissedThreshold = 6;
-  static const _autoTakeoverMissedThreshold = 2;
+  static const _hbDesktopIdleInterval = Duration(seconds: 30);
+  static const _hbAndroidIdleInterval = Duration(minutes: 1);
+  static const _hbRetryInterval = Duration(seconds: 5);
+  static const _hbMissedThreshold = 4;
+  static const _autoTakeoverMissedThreshold = 1;
+
+  Duration get _heartbeatIdleInterval {
+    final androidLink =
+        Platform.isAndroid || peer.platform.toLowerCase() == 'android';
+    return androidLink ? _hbAndroidIdleInterval : _hbDesktopIdleInterval;
+  }
 
   bool get canBeSupersededByAutoReconnect {
-    if (DateTime.now().difference(lastActivityAt) < _raceWindow) return false;
-    return _missed >= _autoTakeoverMissedThreshold;
+    final silentFor = DateTime.now().difference(lastActivityAt);
+    if (silentFor < _raceWindow) return false;
+    return _missed >= _autoTakeoverMissedThreshold ||
+        silentFor >= _silentTakeoverAfter;
   }
 
   int get missedHeartbeats => _missed;
 
-  /// Start the heartbeat timer. The peer answers each ping with a pong
-  /// (handled in the engine); if we don't see enough pongs in a row, fire
-  /// [onDead] so the caller can tear the session down.
+  /// Start the heartbeat scheduler. The peer answers each ping with a pong
+  /// (handled in the engine); unanswered probes temporarily use the short
+  /// retry cadence and eventually fire [onDead].
   void startHeartbeat({required VoidCallback onDead}) {
     _onHeartbeatDead = onDead;
     _missed = 0;
     _pendingPingId = null;
     _pendingPingSentAt = null;
+    _scheduleHeartbeat(_heartbeatIdleInterval);
+  }
+
+  void _scheduleHeartbeat(Duration delay) {
     _heartbeat?.cancel();
-    _heartbeat = Timer.periodic(_hbInterval, (_) => _tick());
+    if (_onHeartbeatDead == null || codec.isClosed) return;
+    _heartbeat = Timer(delay, _tick);
   }
 
   void _tick() {
-    if (codec.isClosed) {
+    if (codec.isClosed || _onHeartbeatDead == null) {
       _heartbeat?.cancel();
+      _heartbeat = null;
       return;
     }
     _missed++;
     onHeartbeat?.call();
     if (_missed >= _hbMissedThreshold) {
       _heartbeat?.cancel();
+      _heartbeat = null;
       Diag.heartbeat('hb_dead',
           peer: peer.deviceId, session: generation, missed: _missed);
       _onHeartbeatDead?.call();
@@ -218,14 +246,15 @@ class PeerSession {
     _pendingPingSentAt = DateTime.now();
     Diag.heartbeat('hb_send',
         peer: peer.deviceId, session: generation, hbId: pingId);
-    try {
-      codec.send({'t': Msg.ping, 'hb': pingId});
-    } catch (_) {
+    unawaited(codec.send({'t': Msg.ping, 'hb': pingId}).catchError((Object _) {
+      if (_onHeartbeatDead == null) return;
       _heartbeat?.cancel();
+      _heartbeat = null;
       Diag.heartbeat('hb_dead',
           peer: peer.deviceId, session: generation, missed: _missed);
       _onHeartbeatDead?.call();
-    }
+    }));
+    _scheduleHeartbeat(_hbRetryInterval);
   }
 
   /// Handle a pong from the peer. If it echoes the id of the ping we most
@@ -259,34 +288,25 @@ class PeerSession {
 
   /// Called by the engine whenever ANY message arrives from the peer (pong,
   /// manifest, chunk, etc.) — any traffic is proof of life. Resets the miss
-  /// counter to zero and reschedules the next ping for a full interval away,
-  // so a steady stream of traffic keeps the session alive indefinitely; only
-  // SILENCE for [_hbMissedThreshold] × [_hbInterval] triggers the dead path.
+  /// counter and moves the next probe back to the sparse idle cadence.
   void restartHeartbeat() {
     if (_onHeartbeatDead == null) return; // heartbeat never started
     final wasMissed = _missed > 0;
     lastActivityAt = DateTime.now(); // proof of life for the dup-hello guard
     _missed = 0;
-    _heartbeat?.cancel();
-    _heartbeat = Timer.periodic(_hbInterval, (_) => _tick());
+    _scheduleHeartbeat(_heartbeatIdleInterval);
     if (wasMissed) {
       onHeartbeat?.call();
     }
   }
 
-  /// Send a heartbeat immediately without waiting for the next periodic tick.
+  /// Send a heartbeat immediately without waiting for the next idle probe.
   /// Used after a long app suspension to validate a session without eagerly
-  /// destroying a healthy socket. The normal periodic schedule is restored
-  /// after the probe.
+  /// destroying a healthy socket. [_tick] schedules the retry cadence itself.
   void probeHeartbeatNow() {
     if (_onHeartbeatDead == null || codec.isClosed) return;
     _heartbeat?.cancel();
     _tick();
-    if (_onHeartbeatDead != null &&
-        !codec.isClosed &&
-        _missed < _hbMissedThreshold) {
-      _heartbeat = Timer.periodic(_hbInterval, (_) => _tick());
-    }
   }
 
   void stopHeartbeat() {
@@ -546,10 +566,10 @@ class PeerConnectionManager {
     // work — preventing it here is the clean fix.)
     //
     // BUT a flat reject also blocks a legitimate reconnect past a half-dead
-    // socket. The safe middle ground is: keep an existing open session unless
-    // our heartbeat has already started missing replies. A merely idle socket
-    // is not stale; replacing it on every late duplicate hello creates the
-    // visible connect/disconnect churn reported from the Activity screen.
+    // socket. The safe middle ground is: protect the short simultaneous-dial
+    // race, then allow takeover after either a missed heartbeat or sustained
+    // total silence. The silence fallback matters on Android Doze, where Dart
+    // timers can be deferred while the TCP listener still accepts a reconnect.
     //
     // A takeover flag is treated as intent, not permission. Older builds used
     // takeover on every automatic reconnect; accepting that unconditionally

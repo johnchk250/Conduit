@@ -89,11 +89,24 @@ object SafOps {
             }
         }
         watch = TreeWatch(observer)
-        ctx.applicationContext.contentResolver.registerContentObserver(
-            Uri.parse(treeUri),
-            true,
-            observer
-        )
+        val resolver = ctx.applicationContext.contentResolver
+        val rootUri = Uri.parse(treeUri)
+        resolver.registerContentObserver(rootUri, true, observer)
+        // DocumentProviders differ in which URI they notify. Some emit on the
+        // tree URI, while others only emit on the child-documents collection.
+        // Register both with the same observer; unregisterContentObserver later
+        // removes all registrations for it. This makes event-led watching
+        // reliable enough that full SAF scans can remain a long fallback.
+        try {
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                rootUri,
+                DocumentsContract.getTreeDocumentId(rootUri),
+            )
+            resolver.registerContentObserver(childrenUri, true, observer)
+        } catch (_: Throwable) {
+            // Non-standard providers may reject the derived URI. The root
+            // observer plus periodic fallback still preserve correctness.
+        }
         treeWatches[treeUri] = watch
     }
 
@@ -239,11 +252,10 @@ object SafOps {
                     // file (each "stat" was itself several queries: path-segment
                     // resolution via findChildUri, a MIME check, then
                     // DocumentFile.length()/lastModified(), which are each their
-                    // own lazy query). The Dart-side FolderWatcher polls every 4s
-                    // while a peer is connected, so on a folder with hundreds of
-                    // files the old path meant thousands of Binder calls every
-                    // 4 seconds. Returns path+size+mtime for every file in one
-                    // recursive pass.
+                    // own lazy query). Older builds ran that path every few
+                    // seconds; the current watcher is event-led and keeps this
+                    // batched traversal as a long fallback. Returns
+                    // path+size+mtime for every file in one recursive pass.
                     val tree = call.argument<String>("treeUri")!!
                     val out = ArrayList<Map<String, Any>>()
                     listRecursiveWithStat(ctx, treeFromUri(ctx, tree).uri, "", out)

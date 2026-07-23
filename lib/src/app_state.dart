@@ -125,6 +125,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // In-flight outbound connects (guard against parallel dials for one peer).
   final _connectingPeerIds = <String>{};
   final _connectingBluetoothPeerIds = <String>{};
+  // The lexically-larger device yields only once per reconnect cycle. Keeping
+  // this separate from the in-flight guard prevents every supervisor retry
+  // from paying the old multi-second anti-double-dial delay.
+  final _autoConnectStaggeredPeerIds = <String>{};
   final Map<String, Timer> _bluetoothDialTimers = <String, Timer>{};
   Timer? _windowsLanUpgradeTimer;
 
@@ -160,8 +164,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       connectionBoostActive ? _connectionBoostUntil : null;
 
   /// Roadmap Phase 0.4 (post-audit fix): renews the transfer-tied wake lock
-  /// every 45s while a burst is active. The connection lock has a longer,
-  /// clipboard-oriented renewal window.
+  /// every 45s while a burst is active. The separate connection lock is used
+  /// only for bounded reconnect recovery.
   /// Previously a transfer burst only fired one native `acquire` at its start
   /// with no renewal, so any burst longer than the native lock's timeout
   /// silently lost wake-lock protection even without the app being
@@ -169,10 +173,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Timer? _transferWakeLockRenewal;
 
   /// Roadmap Phase 0.6 — battery: mirrors whether the Android SyncService's
-  /// MulticastLock is currently held. Starts true because the service
-  /// acquires it unconditionally in onCreate (the correct default before we
-  /// know anything about peer state) — see [_setDiscoveryLockEnabled].
-  bool _discoveryLockHeld = true;
+  /// MulticastLock is currently requested. The service starts lock-free; a
+  /// bounded startup/network/reconnect recovery window explicitly acquires it.
+  bool _discoveryLockHeld = false;
 
   /// Step 3: the current pending invite, surfaced to the UI as STATE. Null
   /// when there is nothing to show. Setting this calls notifyListeners, so
@@ -619,6 +622,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // whitelist) doesn't kill it. No-op + safe-fail on non-Android. The service
     // also owns the transfer-tied wake lock driven by _onTransferState below.
     _ensureBackgroundServiceRunning();
+    // Give cold starts the same bounded recovery window as a real network
+    // transition. setDiscoveryNeeded/setConnectionLockEnabled persist desired
+    // state even if the asynchronous foreground-service start has not reached
+    // onCreate yet, so the service acquires both locks as soon as it is ready.
+    _activateNetworkRecovery(const Duration(seconds: 75));
 
     // Polish: apply the stored notification visibility preference now that the
     // service is running. Default is visible (true); only fires on Android.
@@ -736,11 +744,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// the lexically-smaller deviceId dialed; the other side only listened.
   /// That created a stalemate: if the listener's session died but the dialer
   /// thought theirs was alive (half-dead socket), the listener had NO path
-  /// to reconnect and waited up to 72s for the dialer's heartbeat to notice.
+  /// to reconnect and waited for the dialer's heartbeat timeout.
   ///
   /// Now BOTH sides dial. To avoid a simultaneous double-dial on the first
   /// beacon after a mutual disconnect, the lexically-smaller device dials
-  /// immediately; the larger device waits a short stagger (3.5s) before its
+  /// immediately; the larger device waits a short stagger before its
   /// first attempt for that peer. The registry's identity-guarded `publish`
   /// already makes a late duplicate safe (it just evicts the older socket), so
   /// this stagger is belt-and-suspenders, not load-bearing.
@@ -996,8 +1004,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       // smaller one a head start on the first reconnect attempt for this peer.
       if (!isLanUpgrade &&
           allowStagger &&
-          _identity.deviceId.compareTo(id) > 0) {
-        await Future<void>.delayed(const Duration(milliseconds: 3500));
+          _identity.deviceId.compareTo(id) > 0 &&
+          _autoConnectStaggeredPeerIds.add(id)) {
+        await Future<void>.delayed(const Duration(milliseconds: 900));
         // Re-check after the delay: the other side may have already connected
         // or the user may have explicitly disconnected while this dial waited.
         if (_suppressedPeerIds.contains(id)) return;
@@ -1154,6 +1163,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       _persistDashboardState(id);
 
       _supervisor.noteConnected(id);
+      _autoConnectStaggeredPeerIds.remove(id);
       _applyBeaconMode();
       if (Platform.isWindows &&
           session.transport == ConnectionTransport.bluetooth) {
@@ -1193,7 +1203,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         session.stopHeartbeat();
         _engine.onPeerSessionLost(id);
         _supervisor.noteDisconnected(id);
-        _applyBeaconMode();
+        _startReconnectRecovery(id, const Duration(seconds: 75));
         _clipboard?.onPeerConnectivityChanged();
         notifyListeners();
       }
@@ -1212,7 +1222,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           _persistDashboardState(id);
         }
         _supervisor.noteDisconnected(id); // schedule a reconnect
-        _applyBeaconMode(); // Phase 0.3: last ready session gone -> fast beacon
+        _startReconnectRecovery(id, const Duration(seconds: 75));
         _clipboard?.onPeerConnectivityChanged(); // Phase 2: peer gone -> idle
         notifyListeners();
         if (_config.bluetoothEnabled) {
@@ -1248,14 +1258,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         ?.setBeaconMode(needsDiscovery ? BeaconMode.fast : BeaconMode.stable);
     _discovery?.setBoosted(boosted);
 
-    // Clipboard sync is explicitly opt-in and promises immediate delivery even
-    // while Android is deeply idle. Keep the partial CPU lock only while that
-    // feature is enabled AND a paired session is live. Folder-only operation
-    // remains lock-free while idle; transfers retain their own scoped lock.
-    final needsRealtimeClipboardLock =
-        anyLive && _config.clipboardSyncEnabled;
-    _setConnectionWakeLockEnabled(boosted || needsRealtimeClipboardLock);
-    _setDiscoveryLockEnabled(boosted || needsDiscovery);
+    // A healthy TCP socket and the foreground service are enough to receive
+    // lightweight clipboard traffic. Do not hold a 24/7 partial CPU wake lock
+    // merely because clipboard sync is enabled; reserve it for bounded
+    // reconnect/network-recovery bursts. Transfers own a separate scoped lock.
+    _setConnectionWakeLockEnabled(boosted);
+    // Receiving multicast/broadcast packets is only required during a bounded
+    // recovery window. Outside that window both peers continue sparse outbound
+    // beacons and symmetric TCP dials, so keeping Android's MulticastLock held
+    // for an hours-long outage wastes battery without improving reachability.
+    _setDiscoveryLockEnabled(boosted);
 
     if (anyLive) {
       _startAndroidStatusSampling();
@@ -1265,11 +1277,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   /// Roadmap Phase 0.6 — battery: toggles the Android SyncService's
-  /// MulticastLock. [needed] remains true while any paired peer is missing,
-  /// because another device can have moved to a new IP even when one peer is
-  /// already online. It becomes false only when every paired peer is ready.
-  /// Idempotent —
-  /// skips the channel call when already in the requested state.
+  /// MulticastLock. It is enabled only for bounded startup, reconnect, and
+  /// network-transition recovery windows. Sparse outbound beacons and
+  /// symmetric dialing continue after the window without keeping the Wi-Fi
+  /// multicast receive filter open all day. Idempotent — skips the channel
+  /// call when already in the requested state.
   ///
   /// SyncService is the sole MulticastLock owner, avoiding duplicate Wi-Fi
   /// locks while MainActivity is visible.
@@ -1385,7 +1397,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // Rather than destroy every session, on resume we actively probe them. Only
   // sessions that miss both probes are closed and handed to the reconnect
   // supervisor; healthy service-owned sockets are preserved without UI churn.
-  // cleanly.
   //
   // GATING (critical — this was the root cause of session churn): Android
   // fires AppLifecycleState.resumed after EVERY inactive→resumed transition,
@@ -1396,15 +1407,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // reset when BOTH hold:
   //   (a) the prior state was a real backgrounding (paused/hidden/detached),
   //       not a transient inactive; AND
-  //   (b) we were backgrounded for at least [_minBgForReset] (10s). Brief
-  //       backgroundings almost never invalidate sockets, and resetting them
+  //   (b) we were backgrounded for at least [_minBgForReset] (five minutes).
+  //       Brief backgroundings almost never invalidate sockets, and resetting them
   //       is worse than leaving them — a stale socket gets caught by the
-  //       heartbeat in 72s anyway.
+  //       adaptive heartbeat or authenticated reconnect takeover anyway.
   AppLifecycleState? _lastLifecycle;
   DateTime? _backgroundedAt;
-  static const _minBgForReset = Duration(
-      minutes:
-          5); // was 10 s: even a 10-s lock-screen triggered a full session teardown + bye on every unlock
+  // A short screen lock should not tear down a healthy connection on unlock.
+  static const _minBgForReset = Duration(minutes: 5);
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -1420,6 +1430,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     if (state != AppLifecycleState.resumed) return;
     if (!_started) return;
+    // Re-announce the Dart share handler on every Activity resume. This is a
+    // cheap second handshake for cached/headless-engine cases where the first
+    // ready call happened before MainActivity attached.
+    if (Platform.isAndroid) {
+      unawaited(
+        _chShare.invokeMethod<bool>('shareHandlerReady').then<void>(
+          (_) {},
+          onError: (Object _, StackTrace __) {},
+        ),
+      );
+    }
     // Clear the background clock regardless of whether we reset.
     final bgStart = _backgroundedAt;
     _backgroundedAt = null;
@@ -1592,6 +1613,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       if (retryConnections) _supervisor.retryNow();
     });
     _networkReannounceTimers.add(timer);
+  }
+
+  void _startReconnectRecovery(String peerId, Duration duration) {
+    // Reset discovery's own fast-mode clock. Calling setBeaconMode(fast) is not
+    // enough when it has already backed off to one minute after a long outage.
+    _discovery?.beginRecovery();
+    _activateNetworkRecovery(duration);
+    // Retry only the session that broke. Resetting every peer here turns one
+    // disconnect into needless dial bursts toward unrelated offline devices.
+    _supervisor.retryPeerNow(peerId);
   }
 
   void _activateNetworkRecovery(Duration duration) {
@@ -2338,7 +2369,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  /// Whether battery-saver mode is on (1-hour watcher cadence).
+  /// Whether battery-saver mode is on (event-led SAF watching with a
+  /// four-hour fallback scan).
   bool get batterySaverMode => _config.batterySaverMode;
 
   /// Toggle battery-saver mode. Persists the preference and immediately
