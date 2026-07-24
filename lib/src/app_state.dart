@@ -29,6 +29,53 @@ import 'sync/sync_preview.dart';
 import 'runtime/app_dependencies.dart';
 import 'transfers/transfer_receipt.dart';
 
+/// Summary returned by [AppState.syncAllNow].
+///
+/// A global manual sync is intentionally separate from connection boost: it
+/// performs one authoritative reconcile per folder pair, in sequence, without
+/// enabling aggressive discovery or holding a wake lock beyond real transfers.
+class SyncAllResult {
+  const SyncAllResult({
+    required this.totalPairs,
+    required this.triggeredWithPeer,
+    required this.indexedLocally,
+    required this.skippedBusy,
+    required this.failed,
+    this.paused = false,
+    this.alreadyRunning = false,
+    this.notStarted = false,
+  });
+
+  final int totalPairs;
+  final int triggeredWithPeer;
+  final int indexedLocally;
+  final int skippedBusy;
+  final int failed;
+  final bool paused;
+  final bool alreadyRunning;
+  final bool notStarted;
+
+  String get message {
+    if (notStarted) return 'Conduit is still starting. Try again in a moment.';
+    if (alreadyRunning) return 'Sync all is already running.';
+    if (paused) return 'Sync is paused. Resume syncing first.';
+    if (totalPairs == 0) return 'No folder pairs to sync.';
+
+    final parts = <String>[];
+    if (triggeredWithPeer > 0) {
+      parts.add('Started sync for $triggeredWithPeer connected folder(s)');
+    }
+    if (indexedLocally > 0) {
+      parts.add('Scanned $indexedLocally offline folder(s); waiting for peer');
+    }
+    if (skippedBusy > 0) {
+      parts.add('$skippedBusy already syncing');
+    }
+    if (failed > 0) parts.add('$failed failed');
+    return parts.isEmpty ? 'Sync all finished.' : '${parts.join(' · ')}.';
+  }
+}
+
 /// Central app state, exposed to the UI via Provider. Owns:
 ///   - device identity
 ///   - config store (folder pairs + paired peers)
@@ -185,6 +232,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   FolderPairInvite? get pendingInvite => _pendingInvite;
   final _queuedInvites = <FolderPairInvite>[];
 
+  /// Global manual-sync state surfaced on the Overview quick action. Folder
+  /// pairs are reconciled sequentially so one tap cannot launch several
+  /// recursive SAF scans against Files by Google at the same time.
+  bool _syncAllRunning = false;
+  DateTime? _lastSyncAllAt;
+  String? _lastSyncAllSummary;
+
   bool _started = false;
 
   // Roadmap Phase 4: true while the compact, KDE-Connect-style "send widget"
@@ -204,6 +258,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   FileSystemAccess get fs => _fs;
   SyncEngine get engine => _engine;
   bool get isStarted => _started;
+  bool get syncAllRunning => _syncAllRunning;
+  DateTime? get lastSyncAllAt => _lastSyncAllAt;
+  String? get lastSyncAllSummary => _lastSyncAllSummary;
   bool get sendWidgetMode => _sendWidgetMode;
   String get status => _status;
   List<DiscoveredPeer> get discoveredPeers => <DiscoveredPeer>{
@@ -275,6 +332,121 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       pair,
       session != null && session.isLinkReady ? session : null,
     );
+  }
+
+  /// Force one manual reconcile for every configured folder pair.
+  ///
+  /// This deliberately does not start connection boost. Connected pairs sync
+  /// immediately; offline pairs refresh their local index so their changes are
+  /// ready for the reconnect-triggered exchange. Runs pairs sequentially to
+  /// keep Android SAF/provider work bounded and battery-friendly.
+  Future<SyncAllResult> syncAllNow() async {
+    if (!_started) {
+      return const SyncAllResult(
+        totalPairs: 0,
+        triggeredWithPeer: 0,
+        indexedLocally: 0,
+        skippedBusy: 0,
+        failed: 0,
+        notStarted: true,
+      );
+    }
+    if (_syncAllRunning) {
+      return const SyncAllResult(
+        totalPairs: 0,
+        triggeredWithPeer: 0,
+        indexedLocally: 0,
+        skippedBusy: 0,
+        failed: 0,
+        alreadyRunning: true,
+      );
+    }
+    if (_engine.isPaused) {
+      return const SyncAllResult(
+        totalPairs: 0,
+        triggeredWithPeer: 0,
+        indexedLocally: 0,
+        skippedBusy: 0,
+        failed: 0,
+        paused: true,
+      );
+    }
+
+    final pairs = List<FolderPair>.of(_config.folderPairs);
+    if (pairs.isEmpty) {
+      return const SyncAllResult(
+        totalPairs: 0,
+        triggeredWithPeer: 0,
+        indexedLocally: 0,
+        skippedBusy: 0,
+        failed: 0,
+      );
+    }
+
+    _syncAllRunning = true;
+    _lastSyncAllSummary = 'Syncing ${pairs.length} folder pair(s)…';
+    notifyListeners();
+
+    var triggeredWithPeer = 0;
+    var indexedLocally = 0;
+    var skippedBusy = 0;
+    var failed = 0;
+
+    try {
+      for (final pair in pairs) {
+        // The pair may have been removed while an earlier scan was awaiting.
+        if (!_config.folderPairs.any((candidate) => candidate.id == pair.id)) {
+          continue;
+        }
+        if (_engine.stateFor(pair.id)?.scanning == true) {
+          skippedBusy++;
+          continue;
+        }
+
+        final peerId = pair.peerDeviceId;
+        final session =
+            peerId == null ? null : _registry.openSessionFor(peerId);
+        final hasReadyPeer = session?.isLinkReady == true;
+        try {
+          await _engine.reconcile(pair, hasReadyPeer ? session : null);
+          if (_engine.stateFor(pair.id)?.status == 'Error') {
+            failed++;
+          } else if (hasReadyPeer) {
+            triggeredWithPeer++;
+          } else {
+            indexedLocally++;
+          }
+        } catch (error) {
+          failed++;
+          Diag.log(
+            'manual_sync_all_pair_failed',
+            pairId: pair.id,
+            fields: {'error': error.toString()},
+          );
+        }
+      }
+
+      final result = SyncAllResult(
+        totalPairs: pairs.length,
+        triggeredWithPeer: triggeredWithPeer,
+        indexedLocally: indexedLocally,
+        skippedBusy: skippedBusy,
+        failed: failed,
+      );
+      _lastSyncAllAt = dependencies.now();
+      _lastSyncAllSummary = result.message;
+      Diag.log('manual_sync_all_complete', fields: {
+        'pairs': pairs.length,
+        'withPeer': triggeredWithPeer,
+        'localOnly': indexedLocally,
+        'busy': skippedBusy,
+        'failed': failed,
+      });
+      return result;
+    } finally {
+      _syncAllRunning = false;
+      notifyListeners();
+    }
   }
 
   /// Temporarily run discovery, reconnect, and folder reconciliation in an
@@ -2397,8 +2569,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  /// Whether battery-saver mode is on (event-led SAF watching with a
-  /// four-hour fallback scan).
+  /// Whether battery-saver mode is on (event-led SAF watching with one
+  /// eight-hour fallback while connected and no offline traversal).
   bool get batterySaverMode => _config.batterySaverMode;
 
   /// Toggle battery-saver mode. Persists the preference and immediately

@@ -84,7 +84,12 @@ object SafOps {
                         }
                     }
                     watch.pendingNotification = pending
-                    mainHandler.postDelayed(pending, 1_000L)
+                    // A single logical save commonly produces several SAF
+                    // notifications (temporary file, rename, metadata/WAL
+                    // update). Coalesce the native burst before Dart applies
+                    // its own longer quiet window. This keeps sync responsive
+                    // while avoiding repeated recursive tree scans.
+                    mainHandler.postDelayed(pending, 2_000L)
                 }
             }
         }

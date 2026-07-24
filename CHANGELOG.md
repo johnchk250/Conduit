@@ -6,6 +6,10 @@ versioning for published application releases.
 
 ## [Unreleased]
 
+- Add a Home-screen **Sync all now** action that reconciles every folder pair
+  sequentially without enabling connection boost, keeping manual catch-up fast
+  while avoiding concurrent Android SAF tree scans.
+
 ### Pairing
 
 - Added manual LAN pairing for when UDP discovery is unavailable: enter a
@@ -17,6 +21,14 @@ versioning for published application releases.
 
 ### Performance and battery
 
+- Reduced Android SAF battery use by making provider notifications the primary
+  sync trigger, removing the duplicate periodic reconciliation timer, changing
+  the normal recursive fallback scan from 15 minutes to 4 hours, disabling
+  fallback scans while a peer is offline, and coalescing chatty provider event
+  bursts to at most one follow-up reconcile per 5 minutes. The fallback now
+  enters the authoritative reconcile directly instead of first enumerating the
+  same SAF tree for a watcher signature. Battery saver uses an 8-hour connected
+  fallback; reconnect and manual Sync now still perform immediate catch-up.
 - Moved SAF (Storage Access Framework) content-resolver and stream operations
   off the Android UI thread, marshaling only the final reply back to it, to
   reduce jank on large folder trees.

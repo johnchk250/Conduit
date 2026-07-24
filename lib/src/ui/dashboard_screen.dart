@@ -547,6 +547,31 @@ class _OverviewPage extends StatelessWidget {
               );
             },
           ),
+          const SizedBox(height: 10),
+          GlassListTile(
+            leadingIcon: Icons.sync_rounded,
+            accentColor: c.violet,
+            title: state.syncAllRunning
+                ? 'Syncing all folders…'
+                : 'Sync all now',
+            subtitle: _syncAllSubtitle(state, pairs.length),
+            trailing: state.syncAllRunning
+                ? SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: c.violet,
+                    ),
+                  )
+                : Icon(Icons.refresh_rounded, color: c.textTertiary),
+            onTap: (!state.isStarted ||
+                    pairs.isEmpty ||
+                    state.isPaused ||
+                    state.syncAllRunning)
+                ? null
+                : () => _syncAllNow(ctx, state),
+          ),
           const SizedBox(height: 26),
           if (Platform.isWindows) ...[
             ...state.pairedPeers
@@ -649,6 +674,37 @@ class _OverviewPage extends StatelessWidget {
                 )),
         ],
       ),
+    );
+  }
+
+  String _syncAllSubtitle(AppState state, int pairCount) {
+    if (!state.isStarted) return 'Conduit is still starting';
+    if (pairCount == 0) {
+      return 'Add a folder pair before running a manual sync';
+    }
+    if (state.isPaused) return 'Resume sync first';
+    if (state.syncAllRunning) {
+      return 'Scanning each folder once; connected peers sync immediately';
+    }
+    final summary = state.lastSyncAllSummary;
+    if (summary != null) return summary;
+    return 'Force one scan and sync of every folder pair';
+  }
+
+  Future<void> _syncAllNow(BuildContext ctx, AppState state) async {
+    final messenger = ScaffoldMessenger.of(ctx);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text('Syncing all folder pairs…'),
+        duration: Duration(seconds: 1),
+      ),
+    );
+    final result = await state.syncAllNow();
+    if (!ctx.mounted) return;
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(content: Text(result.message)),
     );
   }
 
@@ -1263,15 +1319,19 @@ class _SettingsHubPage extends StatelessWidget {
               const SizedBox(height: 10),
             ],
 
-            // Battery-saver mode: event-led watching with a long fallback scan.
+            // Battery-saver mode: event-led watching with a very long, single
+            // fallback scan. Offline SAF folders are caught up on reconnect
+            // instead of being traversed in the background.
             GlassListTile(
               leadingIcon: Icons.battery_saver_outlined,
               accentColor: c.teal,
               title: 'Battery saver mode',
-              subtitle:
-                  'Use provider change events and scan only every 4 hours as a '
-                  'fallback — greatly reduces battery use without affecting '
-                  'clipboard connectivity.',
+              subtitle: Platform.isAndroid
+                  ? 'Use provider change events and scan only every 8 hours '
+                      'while connected. Offline folders wait for reconnect '
+                      'instead of being scanned in the background.'
+                  : 'Use native folder events with a 4-hour fallback scan to '
+                      'reduce idle filesystem work.',
               trailing: Switch(
                 value: state.batterySaverMode,
                 onChanged: (v) => state.setBatterySaverMode(v),

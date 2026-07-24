@@ -25,6 +25,8 @@ class FolderWatcher {
     required this.rootPath,
     this.interval = const Duration(seconds: 4),
     this.debounce = const Duration(milliseconds: 800),
+    this.minimumSignalInterval = Duration.zero,
+    this.fallbackSignalsWithoutScan = false,
     this.batchListWithStat,
   }) : _currentInterval = interval;
 
@@ -35,6 +37,26 @@ class FolderWatcher {
   final String rootPath;
   final Duration interval;
   final Duration debounce;
+
+  /// Minimum spacing between emitted change hints.
+  ///
+  /// Android document providers often send several notifications for one
+  /// logical save (temporary file, rename, metadata update, WAL update, and so
+  /// on). [debounce] coalesces a short burst; this additional floor prevents a
+  /// chatty provider from triggering repeated full-tree reconciles while an app
+  /// is continuously writing. The next hint is delayed, never discarded.
+  /// Local filesystem watchers leave this at zero for immediate behaviour.
+  final Duration minimumSignalInterval;
+
+  /// When true, a fallback timer emits a change hint directly instead of first
+  /// traversing the tree to compute a signature.
+  ///
+  /// This is the efficient Android SAF shape: the engine's reconcile is the
+  /// authoritative scan, so doing a watcher signature traversal immediately
+  /// before it would enumerate the same provider tree twice whenever drift is
+  /// found. Local filesystems keep signature polling because it is cheap and
+  /// avoids unnecessary reconciles when nothing changed.
+  final bool fallbackSignalsWithoutScan;
 
   /// Optional fast-path lister (Roadmap Phase 0.6 — battery). When supplied,
   /// [_computeSignature] uses this single batched metadata fetch instead of
@@ -59,12 +81,18 @@ class FolderWatcher {
   int _lastSignature = 0;
   bool _hasBaseline = false;
   bool _scanInProgress = false;
+  bool _started = false;
+  bool _providerEventsEnabled = true;
+  bool _providerWatchActive = false;
+  Future<void> _providerWatchOperation = Future<void>.value();
+  DateTime? _lastSignalAt;
 
   Stream<void> get changes => _controller.stream;
-  bool get isRunning => _timer != null;
+  bool get isRunning => _started;
 
   void start() {
-    if (_timer != null) return;
+    if (_started) return;
+    _started = true;
     _startNativeEvents();
     _schedulePoller();
     if (!_hasBaseline) _scan();
@@ -75,7 +103,26 @@ class FolderWatcher {
     _hasBaseline = true;
   }
 
-  /// Change the poll cadence at runtime (Roadmap Phase 0.2 — battery backoff).
+  /// Enable or disable Android/provider change observation without stopping
+  /// the watcher itself.
+  ///
+  /// A folder whose peer is offline cannot sync anywhere. Disabling its
+  /// ContentObserver avoids waking both Conduit and the DocumentsProvider for
+  /// every camera/database write during that period. The engine performs a
+  /// full catch-up reconcile and re-enables observation when the peer returns.
+  /// Native local-filesystem watching is intentionally unaffected.
+  void setProviderEventsEnabled(bool enabled) {
+    if (_providerEventsEnabled == enabled) return;
+    _providerEventsEnabled = enabled;
+    if (!_started || fs is! FileSystemChangeSource) return;
+    if (!enabled) {
+      _debounceTimer?.cancel();
+      _debounceTimer = null;
+    }
+    unawaited(_queueProviderWatchUpdate());
+  }
+
+  /// Change the fallback-poll cadence at runtime.
   ///
   /// When no peer is connected there is nothing to sync a detected change
   /// *toward*, so the engine stretches the interval. On Android, provider
@@ -83,49 +130,51 @@ class FolderWatcher {
   /// long-interval correctness fallback; this avoids repeatedly traversing a
   /// SAF tree merely because the connection state changed.
   ///
+  /// [Duration.zero] disables fallback polling. Conduit pairs this with
+  /// [setProviderEventsEnabled] for an Android SAF folder whose peer is offline:
+  /// scanning cannot sync anything, and the engine performs an immediate
+  /// reconcile when the peer reconnects.
+  ///
   /// Idempotent: a no-op if the interval is unchanged. Restarting the periodic
   /// timer reschedules the next tick from now (Timer.periodic has no reschedule
   /// API), which is the desired behaviour. Local filesystems also get an
-  /// immediate catch-up scan when speeding up; Android SAF relies on the
-  /// engine's reconnect reconcile to avoid a duplicate tree traversal. The
-  /// debounce window and last-signature baseline are preserved, so a cadence
-  /// change never emits a spurious change signal.
+  /// immediate catch-up scan when polling is re-enabled or made faster;
+  /// Android SAF relies on the engine's reconnect reconcile to avoid a
+  /// duplicate tree traversal. The debounce window and last-signature baseline
+  /// are preserved, so a cadence change never emits a spurious change signal.
   void setInterval(Duration newInterval) {
     if (newInterval == _currentInterval) return;
     final previousInterval = _currentInterval;
     _currentInterval = newInterval;
-    final running = _timer;
-    if (running == null) {
+    if (!_started) {
       return; // not started — start() will pick up the new value
     }
-    running.cancel();
+    _timer?.cancel();
+    _timer = null;
     _schedulePoller();
     // A local-filesystem reconnect (slow→fast) should immediately catch edits
     // accumulated while offline. Android SAF reconnects already run a full
     // engine reconcile and provider events remain armed, so firing a second
     // tree traversal here only duplicates expensive ContentResolver work. A
     // disconnect or battery-saver transition must never trigger a scan.
-    if (newInterval < previousInterval && !fs.isAndroidSAF) {
+    final pollingWasDisabled = previousInterval <= Duration.zero;
+    final pollingIsEnabled = newInterval > Duration.zero;
+    final spedUp = pollingIsEnabled &&
+        (pollingWasDisabled || newInterval < previousInterval);
+    if (spedUp && !fs.isAndroidSAF) {
       unawaited(_scan());
     }
   }
 
   Future<void> stop() async {
+    _started = false;
     _timer?.cancel();
     _timer = null;
     _debounceTimer?.cancel();
     _debounceTimer = null;
     await _nativeEvents?.cancel();
     _nativeEvents = null;
-    await _providerEvents?.cancel();
-    _providerEvents = null;
-    final source = fs;
-    if (source is FileSystemChangeSource) {
-      final changeSource = source as FileSystemChangeSource;
-      try {
-        await changeSource.stopWatching(rootPath);
-      } catch (_) {}
-    }
+    await _queueProviderWatchUpdate();
     await _controller.close();
   }
 
@@ -150,24 +199,27 @@ class FolderWatcher {
   }
 
   void _schedulePoller() {
+    if (!_started || _currentInterval <= Duration.zero) {
+      _timer = null;
+      return;
+    }
     final interval =
         _nativeEvents != null && _currentInterval < const Duration(seconds: 30)
             ? const Duration(seconds: 30)
             : _currentInterval;
-    _timer = Timer.periodic(interval, (_) => _scan());
+    _timer = Timer.periodic(interval, (_) {
+      if (fallbackSignalsWithoutScan) {
+        _signalChange();
+      } else {
+        _scan();
+      }
+    });
   }
 
   void _startNativeEvents() {
     final source = fs;
     if (source is FileSystemChangeSource) {
-      final changeSource = source as FileSystemChangeSource;
-      _providerEvents = changeSource.changesFor(rootPath).listen((_) {
-        _signalChange();
-      });
-      unawaited(changeSource.startWatching(rootPath).catchError((_) {
-        // The periodic signature scan remains the correctness fallback for
-        // document providers that do not support observation.
-      }));
+      unawaited(_queueProviderWatchUpdate());
       return;
     }
     if (fs.isAndroidSAF) return;
@@ -188,9 +240,61 @@ class FolderWatcher {
     }
   }
 
+  Future<void> _queueProviderWatchUpdate() {
+    _providerWatchOperation = _providerWatchOperation
+        .then((_) => _applyProviderWatchState())
+        .catchError((Object _) {
+      // The long fallback reconcile remains available when a provider does not
+      // support observation or its platform channel is temporarily unavailable.
+    });
+    return _providerWatchOperation;
+  }
+
+  Future<void> _applyProviderWatchState() async {
+    final source = fs;
+    if (source is! FileSystemChangeSource) return;
+    final changeSource = source as FileSystemChangeSource;
+    final shouldWatch = _started && _providerEventsEnabled;
+
+    if (!shouldWatch) {
+      final subscription = _providerEvents;
+      _providerEvents = null;
+      try {
+        await subscription?.cancel();
+      } catch (_) {}
+      if (!_providerWatchActive) return;
+      _providerWatchActive = false;
+      try {
+        await changeSource.stopWatching(rootPath);
+      } catch (_) {}
+      return;
+    }
+
+    _providerEvents ??= changeSource.changesFor(rootPath).listen((_) {
+      if (_started && _providerEventsEnabled) _signalChange();
+    });
+    if (_providerWatchActive) return;
+    try {
+      await changeSource.startWatching(rootPath);
+      _providerWatchActive = true;
+    } catch (_) {
+      _providerWatchActive = false;
+      // The periodic reconcile remains the correctness fallback for document
+      // providers that do not support observation.
+    }
+  }
+
   void _signalChange() {
     _debounceTimer?.cancel();
-    _debounceTimer = Timer(debounce, () {
+    var delay = debounce;
+    final last = _lastSignalAt;
+    if (last != null && minimumSignalInterval > Duration.zero) {
+      final remaining = minimumSignalInterval - DateTime.now().difference(last);
+      if (remaining > delay) delay = remaining;
+    }
+    if (delay < Duration.zero) delay = Duration.zero;
+    _debounceTimer = Timer(delay, () {
+      _lastSignalAt = DateTime.now();
       if (!_controller.isClosed) _controller.add(null);
     });
   }

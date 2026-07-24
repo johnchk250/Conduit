@@ -331,10 +331,11 @@ class ConfigStore {
     await _persist();
   }
 
-  /// Battery-saver mode. Android provider events still trigger promptly, but
-  /// the fallback folder traversal is reduced to once every 4 hours. Peer-side
-  /// changes still arrive through the live connection / periodic reconcile.
-  /// Default false.
+  /// Battery-saver mode. Android provider events still trigger after a short
+  /// quiet window, but the single fallback folder traversal is reduced to once
+  /// every 8 hours while connected and disabled while the peer is offline.
+  /// Reconnecting
+  /// performs an immediate catch-up reconcile. Default false.
   bool get batterySaverMode => _data['batterySaverMode'] == true;
 
   Future<void> setBatterySaverMode(bool value) async {

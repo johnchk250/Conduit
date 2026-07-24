@@ -369,7 +369,7 @@ class SyncEngine {
   // [reconcile], flags that gate the periodic tick, and callbacks that flip a
   // host-owned wake lock.
 
-  /// Per-pair periodic reconcile safety-net timers (Roadmap Phase 0.1).
+  /// Per-pair periodic reconcile safety-net timers for local filesystems.
   ///
   /// Sync is otherwise 100% event-driven (a watcher tick, a peer connect, or
   /// an inbound IndexUpdate). If a watcher tick misses an edit — possible on a
@@ -378,8 +378,13 @@ class SyncEngine {
   /// hours. This map holds one long-interval safety-net Timer per pair that
   /// calls [reconcile] while a session is live, closing that hole. Relies on
   /// the existing re-entrancy guard (`if (st.scanning) return;` at the top of
-  /// [reconcile]) and the no-op-invariant (idle folder burns zero sequences),
-  /// so a periodic tick on an already-in-sync pair is free.
+  /// [reconcile]) and the no-op-invariant (idle folder burns zero sequences).
+  ///
+  /// Android SAF deliberately does NOT arm this second timer. Its
+  /// [FolderWatcher] already owns the provider-event stream and the long
+  /// fallback traversal; keeping both mechanisms caused duplicate recursive
+  /// ContentResolver scans and substantial battery use attributed to the
+  /// DocumentsProvider (often Files by Google).
   final _periodicTimers = <String, Timer>{};
   static const _periodicInterval = Duration(minutes: 30);
 
@@ -404,29 +409,46 @@ class SyncEngine {
   /// Watcher poll intervals (Roadmap Phase 0.2 + Battery-Saver Polish).
   ///
   /// Android SAF watching is event-led: ContentObserver notifications trigger
-  /// immediate reconciliation, while these intervals are only fallback scans
-  /// for providers that miss an event. Battery-saver mode stretches that
-  /// safety net further; connection/clipboard liveness is unaffected.
+  /// reconciliation after a short quiet window, while these intervals are only
+  /// fallback scans for providers that miss an event. Battery-saver mode
+  /// stretches that safety net further; connection/clipboard liveness is
+  /// unaffected.
   bool _batterySaverMode = false;
 
   static const _watcherIntervalFast = Duration(seconds: 4);
   static const _watcherIntervalSlow = Duration(seconds: 30);
-  static const _watcherIntervalSafOnline = Duration(minutes: 15);
-  static const _watcherIntervalSafOffline = Duration(hours: 2);
-  static const _watcherIntervalBatterySaver = Duration(hours: 4);
+  // SAF is provider-event first. A full recursive traversal is only a safety
+  // net for providers that miss notifications. When the peer is offline the
+  // fallback is disabled entirely: there is nothing to sync toward, and the
+  // reconnect path performs an immediate full reconcile.
+  static const _watcherIntervalSafOnline = Duration(hours: 4);
+  static const _watcherIntervalSafOffline = Duration.zero;
+  static const _watcherIntervalSafBatterySaver = Duration(hours: 8);
+  static const _watcherIntervalLocalBatterySaver = Duration(hours: 4);
+  // A provider save can produce a long stream of notifications. The first
+  // quiet burst still syncs promptly, but subsequent bursts are grouped so a
+  // camera/database workload cannot recursively traverse the whole tree every
+  // few seconds.
+  static const _safEventDebounce = Duration(seconds: 8);
+  static const _safMinimumSignalInterval = Duration(minutes: 5);
 
   /// The interval to use for a peer that is currently ONLINE, accounting for
   /// battery-saver mode.
   Duration get _onlineInterval {
-    if (_batterySaverMode) return _watcherIntervalBatterySaver;
+    if (_batterySaverMode) {
+      return fs.isAndroidSAF
+          ? _watcherIntervalSafBatterySaver
+          : _watcherIntervalLocalBatterySaver;
+    }
     return fs.isAndroidSAF ? _watcherIntervalSafOnline : _watcherIntervalFast;
   }
 
   /// The interval to use for a peer that is currently OFFLINE, accounting for
   /// battery-saver mode.
   Duration get _offlineInterval {
-    if (_batterySaverMode) return _watcherIntervalBatterySaver;
-    return fs.isAndroidSAF ? _watcherIntervalSafOffline : _watcherIntervalSlow;
+    if (fs.isAndroidSAF) return _watcherIntervalSafOffline;
+    if (_batterySaverMode) return _watcherIntervalLocalBatterySaver;
+    return _watcherIntervalSlow;
   }
 
   /// Toggle battery-saver mode at runtime (called from [AppState] when the
@@ -453,6 +475,12 @@ class SyncEngine {
     final w = FolderWatcher(
       fs: fs,
       rootPath: pair.localPath,
+      debounce: fs.isAndroidSAF
+          ? _safEventDebounce
+          : const Duration(milliseconds: 800),
+      minimumSignalInterval:
+          fs.isAndroidSAF ? _safMinimumSignalInterval : Duration.zero,
+      fallbackSignalsWithoutScan: fs.isAndroidSAF,
       batchListWithStat: batchListWithStat,
     );
     w.changes.listen((_) => _onLocalChange(pair));
@@ -462,16 +490,20 @@ class SyncEngine {
     // scan. In normal mode: start fast if online, slow if offline.
     final startsOffline = pair.peerDeviceId == null ||
         registry.openSessionFor(pair.peerDeviceId!)?.isLinkReady != true;
+    if (fs.isAndroidSAF) {
+      w.setProviderEventsEnabled(!startsOffline);
+    }
     w.setInterval(startsOffline ? _offlineInterval : _onlineInterval);
-    // Phase 0.1: arm the periodic reconcile safety-net for this pair. It only
-    // fires while a live session exists (see _periodicTick) and is a no-op on an
-    // already-in-sync folder (reconcile's re-entrancy guard + no-op-invariant).
+    // Phase 0.1: arm the periodic reconcile safety-net only for local
+    // filesystems. Android SAF already has provider events plus the watcher's
+    // long fallback traversal; adding this timer would duplicate the same full
+    // tree scan.
     _periodicTimers.remove(pair.id)?.cancel();
-    final periodicInterval =
-        fs.isAndroidSAF ? const Duration(hours: 4) : _periodicInterval;
-    _periodicTimers[pair.id] = Timer.periodic(periodicInterval, (_) {
-      _periodicTick(pair);
-    });
+    if (!fs.isAndroidSAF) {
+      _periodicTimers[pair.id] = Timer.periodic(_periodicInterval, (_) {
+        _periodicTick(pair);
+      });
+    }
 
     await _enforceVaultRetentionBestEffort(pair);
     log(pair.id, 'Watching "${pair.localPath}"', SyncEventLevel.info);
@@ -496,8 +528,8 @@ class SyncEngine {
   /// engine is paused, or (c) a reconcile is already running (the re-entrancy
   /// guard inside [reconcile] also catches this). On an in-sync folder the
   /// resulting reconcile burns zero sequences, but it can still traverse the
-  /// filesystem. Android therefore uses a four-hour fallback and relies on SAF
-  /// ContentObserver events for normal responsiveness.
+  /// filesystem. Android SAF does not use this timer; its watcher owns the
+  /// single fallback path.
   void _periodicTick(FolderPair pair) {
     if (_disposed) return;
     final peerId = pair.peerDeviceId;
@@ -1124,10 +1156,10 @@ class SyncEngine {
   }
 
   /// Flip the watcher cadence for every pair bound to [deviceId] (Roadmap
-  /// Phase 0.2 + Battery-Saver Polish). In battery-saver mode the interval
-  /// never changes — both online/offline use the four-hour SAF fallback. In
-  /// normal mode, local filesystems use 4s/30s and Android SAF uses 15m/2h;
-  /// provider events remain immediate in every mode.
+  /// Phase 0.2 + Battery-Saver Polish). Local filesystems use 4s/30s. Android
+  /// SAF uses provider events, one 4h fallback while online (8h in battery
+  /// saver), and neither provider observation nor periodic traversal while
+  /// offline; reconnect itself performs the catch-up scan and re-arms events.
   ///
   /// Safe against partial states: a pair whose peer matches [deviceId] but has
   /// no watcher yet is a no-op, as is a watcher whose interval is already the
@@ -1136,7 +1168,12 @@ class SyncEngine {
     final target = online ? _onlineInterval : _offlineInterval;
     for (final pair in config.folderPairs) {
       if (pair.peerDeviceId != deviceId) continue;
-      _watchers[pair.id]?.setInterval(target);
+      final watcher = _watchers[pair.id];
+      if (watcher == null) continue;
+      if (fs.isAndroidSAF) {
+        watcher.setProviderEventsEnabled(online);
+      }
+      watcher.setInterval(target);
     }
   }
 

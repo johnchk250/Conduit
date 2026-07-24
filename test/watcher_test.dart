@@ -88,7 +88,7 @@ void main() {
     final w = FolderWatcher(
       fs: fs,
       rootPath: root,
-      interval: const Duration(minutes: 15),
+      interval: const Duration(hours: 4),
     );
 
     // The engine seeds the signature during its initial reconcile, so starting
@@ -97,12 +97,12 @@ void main() {
     w.start();
     expect(fs.listCalls, 0);
 
-    w.setInterval(const Duration(hours: 2));
+    w.setInterval(Duration.zero);
     await Future<void>.delayed(const Duration(milliseconds: 20));
     expect(fs.listCalls, 0,
-        reason: 'disconnect/battery backoff must not traverse the SAF tree');
+        reason: 'disabling offline fallback polling must not traverse SAF');
 
-    w.setInterval(const Duration(minutes: 15));
+    w.setInterval(const Duration(hours: 4));
     await Future<void>.delayed(const Duration(milliseconds: 20));
     expect(fs.listCalls, 0,
         reason: 'the engine reconcile owns SAF reconnect catch-up; the watcher '
@@ -150,6 +150,105 @@ void main() {
 
     expect(emitted, hasLength(1));
     expect(fs.started, [root]);
+    await sub.cancel();
+    await w.stop();
+    expect(fs.stopped, [root]);
+  });
+
+  test('disabled SAF fallback keeps provider events active without polling',
+      () async {
+    const root = 'content://tree/primary%3AOffline';
+    final fs = _CountingEventSafFs({'a.txt': _b('hello')});
+    final emitted = <Null>[];
+    final w = FolderWatcher(
+      fs: fs,
+      rootPath: root,
+      interval: Duration.zero,
+      debounce: const Duration(milliseconds: 10),
+    );
+    final sub = w.changes.listen((_) => emitted.add(null));
+
+    w.seedSignature(1);
+    w.start();
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    expect(w.isRunning, isTrue,
+        reason: 'event watching remains active with polling disabled');
+    expect(fs.listCalls, 0,
+        reason: 'an offline SAF folder must not be recursively traversed');
+
+    fs.notify(root);
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+    expect(emitted, hasLength(1),
+        reason: 'provider hints remain armed while fallback polling is off');
+    expect(fs.listCalls, 0,
+        reason: 'the hint itself should wake the engine, not pre-scan here');
+
+    await sub.cancel();
+    await w.stop();
+  });
+
+  test('SAF fallback emits one reconcile hint without pre-scanning the tree',
+      () async {
+    const root = 'content://tree/primary%3AFallback';
+    final fs = _CountingSafFs({'a.txt': _b('hello')});
+    final emitted = <Null>[];
+    final w = FolderWatcher(
+      fs: fs,
+      rootPath: root,
+      interval: const Duration(milliseconds: 25),
+      debounce: const Duration(milliseconds: 5),
+      fallbackSignalsWithoutScan: true,
+    );
+    final sub = w.changes.listen((_) => emitted.add(null));
+
+    // Production seeds this during the engine's initial reconcile.
+    w.seedSignature(1);
+    w.start();
+    await Future<void>.delayed(const Duration(milliseconds: 70));
+
+    expect(emitted, isNotEmpty,
+        reason: 'the fallback must still request an authoritative reconcile');
+    expect(fs.listCalls, 0,
+        reason: 'the watcher must not enumerate SAF immediately before the '
+            'engine performs the real scan');
+
+    await sub.cancel();
+    await w.stop();
+  });
+
+  test('offline SAF watcher does not register provider observation', () async {
+    const root = 'content://tree/primary%3ANoPeer';
+    final fs = _EventSafFs({'a.txt': _b('hello')});
+    final emitted = <Null>[];
+    final w = FolderWatcher(
+      fs: fs,
+      rootPath: root,
+      interval: Duration.zero,
+      debounce: const Duration(milliseconds: 10),
+    );
+    final sub = w.changes.listen((_) => emitted.add(null));
+
+    w.seedSignature(1);
+    w.setProviderEventsEnabled(false);
+    w.start();
+    expect(fs.started, isEmpty,
+        reason: 'an offline pair should not wake the DocumentsProvider');
+
+    w.setProviderEventsEnabled(true);
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    expect(fs.started, [root]);
+    fs.notify(root);
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+    expect(emitted, hasLength(1));
+
+    w.setProviderEventsEnabled(false);
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(fs.stopped, [root]);
+    fs.notify(root);
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+    expect(emitted, hasLength(1),
+        reason: 'offline provider notifications must no longer wake sync');
+
     await sub.cancel();
     await w.stop();
     expect(fs.stopped, [root]);
@@ -243,12 +342,23 @@ class _EventSafFs extends _SafLikeFs implements FileSystemChangeSource {
   @override
   Future<void> stopWatching(String rootPath) async {
     stopped.add(rootPath);
-    await _changes.close();
   }
 }
 
 class _CountingSafFs extends _SafLikeFs {
   _CountingSafFs(super.files);
+
+  int listCalls = 0;
+
+  @override
+  Future<List<String>> listFiles(String rootPath) async {
+    listCalls += 1;
+    return super.listFiles(rootPath);
+  }
+}
+
+class _CountingEventSafFs extends _EventSafFs {
+  _CountingEventSafFs(super.files);
 
   int listCalls = 0;
 
