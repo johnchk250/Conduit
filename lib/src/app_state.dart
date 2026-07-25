@@ -702,6 +702,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       self: _identity,
       listenPort: port,
       onPeer: (peer) {
+        PairedPeer? paired;
+        for (final candidate in _config.pairedPeers) {
+          if (candidate.deviceId == peer.deviceId) {
+            paired = candidate;
+            break;
+          }
+        }
+        // Discovery packets are public and unauthenticated. A packet claiming
+        // a paired device id with a different pinned key must never replace a
+        // reconnect route or trigger a dial.
+        if (paired != null && paired.publicKeyB64 != peer.publicKeyB64) {
+          Diag.session('discovery_identity_mismatch', peer: peer.deviceId);
+          return;
+        }
+
         final previous = _discoveredPeers[peer.deviceId];
         final changed = previous == null ||
             previous.address.address != peer.address.address ||
@@ -711,13 +726,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
             previous.name != peer.name;
         _discoveredPeers[peer.deviceId] = peer;
         if (changed) {
-          unawaited(_config
-              .rememberPeerEndpoint(
-                deviceId: peer.deviceId,
-                address: peer.address.address,
-                port: peer.port,
-              )
-              .catchError((_) {}));
+          // Discovery supplies a candidate route, but it is unauthenticated.
+          // Keep it in memory for an immediate dial and persist it only after
+          // the pinned secure handshake succeeds in _onSessionReady.
           notifyListeners();
         }
         if (_networkingReady) {
@@ -727,6 +738,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         }
       },
       onNetworkChanged: _onHostInterfaceChanged,
+      recoveryDeviceIds: () => _config.pairedPeers.map((peer) => peer.deviceId),
+      recoveryProbeAddresses: _savedRecoveryAddresses,
+      shouldSweepSubnet: () => _config.pairedPeers.any(
+        (peer) => _registry.openSessionFor(peer.deviceId) == null,
+      ),
     );
     await _discovery!.start();
     if (_config.bluetoothEnabled) {
@@ -1020,8 +1036,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       for (final peer in candidates.values) {
         if (_registry.openSessionFor(peerId) != null) return;
         try {
-          final session = await _connectTarget(peer);
-          await _rememberSessionEndpoint(session, peer);
+          await _connectTarget(peer);
           _bluetoothAttemptStatus = null;
           notifyListeners();
           return;
@@ -1115,7 +1130,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
     _setConnecting(_connectingPeerIds, peerId, true);
     try {
-      final session = await _connections.connectMultiHost(
+      await _connections.connectMultiHost(
         deviceId: paired.deviceId,
         name: paired.name,
         platform: paired.platform,
@@ -1123,19 +1138,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         hosts: hosts,
         port: port,
         forceTakeover: true,
-      );
-      await _config.rememberPeerEndpoint(
-        deviceId: peerId,
-        address: session.remoteAddress,
-        port: port,
-      );
-      _discoveredPeers[peerId] = DiscoveredPeer(
-        deviceId: paired.deviceId,
-        name: paired.name,
-        platform: paired.platform,
-        address: InternetAddress(session.remoteAddress),
-        port: port,
-        publicKeyB64: paired.publicKeyB64,
       );
       notifyListeners();
     } catch (error) {
@@ -1187,11 +1189,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         final e2 = _registry.openSessionFor(id);
         if (e2 != null) return;
       }
-      final session = await _connectTarget(
+      await _connectTarget(
         peer,
         forceTakeover: isLanUpgrade,
       );
-      unawaited(_rememberSessionEndpoint(session, peer));
     } catch (e) {
       Diag.session('auto_dial_failed',
           peer: id, fields: {'error': e.toString()});
@@ -1222,17 +1223,66 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         forceTakeover: forceTakeover,
       );
     }
-    return _connections.connect(
-      target: peer,
-      pairCode: pairCode,
-      forceTakeover: forceTakeover,
-    );
+
+    Object? lastError;
+    final candidates = _lanCandidatesFor(peer);
+    for (final candidate in candidates) {
+      try {
+        return await _connections.connect(
+          target: candidate,
+          pairCode: pairCode,
+          forceTakeover: forceTakeover,
+        );
+      } catch (error) {
+        lastError = error;
+        Diag.session(
+          'lan_route_failed',
+          peer: peer.deviceId,
+          fields: {
+            'address': candidate.address.address,
+            'port': candidate.port,
+            'error': error.toString(),
+          },
+        );
+      }
+    }
+    throw lastError ?? StateError('No LAN route connected for ${peer.name}.');
   }
 
-  Future<void> _rememberSessionEndpoint(
-      PeerSession session, DiscoveredPeer source) async {
+  List<DiscoveredPeer> _lanCandidatesFor(DiscoveredPeer seed) {
+    if (seed.transport != ConnectionTransport.lan) return <DiscoveredPeer>[seed];
+    final candidates = <DiscoveredPeer>[];
+    final seen = <String>{};
+
+    void add(DiscoveredPeer candidate) {
+      final key = '${candidate.address.address}:${candidate.port}';
+      if (candidate.port <= 0 || !seen.add(key)) return;
+      candidates.add(candidate);
+    }
+
+    add(seed);
+    final current = _discoveredPeers[seed.deviceId];
+    if (current != null && current.transport == ConnectionTransport.lan) {
+      add(current);
+    }
+    for (final endpoint in _config.peerEndpointCandidates(seed.deviceId)) {
+      try {
+        add(DiscoveredPeer(
+          deviceId: seed.deviceId,
+          name: seed.name,
+          platform: seed.platform,
+          address: InternetAddress(endpoint['address'] as String),
+          port: endpoint['port'] as int,
+          publicKeyB64: seed.publicKeyB64,
+        ));
+      } catch (_) {}
+    }
+    return candidates;
+  }
+
+  Future<void> _rememberSessionEndpoint(PeerSession session) async {
     if (session.transport == ConnectionTransport.bluetooth) {
-      final endpoint = session.transportEndpoint ?? source.transportEndpoint;
+      final endpoint = session.transportEndpoint;
       if (endpoint != null) {
         await _config.rememberPeerBluetoothEndpoint(
           deviceId: session.peer.deviceId,
@@ -1251,10 +1301,25 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       }
       return;
     }
+
+    final port = session.remoteListenPort;
+    if (port == null || port <= 0) {
+      // An incoming connection from an older build exposes only an ephemeral
+      // source port. Do not poison the saved reconnect route with it.
+      return;
+    }
     await _config.rememberPeerEndpoint(
       deviceId: session.peer.deviceId,
       address: session.remoteAddress,
-      port: source.port,
+      port: port,
+    );
+    _discoveredPeers[session.peer.deviceId] = DiscoveredPeer(
+      deviceId: session.peer.deviceId,
+      name: session.peer.name,
+      platform: session.peer.platform,
+      address: InternetAddress(session.remoteAddress),
+      port: port,
+      publicKeyB64: session.peer.publicKeyB64,
     );
   }
 
@@ -1306,13 +1371,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _bluetoothDialTimers.remove(id)?.cancel();
     _bluetoothAttemptStatus = null;
     final replaced = _registry.publish(id, session);
-    if (session.transport == ConnectionTransport.bluetooth &&
-        session.transportEndpoint != null) {
-      unawaited(_config.rememberPeerBluetoothEndpoint(
-        deviceId: id,
-        endpointId: session.transportEndpoint!,
-      ));
-    }
+    // Every authenticated session teaches the owner how to reach the peer
+    // again. LAN saves the observed address plus the stable port exchanged
+    // inside the secure channel; Bluetooth saves its native endpoint id.
+    unawaited(_rememberSessionEndpoint(session).catchError((Object error) {
+      Diag.session('remember_authenticated_route_failed',
+          peer: id, fields: {'error': error.toString()});
+    }));
     if (replaced != null && !identical(replaced, session)) {
       // A previous session is being replaced. Cancel its in-flight sync work
       // BEFORE wiring up the new session, so the old manifest waiters / chunk
@@ -1500,6 +1565,28 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       Diag.log('connection_wakelock_acquire_error',
           fields: {'error': e.toString()});
     });
+  }
+
+  Iterable<InternetAddress> _savedRecoveryAddresses() sync* {
+    final seen = <String>{};
+    for (final peer in _config.pairedPeers) {
+      final discovered = _discoveredPeers[peer.deviceId];
+      if (discovered != null &&
+          discovered.transport == ConnectionTransport.lan &&
+          seen.add(discovered.address.address)) {
+        yield discovered.address;
+      }
+      for (final endpoint in _config.peerEndpointCandidates(peer.deviceId)) {
+        try {
+          final address = InternetAddress(endpoint['address'] as String);
+          if (address.type == InternetAddressType.IPv4 &&
+              !address.isLoopback &&
+              seen.add(address.address)) {
+            yield address;
+          }
+        } catch (_) {}
+      }
+    }
   }
 
   void _seedDiscoveredPeersFromSavedEndpoints() {
@@ -2055,20 +2142,40 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  List<DiscoveredPeer> _reconnectTargetsFor(PairedPeer peer) {
+    final targets = <DiscoveredPeer>[];
+    final lan = _discoveredPeers[peer.deviceId] ??
+        _discoveredPeerFromSavedEndpoint(peer);
+    if (lan != null) targets.add(lan);
+    targets.addAll(
+      _bluetoothPeers.values.where((item) => item.deviceId == peer.deviceId),
+    );
+    return targets;
+  }
+
   Future<void> reconnectPeer(PairedPeer peer) async {
     _suppressedPeerIds.remove(peer.deviceId);
     final existing = _registry.openSessionFor(peer.deviceId);
     if (existing != null) return;
-    final targets = <DiscoveredPeer>[
-      if (_discoveredPeers[peer.deviceId] ??
-              _discoveredPeerFromSavedEndpoint(peer)
-          case final target?)
-        target,
-      ..._bluetoothPeers.values.where((p) => p.deviceId == peer.deviceId),
-    ];
+    var targets = _reconnectTargetsFor(peer);
+    if (targets.isEmpty) {
+      // A remembered identity without a current route is not a pairing error.
+      // Run all discovery layers and briefly wait for a probe reply instead of
+      // forcing the user back through QR pairing.
+      _discovery?.beginRecovery();
+      _activateNetworkRecovery(const Duration(seconds: 75));
+      final deadline = DateTime.now().add(const Duration(seconds: 8));
+      while (targets.isEmpty && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        if (_registry.openSessionFor(peer.deviceId) != null) return;
+        targets = _reconnectTargetsFor(peer);
+      }
+    }
     if (targets.isEmpty) {
       throw StateError(
-          'No LAN or Bluetooth route for ${peer.name}. Open Conduit on that device.');
+        'No route found for ${peer.name}. Keep Conduit open on both devices '
+        'and check that the Wi-Fi allows device-to-device traffic.',
+      );
     }
     if (_connectingPeerIds.contains(peer.deviceId)) return;
     _setConnecting(_connectingPeerIds, peer.deviceId, true);
@@ -2076,8 +2183,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       Object? lastError;
       for (final target in targets) {
         try {
-          final session = await _connectTarget(target, forceTakeover: true);
-          await _rememberSessionEndpoint(session, target);
+          await _connectTarget(target, forceTakeover: true);
           return;
         } catch (e) {
           lastError = e;
@@ -2963,12 +3069,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _suppressedPeerIds.remove(peer.deviceId);
     final alreadyPaired =
         _config.pairedPeers.any((p) => p.deviceId == peer.deviceId);
-    final session = await _connectTarget(
+    await _connectTarget(
       peer,
       pairCode: pairCode.isEmpty ? null : pairCode,
       forceTakeover: alreadyPaired,
     );
-    await _rememberSessionEndpoint(session, peer);
     notifyListeners();
   }
 
@@ -2992,11 +3097,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       pairCode: pairingPhrase,
     );
     _suppressedPeerIds.remove(session.peer.deviceId);
-    await _config.rememberPeerEndpoint(
-      deviceId: session.peer.deviceId,
-      address: session.remoteAddress,
-      port: port,
-    );
+    // _onSessionReady persists the authenticated remote address and the
+    // stable listener port exchanged inside the secure channel.
     notifyListeners();
   }
 
@@ -3079,7 +3181,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     Object? lastError;
     if (decoded.hosts.isNotEmpty) {
       try {
-        final session = await _connections.connectMultiHost(
+        await _connections.connectMultiHost(
           deviceId: decoded.peer.deviceId,
           name: decoded.peer.name,
           platform: decoded.peer.platform,
@@ -3088,11 +3190,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           port: decoded.peer.port,
           pairCode: pairCode.isEmpty ? null : pairCode,
           forceTakeover: alreadyPaired,
-        );
-        await _config.rememberPeerEndpoint(
-          deviceId: decoded.peer.deviceId,
-          address: session.remoteAddress,
-          port: decoded.peer.port,
         );
         notifyListeners();
         return;
@@ -3119,12 +3216,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           transportEndpoint: endpoint,
         );
         try {
-          final session = await _connectTarget(
+          await _connectTarget(
             target,
             pairCode: pairCode.isEmpty ? null : pairCode,
             forceTakeover: alreadyPaired,
           );
-          await _rememberSessionEndpoint(session, target);
           notifyListeners();
           return;
         } catch (error) {

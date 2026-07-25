@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import '../core/identity.dart';
 import 'secure_handshake.dart';
@@ -48,6 +49,9 @@ class Discovery {
     this.interval = const Duration(seconds: 3),
     required this.onPeer,
     this.onNetworkChanged,
+    this.recoveryDeviceIds,
+    this.recoveryProbeAddresses,
+    this.shouldSweepSubnet,
   });
 
   final DeviceIdentity self;
@@ -61,7 +65,22 @@ class Discovery {
   /// laptops moving between home, office, VPN, and dock networks.
   final void Function()? onNetworkChanged;
 
+  /// Paired identities that should answer an active recovery probe. Keeping
+  /// the target list in the packet avoids waking unrelated Conduit devices on
+  /// a busy LAN, while an empty list remains backwards-compatible.
+  final Iterable<String> Function()? recoveryDeviceIds;
+
+  /// Last-known peer addresses. Recovery sends a tiny unicast UDP probe to
+  /// these in addition to broadcast/multicast, which works on networks that
+  /// filter one or both group-delivery mechanisms.
+  final Iterable<InternetAddress> Function()? recoveryProbeAddresses;
+
+  /// Lets the owner cancel the bounded subnet fallback if all paired peers
+  /// connected through a cheaper route before the delayed sweep begins.
+  final bool Function()? shouldSweepSubnet;
+
   RawDatagramSocket? _socket;
+  final Set<InternetAddress> _directedBroadcasts = <InternetAddress>{};
   StreamSubscription<RawSocketEvent>? _socketSubscription;
   Future<void>? _networkRefresh;
   bool _running = false;
@@ -73,6 +92,12 @@ class Discovery {
 
   static const _sweepInterval = Duration(minutes: 1);
   static const _staleAfter = Duration(minutes: 5);
+  static final InternetAddress _multicastGroup =
+      InternetAddress('239.255.42.99');
+  Future<void>? _subnetSweep;
+  Timer? _recoverySweepRetryTimer;
+  DateTime? _lastSubnetSweepAt;
+  static const _subnetSweepCooldown = Duration(minutes: 15);
 
   // ---- Beacon backoff (Roadmap Phase 0.3) --------------------------------
   //
@@ -130,7 +155,9 @@ class Discovery {
     final running = _broadcastTimer;
     if (running == null) return;
     running.cancel();
-    if (reannounce) _broadcast();
+    if (reannounce) {
+      _sendRecoveryBurst(scanSubnet: true, scheduleSweepRetry: true);
+    }
     _scheduleBroadcast();
   }
 
@@ -142,7 +169,13 @@ class Discovery {
     final running = _broadcastTimer;
     if (running == null) return;
     running.cancel();
-    if (enabled) _broadcast();
+    if (enabled) {
+      _sendRecoveryBurst(
+        scanSubnet: true,
+        forceSubnetSweep: true,
+        scheduleSweepRetry: true,
+      );
+    }
     _scheduleBroadcast();
   }
 
@@ -150,7 +183,10 @@ class Discovery {
     _running = true;
     await _bindSocket();
 
-    _broadcast(); // immediate first beacon
+    // Immediate announcement plus a directed recovery probe. When cheaper
+    // routes fail, one bounded private-/24 UDP sweep lets either platform find
+    // a peer even when the router drops broadcast or multicast packets.
+    _sendRecoveryBurst(scanSubnet: true, scheduleSweepRetry: true);
     _scheduleBroadcast();
 
     // Sweep stale peers out periodically. On desktop, also watch the local
@@ -201,7 +237,11 @@ class Discovery {
       return;
     }
     _broadcastTimer?.cancel();
-    _broadcast();
+    _subnetSweep = null;
+    _recoverySweepRetryTimer?.cancel();
+    _recoverySweepRetryTimer = null;
+    _lastSubnetSweepAt = null;
+    _sendRecoveryBurst(scanSubnet: true, scheduleSweepRetry: true);
     _scheduleBroadcast();
   }
 
@@ -247,10 +287,12 @@ class Discovery {
     }
     _socket?.close();
     _socket = null;
+    _directedBroadcasts.clear();
 
     final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, port);
     socket.broadcastEnabled = true;
     _socket = socket;
+    await _joinMulticast(socket);
     _socketSubscription = socket.listen((event) {
       if (event != RawSocketEvent.read || !identical(_socket, socket)) return;
       final dg = socket.receive();
@@ -271,7 +313,12 @@ class Discovery {
     _socketSubscription = null;
     _socket?.close();
     _socket = null;
+    _directedBroadcasts.clear();
     _networkRefresh = null;
+    _subnetSweep = null;
+    _recoverySweepRetryTimer?.cancel();
+    _recoverySweepRetryTimer = null;
+    _lastSubnetSweepAt = null;
     _seen.clear();
   }
 
@@ -281,7 +328,10 @@ class Discovery {
   /// may have changed (new Wi-Fi, woke from Doze) and our beacon was missed.
   void reannounce() {
     if (_socket == null) return; // not started yet, or stopped
-    _broadcast();
+    // App resume is another chance to recover from a PC reboot that happened
+    // while Android was asleep. The cooldown keeps this from becoming a
+    // repeated subnet scan when an unrelated paired device stays offline.
+    _sendRecoveryBurst(scanSubnet: true);
   }
 
   void _scheduleBroadcast() {
@@ -293,45 +343,255 @@ class Discovery {
     });
   }
 
+  Map<String, dynamic> _discoveryPayload(String kind) => {
+        'v': 1,
+        'kind': kind,
+        'secureTransportVersion': secureTransportVersion,
+        'deviceId': self.deviceId,
+        'name': self.name,
+        'platform': self.platform,
+        'pubKey': self.publicKeyB64,
+        'port': listenPort,
+        if (kind == 'probe')
+          'targets': recoveryDeviceIds?.call().toSet().toList() ??
+              const <String>[],
+      };
+
   void _broadcast() {
-    final payload = jsonEncode({
-      'v': 1,
-      'secureTransportVersion': secureTransportVersion,
-      'deviceId': self.deviceId,
-      'name': self.name,
-      'platform': self.platform,
-      'pubKey': self.publicKeyB64,
-      'port': listenPort,
-    });
-    try {
-      _socket?.send(
-        utf8.encode(payload),
-        InternetAddress('255.255.255.255'),
-        port,
-      );
-    } catch (_) {
-      // ignore transient send failures
+    _sendGroupPayload(_discoveryPayload('announce'));
+  }
+
+  void _sendRecoveryBurst({
+    bool scanSubnet = false,
+    bool forceSubnetSweep = false,
+    bool scheduleSweepRetry = false,
+  }) {
+    _broadcast();
+    final probe = _discoveryPayload('probe');
+    _sendGroupPayload(probe, includeSavedRoutes: true);
+    if (scanSubnet) {
+      _scheduleSubnetSweep(probe, force: forceSubnetSweep);
+      if (scheduleSweepRetry) _scheduleRecoverySweepRetry(probe);
     }
+  }
+
+  void _scheduleRecoverySweepRetry(Map<String, dynamic> probe) {
+    _recoverySweepRetryTimer?.cancel();
+    if (shouldSweepSubnet != null && !shouldSweepSubnet!()) return;
+    _recoverySweepRetryTimer = Timer(const Duration(seconds: 20), () {
+      _recoverySweepRetryTimer = null;
+      if (!_running ||
+          (shouldSweepSubnet != null && !shouldSweepSubnet!())) {
+        return;
+      }
+      // The first sweep may have happened before the peer's service finished
+      // starting after boot. One forced retry keeps recovery bounded while
+      // covering that startup race.
+      _scheduleSubnetSweep(probe, force: true);
+    });
+  }
+
+  void _sendGroupPayload(
+    Map<String, dynamic> payload, {
+    bool includeSavedRoutes = false,
+  }) {
+    final socket = _socket;
+    if (socket == null) return;
+    final bytes = utf8.encode(jsonEncode(payload));
+    final destinations = <String, InternetAddress>{
+      '255.255.255.255': InternetAddress('255.255.255.255'),
+      _multicastGroup.address: _multicastGroup,
+      for (final address in _directedBroadcasts) address.address: address,
+    };
+    if (includeSavedRoutes) {
+      for (final address
+          in recoveryProbeAddresses?.call() ?? const <InternetAddress>[]) {
+        if (address.type == InternetAddressType.IPv4 && !address.isLoopback) {
+          destinations[address.address] = address;
+        }
+      }
+    }
+    for (final address in destinations.values) {
+      try {
+        socket.send(bytes, address, port);
+      } catch (_) {
+        // A VPN adapter or a network transition can reject one destination;
+        // the other discovery channels and the next recovery burst remain.
+      }
+    }
+  }
+
+  void _sendUnicastAnnouncement(InternetAddress address, int replyPort) {
+    final socket = _socket;
+    if (socket == null || replyPort <= 0 || replyPort > 65535) return;
+    try {
+      socket.send(
+        utf8.encode(jsonEncode(_discoveryPayload('announce'))),
+        address,
+        replyPort,
+      );
+    } catch (_) {}
   }
 
   void _handleDatagram(Datagram dg) {
     try {
       final j = jsonDecode(utf8.decode(dg.data)) as Map<String, dynamic>;
       if (j['v'] != 1) return;
-      final id = j['deviceId'] as String;
-      if (id == self.deviceId) return; // ourselves
+      final id = j['deviceId'];
+      final name = j['name'];
+      final platform = j['platform'];
+      final publicKey = j['pubKey'];
+      final advertisedPort = j['port'];
+      if (id is! String ||
+          id == self.deviceId ||
+          name is! String ||
+          platform is! String ||
+          publicKey is! String ||
+          advertisedPort is! num) {
+        return;
+      }
+      final tcpPort = advertisedPort.toInt();
+      if (tcpPort <= 0 || tcpPort > 65535) return;
       _seen[id] = DateTime.now();
       onPeer(DiscoveredPeer(
         deviceId: id,
-        name: j['name'] as String,
-        platform: j['platform'] as String,
+        name: name,
+        platform: platform,
         address: dg.address,
-        port: j['port'] as int,
-        publicKeyB64: j['pubKey'] as String,
+        port: tcpPort,
+        publicKeyB64: publicKey,
       ));
+
+      // A probe is both an announcement from its sender and an explicit
+      // request for a direct reply. The unicast response is important on
+      // routers that permit client-to-client traffic but filter broadcasts.
+      final kind = j['kind'] as String? ?? 'announce';
+      if (kind == 'probe') {
+        final targets = (j['targets'] as List?)?.whereType<String>().toSet() ??
+            const <String>{};
+        if (targets.isEmpty || targets.contains(self.deviceId)) {
+          final jitter = Random().nextInt(180);
+          Timer(Duration(milliseconds: jitter), () {
+            if (_running) _sendUnicastAnnouncement(dg.address, dg.port);
+          });
+        }
+      }
     } catch (_) {
       // malformed beacon — ignore
     }
+  }
+
+  Future<void> _joinMulticast(RawDatagramSocket socket) async {
+    var joined = false;
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+        includeLinkLocal: false,
+      );
+      for (final interface in interfaces) {
+        try {
+          socket.joinMulticast(_multicastGroup, interface);
+          joined = true;
+        } catch (_) {}
+        for (final address in interface.addresses) {
+          final parts = address.address.split('.');
+          if (parts.length == 4 && _isPrivateIpv4(parts)) {
+            _directedBroadcasts.add(InternetAddress(
+              '${parts[0]}.${parts[1]}.${parts[2]}.255',
+            ));
+          }
+        }
+      }
+    } catch (_) {}
+    if (!joined) {
+      try {
+        socket.joinMulticast(_multicastGroup);
+      } catch (_) {}
+    }
+  }
+
+  void _scheduleSubnetSweep(
+    Map<String, dynamic> probe, {
+    bool force = false,
+  }) {
+    if (!_running || _subnetSweep != null) return;
+    final now = DateTime.now();
+    final last = _lastSubnetSweepAt;
+    if (!force &&
+        last != null &&
+        now.difference(last) < _subnetSweepCooldown) {
+      return;
+    }
+    _lastSubnetSweepAt = now;
+    final operation = _runSubnetSweep(probe);
+    _subnetSweep = operation;
+    void clearSweep() {
+      if (identical(_subnetSweep, operation)) _subnetSweep = null;
+    }
+
+    operation.then<void>(
+      (_) => clearSweep(),
+      onError: (Object _, StackTrace __) => clearSweep(),
+    );
+  }
+
+  Future<void> _runSubnetSweep(Map<String, dynamic> probe) async {
+    // Give normal broadcast/multicast and saved-route probes a head start.
+    await Future<void>.delayed(const Duration(seconds: 2));
+    if (!_running || (shouldSweepSubnet != null && !shouldSweepSubnet!())) {
+      return;
+    }
+    final socket = _socket;
+    if (socket == null) return;
+    final prefixes = <String>{};
+    final ownAddresses = <String>{};
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+        includeLinkLocal: false,
+      );
+      for (final interface in interfaces) {
+        for (final address in interface.addresses) {
+          final parts = address.address.split('.');
+          if (parts.length != 4 || !_isPrivateIpv4(parts)) continue;
+          ownAddresses.add(address.address);
+          prefixes.add('${parts[0]}.${parts[1]}.${parts[2]}');
+          if (prefixes.length >= 4) break;
+        }
+        if (prefixes.length >= 4) break;
+      }
+    } catch (_) {
+      return;
+    }
+    if (prefixes.isEmpty) return;
+    final bytes = utf8.encode(jsonEncode(probe));
+    var sent = 0;
+    for (final prefix in prefixes) {
+      for (var host = 1; host < 255; host++) {
+        if (!_running || !identical(_socket, socket)) return;
+        final candidate = '$prefix.$host';
+        if (ownAddresses.contains(candidate)) continue;
+        try {
+          socket.send(bytes, InternetAddress(candidate), port);
+        } catch (_) {}
+        sent++;
+        if (sent % 32 == 0) {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
+      }
+    }
+  }
+
+  bool _isPrivateIpv4(List<String> parts) {
+    final values = parts.map(int.tryParse).toList();
+    if (values.any((value) => value == null)) return false;
+    final a = values[0]!;
+    final b = values[1]!;
+    return a == 10 ||
+        (a == 172 && b >= 16 && b <= 31) ||
+        (a == 192 && b == 168);
   }
 
   void _sweep() {

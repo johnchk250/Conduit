@@ -207,38 +207,91 @@ class ConfigStore {
     await _persist();
   }
 
+  /// Best known LAN endpoint for [deviceId].
+  ///
+  /// Older builds stored one map per peer. Current builds retain a small,
+  /// ordered history so a laptop/phone can try the address it used at home,
+  /// work, or a previous DHCP lease without re-pairing. Production callers
+  /// persist routes only after the pinned secure handshake succeeds, so the
+  /// first entry is the most recently authenticated route.
   Map<String, dynamic>? peerEndpoint(String deviceId) {
-    final rawEndpoints = _data['peerEndpoints'];
-    if (rawEndpoints is! Map) return null;
-    final raw = rawEndpoints[deviceId];
-    if (raw is! Map) return null;
-    final address = raw['address'];
-    final port = raw['port'];
-    if (address is! String || address.isEmpty || port is! num) return null;
-    return <String, dynamic>{'address': address, 'port': port.toInt()};
+    final candidates = peerEndpointCandidates(deviceId);
+    return candidates.isEmpty ? null : candidates.first;
   }
 
+  /// Ordered LAN routes for [deviceId], newest/most successful first.
+  ///
+  /// The returned maps always contain `address` and integer `port`; timestamps
+  /// are preserved when available for diagnostics and ordering. This method is
+  /// intentionally backwards-compatible with the legacy single-map shape.
+  List<Map<String, dynamic>> peerEndpointCandidates(String deviceId) {
+    final rawEndpoints = _data['peerEndpoints'];
+    if (rawEndpoints is! Map) return const <Map<String, dynamic>>[];
+    final raw = rawEndpoints[deviceId];
+    final items = raw is List
+        ? raw
+        : raw is Map
+            ? <dynamic>[raw]
+            : const <dynamic>[];
+    final out = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    for (final item in items) {
+      if (item is! Map) continue;
+      final address = item['address'];
+      final port = item['port'];
+      if (address is! String || address.isEmpty || port is! num) continue;
+      final intPort = port.toInt();
+      if (intPort <= 0 || intPort > 65535) continue;
+      final key = '$address:$intPort';
+      if (!seen.add(key)) continue;
+      out.add(<String, dynamic>{
+        'address': address,
+        'port': intPort,
+        if (item['updatedAt'] is String) 'updatedAt': item['updatedAt'],
+        if (item['lastSuccessfulAt'] is String)
+          'lastSuccessfulAt': item['lastSuccessfulAt'],
+      });
+    }
+    return out;
+  }
+
+  /// Remember a LAN route without discarding previously working addresses.
+  ///
+  /// Call this only after the pinned secure handshake has completed. The route
+  /// is promoted to the front and marked as a successful endpoint; public UDP
+  /// discovery candidates stay in memory until authentication succeeds.
   Future<void> rememberPeerEndpoint({
     required String deviceId,
     required String address,
     required int port,
   }) async {
-    if (address.isEmpty || port <= 0) return;
+    if (address.isEmpty || port <= 0 || port > 65535) return;
+    final now = DateTime.now().toIso8601String();
+    final existingCandidates = peerEndpointCandidates(deviceId);
+    final candidates = existingCandidates
+        .where((entry) =>
+            entry['address'] != address || (entry['port'] as int) != port)
+        .map(Map<String, dynamic>.from)
+        .toList();
+    candidates.insert(0, <String, dynamic>{
+      'address': address,
+      'port': port,
+      'updatedAt': now,
+      'lastSuccessfulAt': now,
+    });
+
+    // A few recent routes cover DHCP churn and multiple regular networks while
+    // keeping reconnect attempts bounded. Failed stale routes naturally age
+    // out as newer authenticated routes are promoted.
+    if (candidates.length > 8) {
+      candidates.removeRange(8, candidates.length);
+    }
+
     final rawEndpoints = _data['peerEndpoints'];
     final endpoints = rawEndpoints is Map
         ? Map<String, dynamic>.from(rawEndpoints)
         : <String, dynamic>{};
-    final existing = endpoints[deviceId];
-    if (existing is Map &&
-        existing['address'] == address &&
-        existing['port'] == port) {
-      return;
-    }
-    endpoints[deviceId] = <String, dynamic>{
-      'address': address,
-      'port': port,
-      'updatedAt': DateTime.now().toIso8601String(),
-    };
+    endpoints[deviceId] = candidates;
     _data['peerEndpoints'] = endpoints;
     await _persist();
   }

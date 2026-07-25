@@ -74,10 +74,14 @@ class PeerSession {
     this.features = const [],
     ConnectionTransport transport = ConnectionTransport.lan,
     String? transportEndpoint,
+    int? remoteListenPort,
   }) : generation = _nextGeneration() {
     _sessionTransports[this] = transport;
     if (transportEndpoint != null) {
       _sessionTransportEndpoints[this] = transportEndpoint;
+    }
+    if (remoteListenPort != null) {
+      _sessionRemoteListenPorts[this] = remoteListenPort;
     }
   }
 
@@ -345,6 +349,8 @@ final Expando<ConnectionTransport> _sessionTransports =
     Expando<ConnectionTransport>('connectionTransport');
 final Expando<String> _sessionTransportEndpoints =
     Expando<String>('connectionTransportEndpoint');
+final Expando<int> _sessionRemoteListenPorts =
+    Expando<int>('remoteListenPort');
 
 /// Transport metadata is kept outside the structural [PeerSession] interface.
 /// Test doubles that implement PeerSession therefore remain source-compatible
@@ -354,6 +360,11 @@ extension PeerSessionTransport on PeerSession {
       _sessionTransports[this] ?? ConnectionTransport.lan;
 
   String? get transportEndpoint => _sessionTransportEndpoints[this];
+
+  /// Stable TCP server port advertised by the authenticated remote peer.
+  /// [Socket.remotePort] is only the current connection's ephemeral source
+  /// port and must never be persisted as a reconnect target.
+  int? get remoteListenPort => _sessionRemoteListenPorts[this];
 
   bool get isBandwidthConstrained => transport.isBandwidthConstrained;
 }
@@ -624,6 +635,7 @@ class PeerConnectionManager {
       'name': identity.name,
       'platform': identity.platform,
       'pubKey': identity.publicKeyB64,
+      'listenPort': listenPort,
       'features': supportedPeerFeatures,
       ...secureOffer.toJson(),
     };
@@ -652,9 +664,16 @@ class PeerConnectionManager {
     );
     codec.send({'t': 'secure_switch'});
     codec.enableSecurity(keys);
-    await waitForMessage(codec, 'secure_confirm',
-        timeout: const Duration(seconds: 10));
-    codec.send({'t': 'secure_confirmed'});
+    final secureConfirm = await waitForMessage(
+      codec,
+      'secure_confirm',
+      timeout: const Duration(seconds: 10),
+    );
+    final peerListenPort = _validListenPort(secureConfirm['listenPort']);
+    codec.send({
+      't': 'secure_confirmed',
+      'listenPort': listenPort,
+    });
     if (!isAlreadyPaired) _pendingIncomingPairCode = null;
 
     final peer = PairedPeer(
@@ -674,6 +693,8 @@ class PeerConnectionManager {
       features: features,
       transport: incoming.transport,
       transportEndpoint: incoming.endpointId,
+      remoteListenPort:
+          incoming.transport == ConnectionTransport.lan ? peerListenPort : null,
     );
   }
 
@@ -685,6 +706,7 @@ class PeerConnectionManager {
     List<String> features = const [],
     ConnectionTransport transport = ConnectionTransport.lan,
     String? transportEndpoint,
+    int? remoteListenPort,
   }) {
     final session = PeerSession(
       peer: peer,
@@ -694,6 +716,7 @@ class PeerConnectionManager {
       features: features,
       transport: transport,
       transportEndpoint: transportEndpoint,
+      remoteListenPort: remoteListenPort,
     );
     // The codec is ALREADY being pumped (started in _handleIncoming /
     // _handshake). Its onMessage currently points at the temp handshake
@@ -872,6 +895,7 @@ class PeerConnectionManager {
           timeout: timeout,
           forceTakeover: forceTakeover,
           transport: ConnectionTransport.lan,
+          connectedListenPort: port,
         );
       } catch (e) {
         lastError = e;
@@ -920,6 +944,7 @@ class PeerConnectionManager {
     bool forceTakeover = false,
     ConnectionTransport transport = ConnectionTransport.lan,
     String? transportEndpoint,
+    int? connectedListenPort,
   }) async {
     final codec = FrameCodec(socket);
     final secureOffer = await SecureHandshake.createOffer();
@@ -930,6 +955,7 @@ class PeerConnectionManager {
       'name': identity.name,
       'platform': identity.platform,
       'pubKey': identity.publicKeyB64,
+      'listenPort': listenPort,
       'features': supportedPeerFeatures,
       ...secureOffer.toJson(),
     };
@@ -1008,8 +1034,13 @@ class PeerConnectionManager {
     );
     await waitForMessage(codec, 'secure_switch', timeout: timeout);
     codec.enableSecurity(keys);
-    codec.send({'t': 'secure_confirm'});
-    await waitForMessage(codec, 'secure_confirmed', timeout: timeout);
+    codec.send({
+      't': 'secure_confirm',
+      'listenPort': listenPort,
+    });
+    final secureConfirmed =
+        await waitForMessage(codec, 'secure_confirmed', timeout: timeout);
+    final peerListenPort = _validListenPort(secureConfirmed['listenPort']);
 
     if (expected == null) {
       await config.rememberPeer(peer);
@@ -1023,6 +1054,9 @@ class PeerConnectionManager {
       features: features,
       transport: transport,
       transportEndpoint: transportEndpoint,
+      remoteListenPort: transport == ConnectionTransport.lan
+          ? (peerListenPort ?? connectedListenPort)
+          : null,
     );
     if (!accepted) {
       throw StateError('connection superseded by existing session');
@@ -1035,6 +1069,12 @@ class PeerConnectionManager {
   }
 
   PeerSession? sessionFor(String deviceId) => _active[deviceId];
+}
+
+int? _validListenPort(Object? value) {
+  if (value is! num) return null;
+  final port = value.toInt();
+  return port > 0 && port <= 65535 ? port : null;
 }
 
 String _pairingProof(String secret, Map<String, dynamic> hello) {

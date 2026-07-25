@@ -10,6 +10,23 @@ versioning for published application releases.
   sequentially without enabling connection boost, keeping manual catch-up fast
   while avoiding concurrent Android SAF tree scans.
 
+### Connectivity
+
+- Hardened automatic reconnect across process restarts, DHCP changes, Wi-Fi
+  switches, and missed UDP broadcasts. The encrypted handshake confirmation
+  now exchanges each peer's stable TCP listener port, both incoming and outgoing
+  sessions persist the observed reverse route, and up to eight recent LAN
+  routes are retained and tried before requiring user action.
+- Added layered route discovery: limited broadcast, per-interface directed
+  broadcast, a private LAN multicast group, unicast probes to saved routes,
+  direct replies to recovery probes, and a throttled private-/24 UDP sweep when
+  cheaper discovery paths fail. Recovery performs one bounded delayed retry to
+  cover peer-service startup races; explicit Connection Boost forces a fresh
+  sweep.
+- Reject discovery packets that claim a paired device id with a different
+  pinned public key. Every learned route still has to pass the pinned secure
+  handshake before it is marked successful.
+
 ### Pairing
 
 - Added manual LAN pairing for when UDP discovery is unavailable: enter a
