@@ -35,8 +35,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     final hasPeer = clipboard?.hasConnectedPeer() ?? false;
     final isAndroid = state.identity.platform == 'android';
     final lastReceivedAt = clipboard?.lastReceivedAt;
-    final lastReceivedFrom =
-        _peerName(state, clipboard?.lastReceivedPeerId);
+    final lastReceivedFrom = _peerName(state, clipboard?.lastReceivedPeerId);
     final lastSentAt = clipboard?.lastSentAt;
     final lastError = clipboard?.lastError;
 
@@ -47,7 +46,36 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
         child: ListView(
           padding: const EdgeInsets.fromLTRB(20, 22, 20, 32),
           children: [
-            const GlassPageTitle('Clipboard'),
+            Navigator.canPop(ctx)
+                ? Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: Row(
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.arrow_back_ios_new_rounded),
+                          tooltip: 'Back',
+                          color: c.textPrimary,
+                          iconSize: 20,
+                          onPressed: () => Navigator.pop(ctx),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Clipboard',
+                            style: AppTypography.manrope(
+                              textStyle: TextStyle(
+                                color: c.textPrimary,
+                                fontSize: 22,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: -0.5,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  )
+                : const GlassPageTitle('Clipboard'),
 
             // ---- Master toggle ---------------------------------------------
             GlassListTile(
@@ -218,9 +246,8 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                       icon: isAndroid
                           ? Icons.phone_android_rounded
                           : Icons.visibility_outlined,
-                      label: isAndroid
-                          ? 'Automatic watcher'
-                          : 'Desktop watcher',
+                      label:
+                          isAndroid ? 'Automatic watcher' : 'Desktop watcher',
                       value: isAndroid
                           ? 'Incoming only'
                           : (clipboard?.isPolling == true ? 'Running' : 'Idle'),
