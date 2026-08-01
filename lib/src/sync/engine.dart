@@ -5,6 +5,7 @@ import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 
 import '../core/config_store.dart';
+import '../core/relative_path.dart';
 import '../diag.dart';
 import '../net/peer_registry.dart';
 import '../net/peer_session.dart';
@@ -975,15 +976,7 @@ class SyncEngine {
     return !parts.any((part) => part == '..');
   }
 
-  bool _isSafeRelativePath(String path) {
-    final normalized = path.replaceAll('\\', '/');
-    if (normalized.isEmpty ||
-        normalized.startsWith('/') ||
-        RegExp(r'^[A-Za-z]:').hasMatch(normalized)) {
-      return false;
-    }
-    return !normalized.split('/').any((part) => part == '..' || part.isEmpty);
-  }
+  bool _isSafeRelativePath(String path) => isSyncableRelativePath(path);
 
   Future<void> _enforceVaultRetentionBestEffort(FolderPair pair) async {
     try {
@@ -1777,14 +1770,23 @@ class SyncEngine {
   ) async {
     if (_disposed) return;
     final name = req['name'] as String?;
-    if (name == null) return;
+    if (name == null || !isSyncableRelativePath(name)) {
+      log(pair.id, 'Rejected unsafe block request path: $name',
+          SyncEventLevel.warn);
+      return;
+    }
     final key = _blockKey(pair.id, name);
     var ctrl = _serveStreams[key];
     if (ctrl == null || ctrl.isClosed) {
-      final sourceStat = await fs.stat(pair.localPath, name);
-      var servedRecorded = false;
+      // Publish the request stream before the metadata lookup below. Multiple
+      // pipelined requests can enter this method concurrently; storing the
+      // controller first makes all of them converge on the same serve loop
+      // instead of creating competing controllers and losing requests while
+      // stat() is pending.
       ctrl = StreamController<Map<String, dynamic>>();
       _serveStreams[key] = ctrl;
+      final sourceStat = await fs.stat(pair.localPath, name);
+      var servedRecorded = false;
       // Spawn the serve loop. It owns the file cache for this fetch and
       // responds to each request. `respond` echoes the V2 envelope fields the
       // peer's _BlockSink correlates on (pairId/folderId/name) so a response
@@ -2308,7 +2310,19 @@ class SyncEngine {
     var learned = 0;
     for (final raw in entriesRaw) {
       if (raw is! Map) continue;
-      final entry = IndexEntry.fromJson(raw.cast<String, dynamic>());
+      late final IndexEntry entry;
+      try {
+        entry = IndexEntry.fromJson(raw.cast<String, dynamic>());
+        if (!isSyncableRelativePath(entry.relPath) ||
+            entry.size < 0 ||
+            entry.sequence < 0) {
+          throw const FormatException('invalid index entry');
+        }
+      } catch (error) {
+        log(pairId, 'Dropped invalid peer index entry: $error',
+            SyncEventLevel.warn);
+        continue;
+      }
       // DELETE-TO-DISK (Bug #6, REDESIGN.md Phase 4): the peer tombstoned this
       // file. Phase 2 only DROPPED the tombstone from the live map (so the diff
       // stopped offering it as a need) and never removed the bytes from disk —
@@ -2443,6 +2457,9 @@ class SyncEngine {
     IndexEntry entry, {
     String? sourcePeerId,
   }) async {
+    if (!isSyncableRelativePath(entry.relPath)) {
+      return DeleteDecision.nothingToDecide;
+    }
     final pair = _pairById(pairId);
     if (pair == null) return DeleteDecision.nothingToDecide;
     final db = _indexDbs[pairId];
@@ -2523,6 +2540,11 @@ class SyncEngine {
     if (db == null) return;
     final tombstones = await db.tombstones();
     for (final t in tombstones) {
+      if (!isSyncableRelativePath(t.relPath)) {
+        log(pair.id, 'Skipped unsafe tombstone path: ${t.relPath}',
+            SyncEventLevel.warn);
+        continue;
+      }
       final stat = await fs.stat(pair.localPath, t.relPath);
       if (stat == null) continue; // already gone — nothing to do
       final vault = await vaultBeforeDestructiveChange(

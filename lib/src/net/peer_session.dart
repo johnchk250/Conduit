@@ -349,8 +349,7 @@ final Expando<ConnectionTransport> _sessionTransports =
     Expando<ConnectionTransport>('connectionTransport');
 final Expando<String> _sessionTransportEndpoints =
     Expando<String>('connectionTransportEndpoint');
-final Expando<int> _sessionRemoteListenPorts =
-    Expando<int>('remoteListenPort');
+final Expando<int> _sessionRemoteListenPorts = Expando<int>('remoteListenPort');
 
 /// Transport metadata is kept outside the structural [PeerSession] interface.
 /// Test doubles that implement PeerSession therefore remain source-compatible
@@ -488,7 +487,7 @@ class PeerConnectionManager {
           // ignore: avoid_print
           print('[Conduit] _onHello failed: $e\n$st');
           try {
-            codec.send(
+            await codec.send(
                 {'t': Msg.error, 'message': 'internal error processing hello'});
           } catch (_) {}
           await socket.close();
@@ -516,7 +515,7 @@ class PeerConnectionManager {
     final peerPlatform = hello['platform'] as String;
     final peerPubKey = hello['pubKey'] as String;
     if (hello['secureVersion'] != secureTransportVersion) {
-      codec.send({
+      await codec.send({
         't': Msg.error,
         'message':
             'This device uses an older insecure Conduit protocol. Update Conduit on both devices.',
@@ -548,7 +547,7 @@ class PeerConnectionManager {
             proof,
             _pairingProof(pending.code, hello),
           )) {
-        codec.send({
+        await codec.send({
           't': Msg.error,
           'message': 'pairing required: wrong/missing code'
         });
@@ -557,19 +556,19 @@ class PeerConnectionManager {
       }
       if (DateTime.now().isAfter(pending.expiresAt)) {
         _pendingIncomingPairCode = null;
-        codec.send(
+        await codec.send(
             {'t': Msg.error, 'message': 'pairing required: code expired'});
         await socket.close();
         return;
       }
       if (pending.boundPubKey != null && peerPubKey != pending.boundPubKey) {
-        codec.send({'t': Msg.error, 'message': 'pubkey mismatch'});
+        await codec.send({'t': Msg.error, 'message': 'pubkey mismatch'});
         await socket.close();
         return;
       }
     } else {
       if (peerPubKey != known.publicKeyB64) {
-        codec.send({'t': Msg.error, 'message': 'pinned pubkey mismatch'});
+        await codec.send({'t': Msg.error, 'message': 'pinned pubkey mismatch'});
         await socket.close();
         return;
       }
@@ -612,7 +611,7 @@ class PeerConnectionManager {
                 .inMilliseconds,
             'missed': existing.missedHeartbeats,
           });
-      codec.send({'t': Msg.error, 'message': 'duplicate connection'});
+      await codec.send({'t': Msg.error, 'message': 'duplicate connection'});
       await socket.close();
       return;
     }

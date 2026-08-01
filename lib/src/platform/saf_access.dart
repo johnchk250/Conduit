@@ -1,9 +1,8 @@
 import 'dart:async';
-import 'dart:typed_data';
-
 import 'package:flutter/services.dart';
 
 import '../diag.dart';
+import '../core/relative_path.dart';
 import '../sync/manifest.dart';
 
 const _chPick = MethodChannel('conduit/saf_pick_tree');
@@ -85,11 +84,15 @@ class SafFileSystemAccess
   @override
   Future<List<String>> listFiles(String rootPath) async {
     final res = await _chSaf.invokeMethod('listFiles', {'treeUri': rootPath});
-    return (res as List).cast<String>();
+    return (res as List)
+        .cast<String>()
+        .where(isSyncableRelativePath)
+        .toList(growable: false);
   }
 
   @override
   Future<FileEntry?> stat(String rootPath, String relPath) async {
+    relPath = requireSafeRelativePath(relPath);
     final res = await _chSaf.invokeMethod('stat', {
       'treeUri': rootPath,
       'relPath': relPath,
@@ -115,18 +118,22 @@ class SafFileSystemAccess
     final res =
         await _chSaf.invokeMethod('listFilesWithStat', {'treeUri': rootPath});
     final list = (res as List).cast<Map>();
-    return list.map((raw) {
-      final m = raw.cast<String, dynamic>();
-      return FileEntry(
-        relPath: m['path'] as String,
-        size: (m['size'] as num).toInt(),
-        mtime: (m['mtime'] as num).toInt(),
-        sha256: '',
-      );
-    }).toList();
+    return list
+        .map((raw) {
+          final m = raw.cast<String, dynamic>();
+          return FileEntry(
+            relPath: m['path'] as String,
+            size: (m['size'] as num).toInt(),
+            mtime: (m['mtime'] as num).toInt(),
+            sha256: '',
+          );
+        })
+        .where((entry) => isSyncableRelativePath(entry.relPath))
+        .toList();
   }
 
   Future<String> hashFile(String rootPath, String relPath) async {
+    relPath = requireSyncableRelativePath(relPath);
     return (await _chSaf.invokeMethod<String>('hashFile', {
       'treeUri': rootPath,
       'relPath': relPath,
@@ -136,6 +143,7 @@ class SafFileSystemAccess
   @override
   Stream<List<int>> openRead(String rootPath, String relPath,
       [int offset = 0]) async* {
+    relPath = requireSafeRelativePath(relPath);
     // SAF gives us a whole-file byte buffer; we slice as requested.
     final bytes = await _chSaf.invokeMethod('read', {
       'treeUri': rootPath,
@@ -152,6 +160,7 @@ class SafFileSystemAccess
     int offset,
     int length,
   ) async {
+    relPath = requireSafeRelativePath(relPath);
     final bytes = await _chSaf.invokeMethod<Uint8List>('readBlock', {
       'treeUri': rootPath,
       'relPath': relPath,
@@ -163,6 +172,7 @@ class SafFileSystemAccess
 
   @override
   Future<void> write(String rootPath, String relPath, List<int> data) async {
+    relPath = requireSafeRelativePath(relPath);
     await _chSaf.invokeMethod('write', {
       'treeUri': rootPath,
       'relPath': relPath,
@@ -172,6 +182,7 @@ class SafFileSystemAccess
 
   @override
   Future<void> append(String rootPath, String relPath, List<int> data) async {
+    relPath = requireSafeRelativePath(relPath);
     await _chSaf.invokeMethod('append', {
       'treeUri': rootPath,
       'relPath': relPath,
@@ -185,6 +196,8 @@ class SafFileSystemAccess
     String temporaryRelPath,
     String destinationRelPath,
   ) async {
+    temporaryRelPath = requireSafeRelativePath(temporaryRelPath);
+    destinationRelPath = requireSyncableRelativePath(destinationRelPath);
     await _chSaf.invokeMethod('replaceFromTemporary', {
       'treeUri': rootPath,
       'temporaryRelPath': temporaryRelPath,
@@ -194,6 +207,7 @@ class SafFileSystemAccess
 
   @override
   Future<bool> delete(String rootPath, String relPath) async {
+    relPath = requireSafeRelativePath(relPath);
     final res = await _chSaf.invokeMethod('delete', {
       'treeUri': rootPath,
       'relPath': relPath,
@@ -203,6 +217,7 @@ class SafFileSystemAccess
 
   @override
   Future<String> moveToVault(String rootPath, String relPath) async {
+    relPath = requireSyncableRelativePath(relPath);
     final res = await _chSaf.invokeMethod('moveToVault', {
       'treeUri': rootPath,
       'relPath': relPath,
@@ -218,6 +233,7 @@ class SafFileSystemAccess
   /// fires an [Intent.ACTION_VIEW] so the OS opens the file in the correct app.
   /// Best-effort — errors are swallowed so a failed open never crashes the app.
   static Future<void> openFile(String treeUri, String relPath) async {
+    relPath = requireSyncableRelativePath(relPath);
     try {
       await _chSaf.invokeMethod<void>('openFile', {
         'treeUri': treeUri,

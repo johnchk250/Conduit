@@ -8,6 +8,7 @@ import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
 import '../protocol/wire.dart';
+import '../core/relative_path.dart';
 import 'manifest.dart';
 
 /// Block size for V2 transfers (REDESIGN.md §(5)). Matches the legacy
@@ -104,6 +105,10 @@ Future<String> fetchFileBlockLevel({
   // _replacePartWithFinal.
   void Function(String vaultPath, int oldSizeBytes)? onVaulted,
 }) async {
+  relPath = requireSyncableRelativePath(relPath);
+  if (expectedSize < 0) {
+    throw const FormatException('Negative file size');
+  }
   final partRel = '$relPath$syncPartSuffix';
   // Peer-provided block hashes are defined over the protocol's standard
   // 1-MiB blocks. Hashless ad-hoc transfers may request smaller blocks to
@@ -131,8 +136,8 @@ Future<String> fetchFileBlockLevel({
         i < completeBlocks && i < totalBlocks && i < blockHashes.length;
         i++) {
       final start = i * transferBlockSize;
-      final chunk = await readFileBlock(
-          fs, rootPath, partRel, start, transferBlockSize);
+      final chunk =
+          await readFileBlock(fs, rootPath, partRel, start, transferBlockSize);
       if (chunk.length != transferBlockSize) break;
       if (sha256.convert(chunk).toString() != blockHashes[i]) break;
       digestSink.add(chunk);
@@ -279,8 +284,8 @@ Future<void> _replacePartWithFinal(
   void Function(String vaultPath, int oldSizeBytes)? onVaulted,
 }) async {
   if (fs is LocalFileSystemAccess) {
-    final part = File(p.join(rootPath, partRel));
-    final dest = File(p.join(rootPath, relPath));
+    final part = File(resolveLocalContainedPath(rootPath, partRel));
+    final dest = File(resolveLocalContainedPath(rootPath, relPath));
     await Directory(p.dirname(dest.path)).create(recursive: true);
     if (await dest.exists()) {
       var vaulted = false;
@@ -338,6 +343,7 @@ Future<void> serveFileBlockLevel({
   required Stream<Map<String, dynamic>> requests,
   required FutureOr<void> Function(Map<String, dynamic> response) respond,
 }) async {
+  relPath = requireSyncableRelativePath(relPath);
   // Pre-check existence once. A per-request check would be more robust against
   // a vanish mid-serve, but reading the file per block (below) already throws
   // on a missing source, which we convert to a terminal error. This pre-check

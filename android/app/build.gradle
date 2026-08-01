@@ -29,11 +29,45 @@ android {
         versionName = flutter.versionName
     }
 
+    def signingProperties = new Properties()
+    def signingPropertiesFile = rootProject.file("key.properties")
+    if (signingPropertiesFile.exists()) {
+        signingPropertiesFile.withInputStream { signingProperties.load(it) }
+    }
+    def releaseStoreFile = System.getenv("CONDUIT_RELEASE_STORE_FILE") ?: signingProperties["storeFile"]
+    def releaseStorePassword = System.getenv("CONDUIT_RELEASE_STORE_PASSWORD") ?: signingProperties["storePassword"]
+    def releaseKeyAlias = System.getenv("CONDUIT_RELEASE_KEY_ALIAS") ?: signingProperties["keyAlias"]
+    def releaseKeyPassword = System.getenv("CONDUIT_RELEASE_KEY_PASSWORD") ?: signingProperties["keyPassword"]
+    def hasReleaseSigning = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+    def releaseTaskRequested = gradle.startParameter.taskNames.any { it.toLowerCase().contains("release") }
+
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.debug
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.release
+            } else if (project.findProperty("conduit.allowDebugSigning") == "true") {
+                // Explicitly opt-in for local smoke tests; never use debug keys
+                // accidentally for a distributable APK.
+                signingConfig = signingConfigs.debug
+            } else if (releaseTaskRequested) {
+                throw new GradleException(
+                    "Release signing is not configured. Set CONDUIT_RELEASE_* " +
+                    "environment variables or android/key.properties."
+                )
+            } else {
+                signingConfig = signingConfigs.debug
+            }
         }
     }
 }

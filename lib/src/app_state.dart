@@ -269,7 +269,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
             .any((lan) => lan.deviceId == candidate.deviceId)),
       }.toList(growable: false);
   List<PairedPeer> get pairedPeers => _config.pairedPeers;
-  List<SyncEvent> get events => _engine.eventLog;
+  List<SyncEvent> get events => List.unmodifiable(_events);
   PairSyncState? stateFor(String pairId) => _engine.stateFor(pairId);
   bool get bluetoothEnabled => _config.bluetoothEnabled;
   String get bluetoothStatus {
@@ -1250,7 +1250,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   List<DiscoveredPeer> _lanCandidatesFor(DiscoveredPeer seed) {
-    if (seed.transport != ConnectionTransport.lan) return <DiscoveredPeer>[seed];
+    if (seed.transport != ConnectionTransport.lan) {
+      return <DiscoveredPeer>[seed];
+    }
     final candidates = <DiscoveredPeer>[];
     final seen = <String>{};
 
@@ -1485,8 +1487,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     final readyPeerIds = _registry.readyPeerIds.toSet();
     final pairedPeerIds = _pairedPeerIds();
     final anyLive = readyPeerIds.isNotEmpty;
-    final allPairedPeersReady = pairedPeerIds.isNotEmpty &&
-        pairedPeerIds.every(readyPeerIds.contains);
+    final allPairedPeersReady =
+        pairedPeerIds.isNotEmpty && pairedPeerIds.every(readyPeerIds.contains);
     final needsDiscovery = !allPairedPeersReady;
     final boosted = connectionBoostActive || _networkRecoveryActive;
 
@@ -1697,9 +1699,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (Platform.isAndroid) {
       unawaited(
         _chShare.invokeMethod<bool>('shareHandlerReady').then<void>(
-          (_) {},
-          onError: (Object _, StackTrace __) {},
-        ),
+              (_) {},
+              onError: (Object _, StackTrace __) {},
+            ),
       );
     }
     // Clear the background clock regardless of whether we reset.
@@ -1939,9 +1941,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     unawaited(session.close().catchError((Object _) {}));
     _clipboard?.onPeerConnectivityChanged();
     Diag.session('session_dropped_for_reconnect',
-        peer: id,
-        session: session.generation,
-        fields: {'reason': reason});
+        peer: id, session: session.generation, fields: {'reason': reason});
     return true;
   }
 

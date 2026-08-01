@@ -219,6 +219,16 @@ class FolderWatcher {
   void _startNativeEvents() {
     final source = fs;
     if (source is FileSystemChangeSource) {
+      final changeSource = source as FileSystemChangeSource;
+      // Attach the Dart stream listener synchronously. Providers can emit a
+      // change as soon as start() returns, before the queued platform
+      // watchTree call has completed; subscribing only in that async step
+      // would drop the first hint.
+      if (_providerEventsEnabled) {
+        _providerEvents ??= changeSource.changesFor(rootPath).listen((_) {
+          if (_started && _providerEventsEnabled) _signalChange();
+        });
+      }
       unawaited(_queueProviderWatchUpdate());
       return;
     }

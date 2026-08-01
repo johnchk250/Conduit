@@ -12,9 +12,8 @@ $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 # Prefer explicit, known locations, but allow a developer's PATH to supply a
 # newer Flutter installation. Nothing here is persisted outside this process.
 $flutterHomeCandidates = @(
-    $env:FLUTTER_ROOT,
-    'E:\Developer\flutter'
-) | Where-Object { $_ -and (Test-Path (Join-Path $_ 'bin\flutter.bat')) }
+    $env:FLUTTER_ROOT
+) | Where-Object { $_ -and (Test-Path -LiteralPath "$_\bin\flutter.bat") }
 
 if ($flutterHomeCandidates.Count -gt 0) {
     $flutterHome = $flutterHomeCandidates[0]
@@ -24,9 +23,8 @@ if ($flutterHomeCandidates.Count -gt 0) {
 
 $androidSdkCandidates = @(
     $env:ANDROID_SDK_ROOT,
-    $env:ANDROID_HOME,
-    'E:\Developer\Android\SDK'
-) | Where-Object { $_ -and (Test-Path $_) }
+    $env:ANDROID_HOME
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
 if ($androidSdkCandidates.Count -gt 0) {
     $env:ANDROID_SDK_ROOT = $androidSdkCandidates[0]
@@ -34,11 +32,18 @@ if ($androidSdkCandidates.Count -gt 0) {
     $env:Path = "$env:ANDROID_SDK_ROOT\platform-tools;$env:ANDROID_SDK_ROOT\cmdline-tools\latest\bin;$env:Path"
 }
 
-$env:GRADLE_USER_HOME = 'E:\Developer\Gradle'
+if ($env:GRADLE_USER_HOME) {
+    $env:GRADLE_USER_HOME = [Environment]::ExpandEnvironmentVariables($env:GRADLE_USER_HOME)
+}
 
-$jbr = 'C:\Program Files\Android\Android Studio\jbr'
-if (-not $env:JAVA_HOME -and (Test-Path (Join-Path $jbr 'bin\java.exe'))) {
-    $env:JAVA_HOME = $jbr
+$javaCandidates = @(
+    $env:JAVA_HOME,
+    'C:\Program Files\Android\Android Studio\jbr'
+) | Where-Object { $_ -and (Test-Path -LiteralPath "$_\bin\java.exe") }
+if ((-not $env:JAVA_HOME -or
+        -not (Test-Path -LiteralPath "$env:JAVA_HOME\bin\java.exe")) -and
+    $javaCandidates.Count -gt 0) {
+    $env:JAVA_HOME = $javaCandidates[0]
     $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 }
 

@@ -364,7 +364,9 @@ class ClipboardSync {
   /// Returns true if at least one peer received it.
   Future<bool> sendCurrentClipboard({String? targetPeerId}) async {
     final text = await readClipboard();
-    if (text == null || text.isEmpty || !_isPayloadAllowed(text, outbound: true)) {
+    if (text == null ||
+        text.isEmpty ||
+        !_isPayloadAllowed(text, outbound: true)) {
       return false;
     }
     if (!hasConnectedPeer()) return false;
@@ -506,8 +508,7 @@ class ClipboardSync {
     if (sent.isNotEmpty) {
       _lastSentAt = now();
       _lastError = null;
-      onLog(
-          'Sent clipboard (${text.length} chars) to ${sent.length} peer(s)',
+      onLog('Sent clipboard (${text.length} chars) to ${sent.length} peer(s)',
           false);
       onStateChanged?.call();
     }

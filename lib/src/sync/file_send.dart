@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:uuid/uuid.dart';
 
 import '../notifications/notifier.dart';
+import '../core/relative_path.dart';
 import '../net/peer_session.dart';
 import '../net/transport.dart';
 import '../protocol/wire.dart';
@@ -606,6 +607,17 @@ class AdHocFileSend {
       onLog('fileOffer missing offerId or name — dropped', isError: true);
       return;
     }
+    if (!isSafeFileName(name) || size < 0) {
+      onLog('fileOffer has an unsafe name or size - dropped', isError: true);
+      _sendReceipt(
+        session,
+        offerId,
+        'rejected',
+        0,
+        TransferFailureCode.unknown,
+      );
+      return;
+    }
     if (session.isBandwidthConstrained &&
         size > bluetoothLargeTransferLimitBytes) {
       session.send({
@@ -747,9 +759,8 @@ class AdHocFileSend {
         },
         pipelineDepth:
             offer.session.isBandwidthConstrained ? 1 : _adHocPipelineDepth,
-        requestBlockSize: offer.blockHashes.isEmpty
-            ? _adHocRequestBlockSize
-            : blockSize,
+        requestBlockSize:
+            offer.blockHashes.isEmpty ? _adHocRequestBlockSize : blockSize,
         yieldBetweenBlocks: Platform.isAndroid,
       );
 

@@ -4,6 +4,8 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
+import '../core/relative_path.dart';
+
 /// One entry describing a file in a sync folder. `sha256` is the full-file
 /// hash; block-level transfer additionally verifies per-block, but the index
 /// layer only needs the whole-file digest to detect changes cheaply.
@@ -74,6 +76,7 @@ abstract class FileSystemAccess {
   /// fixed here, at the one moment that change is guaranteed to affect no
   /// existing behavior.)
   Future<String> moveToVault(String rootPath, String relPath) async {
+    relPath = requireSyncableRelativePath(relPath);
     final relDir = p.dirname(relPath); // '.' when relPath has no directory
     final vaultDir = p.join(rootPath, '.syncversions', relDir);
     await Directory(vaultDir).create(recursive: true);
@@ -149,7 +152,8 @@ abstract interface class TemporaryFileFinalizer {
 }
 
 /// Standard filesystem access for Windows (and any platform with real File I/O).
-class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
+class LocalFileSystemAccess
+    implements FileSystemAccess, BlockFileReader, TemporaryFileFinalizer {
   const LocalFileSystemAccess();
 
   @override
@@ -157,12 +161,12 @@ class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
 
   @override
   Future<List<String>> listFiles(String rootPath) async {
-    final root = Directory(rootPath);
+    final root = Directory(_canonicalRoot(rootPath));
     if (!await root.exists()) return [];
     final result = <String>[];
     await for (final entity in root.list(recursive: true, followLinks: false)) {
       if (entity is! File) continue;
-      final rel = p.relative(entity.path, from: rootPath);
+      final rel = p.relative(entity.path, from: root.path);
       // Skip our own state dir and hidden versioning vault.
       if (rel.startsWith('.syncstate') || rel.startsWith('.syncversions')) {
         continue;
@@ -174,12 +178,13 @@ class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
 
   /// Enumerate and stat in one traversal, avoiding a second exists/stat pass.
   Future<List<FileEntry>> listFilesWithStat(String rootPath) async {
-    final root = Directory(rootPath);
+    final root = Directory(_canonicalRoot(rootPath));
     if (!await root.exists()) return const <FileEntry>[];
     final result = <FileEntry>[];
     await for (final entity in root.list(recursive: true, followLinks: false)) {
       if (entity is! File) continue;
-      final rel = p.relative(entity.path, from: rootPath).replaceAll('\\', '/');
+      final rel =
+          p.relative(entity.path, from: root.path).replaceAll('\\', '/');
       if (rel.startsWith('.syncstate/') ||
           rel.startsWith('.syncversions/') ||
           rel.endsWith('.syncpart')) {
@@ -198,7 +203,8 @@ class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
 
   @override
   Future<FileEntry?> stat(String rootPath, String relPath) async {
-    final file = File(p.join(rootPath, relPath));
+    relPath = requireSafeRelativePath(relPath);
+    final file = File(_containedPath(rootPath, relPath));
     if (!await file.exists()) return null;
     final stat = await file.stat();
     return FileEntry(
@@ -212,7 +218,8 @@ class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
   @override
   Stream<List<int>> openRead(String rootPath, String relPath,
       [int offset = 0]) {
-    final file = File(p.join(rootPath, relPath));
+    relPath = requireSafeRelativePath(relPath);
+    final file = File(_containedPath(rootPath, relPath));
     final raf = file.openRead(offset);
     return raf;
   }
@@ -224,10 +231,11 @@ class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
     int offset,
     int length,
   ) async {
-    final file = await File(p.join(rootPath, relPath)).open();
+    relPath = requireSafeRelativePath(relPath);
+    final file = await File(_containedPath(rootPath, relPath)).open();
     try {
       await file.setPosition(offset);
-      return file.read(length);
+      return await file.read(length);
     } finally {
       await file.close();
     }
@@ -235,14 +243,16 @@ class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
 
   @override
   Future<void> write(String rootPath, String relPath, List<int> data) async {
-    final full = p.join(rootPath, relPath);
+    relPath = requireSafeRelativePath(relPath);
+    final full = _containedPath(rootPath, relPath);
     await Directory(p.dirname(full)).create(recursive: true);
     await File(full).writeAsBytes(data, flush: true);
   }
 
   @override
   Future<void> append(String rootPath, String relPath, List<int> data) async {
-    final full = p.join(rootPath, relPath);
+    relPath = requireSafeRelativePath(relPath);
+    final full = _containedPath(rootPath, relPath);
     await Directory(p.dirname(full)).create(recursive: true);
     final f = await File(full).open(mode: FileMode.writeOnlyAppend);
     try {
@@ -254,7 +264,8 @@ class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
 
   @override
   Future<bool> delete(String rootPath, String relPath) async {
-    final file = File(p.join(rootPath, relPath));
+    relPath = requireSafeRelativePath(relPath);
+    final file = File(_containedPath(rootPath, relPath));
     if (await file.exists()) {
       await file.delete();
       return true;
@@ -264,21 +275,71 @@ class LocalFileSystemAccess implements FileSystemAccess, BlockFileReader {
 
   @override
   Future<String> moveToVault(String rootPath, String relPath) async {
+    relPath = requireSyncableRelativePath(relPath);
     final relDir = p.dirname(relPath); // '.' when relPath has no directory
-    final vaultDir = p.join(rootPath, '.syncversions', relDir);
+    final vaultRelDir =
+        relDir == '.' ? '.syncversions' : p.join('.syncversions', relDir);
+    final vaultDir = _containedPath(rootPath, vaultRelDir);
     await Directory(vaultDir).create(recursive: true);
     final stamp = DateTime.now().toIso8601String().replaceAll(':', '-');
     final base = p.basenameWithoutExtension(relPath);
     final ext = p.extension(relPath);
     final destName = '$base.$stamp$ext';
-    final dest = p.join(vaultDir, destName);
-    final src = p.join(rootPath, relPath);
+    final dest = _containedPath(rootPath, p.join(vaultRelDir, destName));
+    final src = _containedPath(rootPath, relPath);
     await File(src).rename(dest);
-    final vaultRelDir =
-        relDir == '.' ? '.syncversions' : p.join('.syncversions', relDir);
     return p.join(vaultRelDir, destName);
   }
+
+  @override
+  Future<void> replaceFromTemporary(
+    String rootPath,
+    String temporaryRelPath,
+    String destinationRelPath,
+  ) async {
+    temporaryRelPath = requireSafeRelativePath(temporaryRelPath);
+    destinationRelPath = requireSyncableRelativePath(destinationRelPath);
+    final source = File(_containedPath(rootPath, temporaryRelPath));
+    final destination = _containedPath(rootPath, destinationRelPath);
+    await Directory(p.dirname(destination)).create(recursive: true);
+    final existing = File(destination);
+    if (await existing.exists()) await existing.delete();
+    await source.rename(destination);
+  }
 }
+
+String _canonicalRoot(String rootPath) {
+  final absolute = p.normalize(p.absolute(rootPath));
+  final root = Directory(absolute);
+  return root.existsSync()
+      ? p.normalize(root.resolveSymbolicLinksSync())
+      : absolute;
+}
+
+String _containedPath(String rootPath, String relPath) {
+  relPath = requireSafeRelativePath(relPath);
+  final root = _canonicalRoot(rootPath);
+  final candidate = p.normalize(p.join(root, relPath));
+  if (!p.isWithin(root, candidate)) {
+    throw FileSystemException('Path escapes the selected sync root', candidate);
+  }
+
+  var current = root;
+  for (final segment in relPath.replaceAll('\\', '/').split('/')) {
+    current = p.join(current, segment);
+    if (FileSystemEntity.typeSync(current, followLinks: false) ==
+        FileSystemEntityType.link) {
+      throw FileSystemException(
+        'Symbolic links and junctions are not valid sync paths',
+        current,
+      );
+    }
+  }
+  return candidate;
+}
+
+String resolveLocalContainedPath(String rootPath, String relPath) =>
+    _containedPath(rootPath, relPath);
 
 /// Compute the SHA-256 of a file. Used by the scanner when hashing files.
 Future<String> hashFile(

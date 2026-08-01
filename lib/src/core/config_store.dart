@@ -56,6 +56,7 @@ class ConfigStore {
 
   final File _file;
   final Map<String, dynamic> _data;
+  Future<void> _persistChain = Future<void>.value();
 
   static Future<ConfigStore> load() async {
     final dir = await _appSupportDir();
@@ -65,6 +66,7 @@ class ConfigStore {
       try {
         data = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
       } catch (_) {
+        await quarantineCorruptJson(file);
         data = <String, dynamic>{};
       }
     } else {
@@ -73,7 +75,7 @@ class ConfigStore {
     // Drop the obsolete v1/v2 engine toggle from older configs.
     if (data.remove('useNewEngine') != null) {
       try {
-        await file.writeAsString(jsonEncode(data));
+        await writeJsonAtomically(file, data);
       } catch (_) {
         // Best-effort cleanup; the flag is ignored either way.
       }
@@ -128,8 +130,32 @@ class ConfigStore {
 
   static Future<Directory> _appSupportDir() => appSupportDir();
 
+  static Future<void> writeJsonAtomically(File file, Object value) async {
+    await file.parent.create(recursive: true);
+    final temp = File('${file.path}.tmp');
+    await temp.writeAsString(jsonEncode(value), flush: true);
+    try {
+      await temp.rename(file.path);
+    } catch (_) {
+      if (await file.exists()) await file.delete();
+      await temp.rename(file.path);
+    }
+  }
+
+  static Future<void> quarantineCorruptJson(File file) async {
+    if (!await file.exists()) return;
+    final suffix = DateTime.now().millisecondsSinceEpoch;
+    final quarantine = File('${file.path}.corrupt-$suffix');
+    try {
+      await file.rename(quarantine.path);
+    } catch (_) {}
+  }
+
   Future<void> _persist() async {
-    await _file.writeAsString(jsonEncode(_data));
+    final operation =
+        _persistChain.then((_) => writeJsonAtomically(_file, _data));
+    _persistChain = operation.catchError((_) {});
+    await operation;
   }
 
   List<FolderPair> get folderPairs {
@@ -137,9 +163,14 @@ class ConfigStore {
     if (list is! List) {
       return const <FolderPair>[];
     }
-    return list
-        .map((e) => FolderPair.fromJson(e as Map<String, dynamic>))
-        .toList(growable: false);
+    final out = <FolderPair>[];
+    for (final value in list) {
+      if (value is! Map) continue;
+      try {
+        out.add(FolderPair.fromJson(value.cast<String, dynamic>()));
+      } catch (_) {}
+    }
+    return out;
   }
 
   Future<void> upsertPair(FolderPair pair) async {
@@ -169,9 +200,14 @@ class ConfigStore {
     if (list is! List) {
       return const <PairedPeer>[];
     }
-    return list
-        .map((e) => PairedPeer.fromJson(e as Map<String, dynamic>))
-        .toList(growable: false);
+    final out = <PairedPeer>[];
+    for (final value in list) {
+      if (value is! Map) continue;
+      try {
+        out.add(PairedPeer.fromJson(value.cast<String, dynamic>()));
+      } catch (_) {}
+    }
+    return out;
   }
 
   Future<void> rememberPeer(PairedPeer peer) async {

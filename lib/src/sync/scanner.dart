@@ -1,3 +1,4 @@
+import '../core/relative_path.dart';
 import '../storage/index_db.dart';
 import '../sync/ignore_rules.dart';
 import '../sync/manifest.dart';
@@ -101,6 +102,10 @@ class IndexScanner {
     var signatureNewest = 0;
     for (final fileEntry in diskEntries) {
       final rel = fileEntry.relPath;
+      if (!isSyncableRelativePath(rel)) {
+        seenPaths.add(rel);
+        continue;
+      }
       // Skip our own metadata artefacts. The legacy LocalFileSystemAccess
       // already filters .syncstate/.syncversions at list time; we add the V2
       // partial-download suffix here so a crashed block transfer never appears

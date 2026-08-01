@@ -14,7 +14,7 @@ import 'config_store.dart';
 /// survives restarts and lets peers recognise us across networks.
 class DeviceIdentity {
   final String deviceId; // short fingerprint, e.g. "F3A9-21BC"
-  final String name; // user-facing name, e.g. "Office PC"
+  String name; // user-facing name, e.g. "Office PC"
   final String platform; // "windows" | "android"
   final Uint8List privateKey;
   final Uint8List publicKey;
@@ -39,15 +39,38 @@ class DeviceIdentity {
         'publicKeyB64': base64.encode(publicKey),
       };
 
-  factory DeviceIdentity.fromJson(Map<String, dynamic> j) => DeviceIdentity(
-        deviceId: j['deviceId'] as String,
-        name: j['name'] as String,
-        platform: j['platform'] as String,
-        privateKey:
-            Uint8List.fromList(base64.decode(j['privateKeyB64'] as String)),
-        publicKey:
-            Uint8List.fromList(base64.decode(j['publicKeyB64'] as String)),
+  factory DeviceIdentity.fromJson(Map<String, dynamic> j) {
+    final deviceId = j['deviceId'];
+    final name = j['name'];
+    final platform = j['platform'];
+    if (deviceId is! String ||
+        deviceId.isEmpty ||
+        name is! String ||
+        name.isEmpty ||
+        platform is! String ||
+        platform.isEmpty) {
+      throw const FormatException('Invalid identity metadata');
+    }
+    try {
+      final privateKey =
+          Uint8List.fromList(base64.decode(j['privateKeyB64'] as String));
+      final publicKey =
+          Uint8List.fromList(base64.decode(j['publicKeyB64'] as String));
+      if (privateKey.length != 32 || publicKey.length != 32) {
+        throw const FormatException('Invalid Ed25519 key length');
+      }
+      return DeviceIdentity(
+        deviceId: deviceId,
+        name: name,
+        platform: platform,
+        privateKey: privateKey,
+        publicKey: publicKey,
       );
+    } catch (error) {
+      if (error is FormatException) rethrow;
+      throw FormatException('Invalid identity key material: $error');
+    }
+  }
 
   static Future<File> _identityFile() async {
     final dir = await _appSupportDir();
@@ -67,11 +90,12 @@ class DeviceIdentity {
         final j = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
         return DeviceIdentity.fromJson(j);
       } catch (_) {
+        await ConfigStore.quarantineCorruptJson(file);
         // corrupt — regenerate
       }
     }
     final fresh = _generate(platform: platform, name: desiredName);
-    await file.writeAsString(jsonEncode(fresh.toJson()));
+    await ConfigStore.writeJsonAtomically(file, fresh.toJson());
     return fresh;
   }
 
@@ -102,15 +126,18 @@ class DeviceIdentity {
       ed.verify(ed.PublicKey(peerPub), data, signature);
 
   Future<void> rename(String newName) async {
-    final updated = DeviceIdentity(
-      deviceId: deviceId,
-      name: newName,
-      platform: platform,
-      privateKey: privateKey,
-      publicKey: publicKey,
-    );
+    if (newName.trim().isEmpty) {
+      throw ArgumentError.value(newName, 'newName', 'must not be empty');
+    }
+    final previous = name;
+    name = newName.trim();
     final file = await _identityFile();
-    await file.writeAsString(jsonEncode(updated.toJson()));
+    try {
+      await ConfigStore.writeJsonAtomically(file, toJson());
+    } catch (_) {
+      name = previous;
+      rethrow;
+    }
   }
 
   static const uuid = Uuid();

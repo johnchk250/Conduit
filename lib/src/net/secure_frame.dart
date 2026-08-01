@@ -132,6 +132,7 @@ class FrameCodec {
       _receiveChain = _receiveChain.then((_) => _decodeFrame(raw)).catchError(
         (Object e) {
           _closed = true;
+          Diag.log('frame_receive_error', fields: {'error': e.toString()});
           onError?.call(e);
           _socket.destroy();
         },
@@ -178,13 +179,14 @@ class FrameCodec {
     msg['msgId'] ??= Diag.nextMsgId();
     Diag.send(msg);
     final keys = _secureKeys;
-    if (keys == null) {
-      _writeFrame(_encodePayload(msg));
-      return _socket.flush();
-    }
     final queued = Map<String, dynamic>.from(msg);
     _sendChain = _sendChain.then((_) async {
       if (_closed) return;
+      if (keys == null) {
+        _writeFrame(_encodePayload(queued));
+        await _socket.flush();
+        return;
+      }
       if (_sendSequence == 0xFFFFFFFFFFFFFFFF) {
         throw StateError('secure sequence exhausted');
       }
@@ -206,6 +208,7 @@ class FrameCodec {
       _sendSequence++;
     }).catchError((Object e) {
       _closed = true;
+      Diag.log('frame_send_error', fields: {'error': e.toString()});
       onError?.call(e);
       _socket.destroy();
     });

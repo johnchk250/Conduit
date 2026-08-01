@@ -235,7 +235,10 @@ void main() {
       final ok = await sync.sendCurrentClipboard();
       expect(ok, isTrue);
       expect(session.sent, isNotEmpty);
-      final push = session.sent.single;
+      final pushes =
+          session.sent.where((m) => m['t'] == Msg.clipboardPush).toList();
+      expect(pushes, isNotEmpty);
+      final push = pushes.last;
       expect(push['t'], Msg.clipboardPush);
       expect(push['text'], 'hello from test');
       expect(sync.lastSentAt, isNotNull);
@@ -309,9 +312,11 @@ void main() {
 
       await sync.onPushReceived(_bobDeviceId, 'shared value');
 
-      expect(bob.sent, isEmpty);
-      expect(charlie.sent, hasLength(1));
-      expect(charlie.sent.single['text'], 'shared value');
+      expect(bob.sent.where((m) => m['t'] == Msg.clipboardPush), isEmpty);
+      final charliePushes =
+          charlie.sent.where((m) => m['t'] == Msg.clipboardPush).toList();
+      expect(charliePushes, hasLength(1));
+      expect(charliePushes.single['text'], 'shared value');
       sync.dispose();
     });
 
@@ -492,7 +497,7 @@ void main() {
 
         sync.setEnabled(true);
         async.elapse(const Duration(seconds: 10));
-        expect(session.sent, isEmpty);
+        expect(session.sent.where((m) => m['t'] == Msg.clipboardPush), isEmpty);
         sync.dispose();
       });
     });
@@ -529,7 +534,8 @@ void main() {
       });
     });
 
-    test('unchanged clipboard is not re-sent to the same peer on reconnect', () {
+    test('unchanged clipboard is not re-sent to the same peer on reconnect',
+        () {
       fakeAsync((async) {
         final registry = PeerConnectionRegistry();
         final session = _FakeSession();
@@ -559,7 +565,8 @@ void main() {
       });
     });
 
-    test('clipboard changed while offline is sent immediately on reconnect', () {
+    test('clipboard changed while offline is sent immediately on reconnect',
+        () {
       fakeAsync((async) {
         final registry = PeerConnectionRegistry();
         final session = _FakeSession();
