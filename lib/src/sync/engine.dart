@@ -327,6 +327,12 @@ class SyncEngine {
   final _peerGeneration = <String, int>{};
   final _peerUpdatedAt = <String, DateTime>{};
 
+  /// Safety holds raised when a scan or inbound index looks like a mass
+  /// disappearance. Holds keep the UI honest and prevent a suspicious empty
+  /// folder from being reported as a clean/idle sync.
+  final _localDeletionHolds = <String, int>{};
+  final _remoteDeletionHolds = <String, int>{};
+
   /// Active block-fetch sinks, keyed by `"$pairId|$name"`. The `Msg.response`
   /// handler routes each incoming response into the sink for the file it's a
   /// reply to; [fetchFileBlockLevel]'s `sendRequest` pulls the next response
@@ -357,6 +363,15 @@ class SyncEngine {
   PairSyncState? stateFor(String pairId) => _states[pairId];
   List<FolderPairInvite> get pendingInvites =>
       _pendingInvites.values.toList(growable: false);
+
+  String _idleStatus(String pairId, {String fallback = 'Idle'}) {
+    final local = _localDeletionHolds[pairId] ?? 0;
+    final remote = _remoteDeletionHolds[pairId] ?? 0;
+    final blocked = local > remote ? local : remote;
+    return blocked == 0
+        ? fallback
+        : 'Safety hold: $blocked deletion(s) blocked';
+  }
 
   bool _disposed = false;
 
@@ -562,6 +577,8 @@ class SyncEngine {
     _localGeneration.remove(pairId);
     _peerGeneration.remove(pairId);
     _peerUpdatedAt.remove(pairId);
+    _localDeletionHolds.remove(pairId);
+    _remoteDeletionHolds.remove(pairId);
     _peerSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _sentSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _activeReconcileSessions.remove(pairId);
@@ -1377,11 +1394,22 @@ class SyncEngine {
     if (scan.changed.isNotEmpty) {
       _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
     }
+    if (scan.blockedDeletionCount > 0) {
+      _localDeletionHolds[pair.id] = scan.blockedDeletionCount;
+      log(
+        pair.id,
+        'Safety hold: blocked ${scan.blockedDeletionCount} suspected '
+        'mass deletion(s) from this scan',
+        SyncEventLevel.warn,
+      );
+    } else {
+      _localDeletionHolds.remove(pair.id);
+    }
 
     if (session == null) {
       // No peer: the DB is now current. Needs/fetch can't run without a peer.
       st.lastSyncedAt = DateTime.now();
-      st.status = 'Idle (no peer)';
+      st.status = _idleStatus(pair.id, fallback: 'Idle (no peer)');
       _stateController.add(st);
       log(pair.id, 'V2 scan complete (${scan.changed.length} changed), no peer',
           SyncEventLevel.info);
@@ -1530,7 +1558,7 @@ class SyncEngine {
     final needs = indexDiff(localLive: localLive, peerLive: peerLive);
     if (needs.isEmpty) {
       st.lastSyncedAt = DateTime.now();
-      st.status = 'Idle';
+      st.status = _idleStatus(pair.id);
       st.progress = null;
       _stateController.add(st);
       log(pair.id, 'V2 in sync (${localLive.length} files)',
@@ -1665,7 +1693,7 @@ class SyncEngine {
     st.progress = null;
     st.lastSyncedAt = DateTime.now();
     st.status = deferred.isEmpty
-        ? 'Idle'
+        ? _idleStatus(pair.id)
         : 'Bluetooth · ${deferred.length} large file(s) paused';
     if (!_disposed) _stateController.add(st);
     log(
@@ -1951,6 +1979,14 @@ class SyncEngine {
   bool _sessionOwnsPair(PeerSession session, FolderPair pair) =>
       pair.peerDeviceId == session.peer.deviceId;
 
+  bool _isMassDeleteFrame(List<dynamic> entries) {
+    final maps = entries.whereType<Map>();
+    final total = maps.length;
+    if (total == 0) return false;
+    final deletes = maps.where((entry) => entry['deleted'] == true).length;
+    return deletes >= 2 && deletes * 2 >= total;
+  }
+
   /// Resolve a pair only when it belongs to the session's authenticated peer.
   /// Pair IDs are routing keys, not authorization: every inbound pair-scoped
   /// frame must also satisfy this device binding.
@@ -2144,6 +2180,11 @@ class SyncEngine {
         final pairId = msg['pairId'] as String;
         final pair = _pairForSession(session, pairId);
         if (pair == null) break;
+        // The initiator may have advertised before the peer created the pair.
+        // That index was discarded, but the send watermark was still advanced.
+        // Rewind it so the first post-accept reconcile re-advertises all local
+        // rows and the peer can receive the files that existed before pairing.
+        _sentSeq.remove(_peerKey(session.peer.deviceId, pairId));
         _markPeerAccepted(pairId, session.peer.deviceId);
         _setStatus(pairId, 'Peer accepted');
         log(pairId, 'Peer accepted folder invite', SyncEventLevel.info);
@@ -2307,6 +2348,22 @@ class SyncEngine {
     var maxSeq = priorSeq;
     final wasLiveEmpty = !_peerLive.containsKey(pairId);
     final live = _peerLive.putIfAbsent(pairId, () => <String, IndexEntry>{});
+    final massDeleteFrame = _isMassDeleteFrame(entriesRaw);
+    if (massDeleteFrame) {
+      final deleteCount = entriesRaw
+          .whereType<Map>()
+          .where((entry) => entry['deleted'] == true)
+          .length;
+      _remoteDeletionHolds[pairId] = deleteCount;
+      log(
+        pairId,
+        'Safety hold: blocked $deleteCount suspected peer mass deletion(s)',
+        SyncEventLevel.warn,
+      );
+    } else if (entriesRaw
+        .any((entry) => entry is Map && entry['deleted'] != true)) {
+      _remoteDeletionHolds.remove(pairId);
+    }
     var learned = 0;
     for (final raw in entriesRaw) {
       if (raw is! Map) continue;
@@ -2321,6 +2378,16 @@ class SyncEngine {
       } catch (error) {
         log(pairId, 'Dropped invalid peer index entry: $error',
             SyncEventLevel.warn);
+        continue;
+      }
+      if (entry.deleted && massDeleteFrame) {
+        // Advance the peer watermark and remove the path from the peer live
+        // view, but do not persist the tombstone or touch local disk. A
+        // peer's empty/newly reinstalled folder is not sufficient authority
+        // to delete a whole local tree.
+        live.remove(entry.relPath);
+        if (entry.sequence > maxSeq) maxSeq = entry.sequence;
+        learned++;
         continue;
       }
       // DELETE-TO-DISK (Bug #6, REDESIGN.md Phase 4): the peer tombstoned this
@@ -2539,6 +2606,7 @@ class SyncEngine {
     final db = _indexDbs[pair.id];
     if (db == null) return;
     final tombstones = await db.tombstones();
+    final pending = <IndexEntry>[];
     for (final t in tombstones) {
       if (!isSyncableRelativePath(t.relPath)) {
         log(pair.id, 'Skipped unsafe tombstone path: ${t.relPath}',
@@ -2547,6 +2615,20 @@ class SyncEngine {
       }
       final stat = await fs.stat(pair.localPath, t.relPath);
       if (stat == null) continue; // already gone — nothing to do
+      pending.add(t);
+    }
+    final localPaths = await db.localLivePaths(deviceId);
+    if (pending.length >= 2 &&
+        pending.length * 2 >= pending.length + localPaths.length) {
+      _localDeletionHolds[pair.id] = pending.length;
+      log(
+        pair.id,
+        'Safety hold: skipped ${pending.length} orphan mass deletion(s)',
+        SyncEventLevel.warn,
+      );
+      return;
+    }
+    for (final t in pending) {
       final vault = await vaultBeforeDestructiveChange(
         pair: pair,
         relPath: t.relPath,

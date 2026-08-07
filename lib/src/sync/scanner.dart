@@ -17,7 +17,17 @@ class ScanResult {
   /// `changed.last.sequence` when non-empty, else the unchanged prior max.
   final int maxSequence;
 
-  ScanResult(this.changed, this.maxSequence);
+  /// Number of local deletions deliberately withheld because the scan looked
+  /// like a mass disappearance (for example, a newly reinstalled peer with an
+  /// empty or unreadable folder). Such a scan must never turn into a delete
+  /// storm on the other device.
+  final int blockedDeletionCount;
+
+  ScanResult(
+    this.changed,
+    this.maxSequence, {
+    this.blockedDeletionCount = 0,
+  });
 
   bool get isEmpty => changed.isEmpty;
 }
@@ -157,14 +167,44 @@ class IndexScanner {
     // delete, and tombstoning it would create a delete-storm.
     onDiskSignature
         ?.call(signatureCount * 1000003 + signatureSize + signatureNewest);
+    final localPaths = await db.localLivePaths(deviceId);
+    final missingLocalPaths = localPaths
+        .where((path) => !seenPaths.contains(path))
+        .toList(growable: false);
+    final blockMassDeletion = _isMassDeletion(
+      deletedCount: missingLocalPaths.length,
+      existingCount: localPaths.length,
+    );
+    // Preserve all existing local paths in the seen set while the safety hold
+    // is active. Present files are still scanned and local edits still enter
+    // the index; only the destructive tombstone pass is withheld.
+    final effectiveSeenPaths =
+        blockMassDeletion ? <String>{...seenPaths, ...localPaths} : seenPaths;
     final changed = await db.applyLocalScan(
       observations: observations,
-      seenPaths: seenPaths,
+      seenPaths: effectiveSeenPaths,
       deviceId: deviceId,
     );
     final maxSeq =
         changed.isEmpty ? await db.maxSequence() : changed.last.sequence;
-    return ScanResult(changed, maxSeq);
+    return ScanResult(
+      changed,
+      maxSeq,
+      blockedDeletionCount: blockMassDeletion ? missingLocalPaths.length : 0,
+    );
+  }
+
+  /// A complete/near-complete disappearance is ambiguous: it can be a real
+  /// user deletion, but it can also be a transient provider failure, a lost
+  /// SAF grant, or a freshly installed peer reporting an empty folder. The
+  /// latter must not delete the other device's files automatically.
+  static bool _isMassDeletion({
+    required int deletedCount,
+    required int existingCount,
+  }) {
+    if (deletedCount == 0 || existingCount == 0) return false;
+    if (deletedCount == existingCount) return true;
+    return deletedCount >= 2 && deletedCount * 2 >= existingCount;
   }
 
   /// Lists every file under [rootPath] with its size+mtime. Uses

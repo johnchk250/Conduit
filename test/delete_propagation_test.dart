@@ -174,6 +174,48 @@ void main() {
     // The peer learns of our edit on its next reconcile and resurrects the file.
   });
 
+  test('blocks a peer mass-delete frame without touching local files',
+      () async {
+    h.aliceFs.files['a.txt'] = utf8.encode('a');
+    h.aliceFs.files['b.txt'] = utf8.encode('b');
+    h.aliceFs.files['c.txt'] = utf8.encode('c');
+    await h.alice.startPair(h.pair);
+    final rows = [
+      await h.aliceDb.get('a.txt'),
+      await h.aliceDb.get('b.txt'),
+      await h.aliceDb.get('c.txt'),
+    ];
+    h.connectAlice();
+
+    final tombstones = <Map<String, dynamic>>[];
+    for (var i = 0; i < rows.length; i++) {
+      final row = rows[i]!;
+      tombstones.add(IndexEntry(
+        relPath: row.relPath,
+        size: row.size,
+        mtime: row.mtime,
+        sha256: row.sha256,
+        version: row.version.bump(_peer),
+        sequence: row.sequence + rows.length,
+        deleted: true,
+      ).toJson());
+    }
+
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': tombstones,
+      'fromSequence': 0,
+    });
+
+    expect(
+        h.aliceFs.files.keys, containsAll(<String>['a.txt', 'b.txt', 'c.txt']));
+    expect((await h.aliceDb.get('a.txt'))!.deleted, isFalse);
+    expect((await h.aliceDb.get('b.txt'))!.deleted, isFalse);
+    expect((await h.aliceDb.get('c.txt'))!.deleted, isFalse);
+  });
+
   test(
       'orphan backlog: a tombstoned DB row whose file is still on disk is '
       'removed by the reconcile sweep', () async {

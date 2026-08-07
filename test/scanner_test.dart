@@ -95,6 +95,26 @@ void main() {
     expect(result.changed.where((e) => e.relPath == 'b.txt'), isEmpty);
   });
 
+  test('blocks a mass disappearance instead of emitting delete tombstones',
+      () async {
+    final fs = FakeFs({
+      'a.txt': utf8Bytes('a'),
+      'b.txt': utf8Bytes('b'),
+      'c.txt': utf8Bytes('c'),
+    });
+    await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
+
+    fs.files.clear();
+    final result =
+        await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
+
+    expect(result.blockedDeletionCount, 3);
+    expect(result.changed, isEmpty);
+    expect((await db.get('a.txt'))!.deleted, isFalse);
+    expect((await db.get('b.txt'))!.deleted, isFalse);
+    expect((await db.get('c.txt'))!.deleted, isFalse);
+  });
+
   test('a file matching an ignore glob is never indexed at all', () async {
     final fs = FakeFs({
       'a.txt': utf8Bytes('hello'),

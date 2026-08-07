@@ -177,6 +177,43 @@ void main() {
   });
 
   test(
+      'folder acceptance rewinds an early advertise so pre-existing files are sent',
+      () async {
+    // This reproduces the pairing race: Alice starts the pair while the link is
+    // already ready, so she advertises before Bob has accepted and created the
+    // matching pair. Bob's side would discard that first index as unknown.
+    final content = utf8.encode('created before pairing');
+    h.aliceFs.files['before-pairing.txt'] = content;
+    h.session.markLinkReady();
+    h.connectAlice();
+
+    await h.alice.startPair(h.pair);
+    final earlyUpdates = h.session.sent
+        .where((m) =>
+            m['t'] == Msg.indexUpdate && (m['entries'] as List).isNotEmpty)
+        .toList();
+    expect(earlyUpdates, hasLength(1));
+
+    // Bob now accepts. The post-accept reconcile must not trust the watermark
+    // from the discarded early advertisement.
+    await h.deliverToAlice({
+      't': Msg.folderAccept,
+      'pairId': h.pair.id,
+    });
+
+    final advertised = h.session.sent
+        .where((m) =>
+            m['t'] == Msg.indexUpdate && (m['entries'] as List).isNotEmpty)
+        .toList();
+    expect(advertised, hasLength(2));
+    expect(
+      advertised.last['entries'],
+      contains(
+          predicate<Map>((entry) => entry['path'] == 'before-pairing.txt')),
+    );
+  });
+
+  test(
       '_handleIndexFrame merges a peer index, advances the watermark, and '
       'kicks a reconcile that fetches the file', () async {
     // Bob has a file Alice lacks. Delivering Bob's advertisement to Alice must

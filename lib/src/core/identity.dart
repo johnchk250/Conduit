@@ -56,7 +56,12 @@ class DeviceIdentity {
           Uint8List.fromList(base64.decode(j['privateKeyB64'] as String));
       final publicKey =
           Uint8List.fromList(base64.decode(j['publicKeyB64'] as String));
-      if (privateKey.length != 32 || publicKey.length != 32) {
+      // ed25519_edwards stores a private key as the 32-byte seed followed by
+      // the 32-byte public key. The generated key pair therefore persists a
+      // 64-byte private key; accepting only 32 bytes makes every restart
+      // quarantine the valid identity and generate a new device ID.
+      if (privateKey.length != ed.PrivateKeySize ||
+          publicKey.length != ed.PublicKeySize) {
         throw const FormatException('Invalid Ed25519 key length');
       }
       return DeviceIdentity(
