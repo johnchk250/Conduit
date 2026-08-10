@@ -29,6 +29,13 @@ class IndexEntry {
   final VersionVector version;
   final int sequence; // monotonic per-folder counter (this device's view)
   final bool deleted;
+
+  /// True only when a local user explicitly approved a deletion that was
+  /// previously stopped by the mass-deletion safety hold. This bit is durable
+  /// and is serialized on the wire so the receiving device can distinguish an
+  /// intentional bulk delete from an empty/unreadable-folder accident.
+  final bool deletionApproved;
+
   final List<String> blockHashes; // empty when not computed
   /// The sha of the bytes THIS device last confirmed on its own disk, '' until
   /// observed. DB-LOCAL ONLY — never serialized on the wire (it is meaningless
@@ -49,6 +56,7 @@ class IndexEntry {
     required this.version,
     required this.sequence,
     this.deleted = false,
+    this.deletionApproved = false,
     this.blockHashes = const <String>[],
     this.localSha = '',
     this.localSize = 0,
@@ -65,6 +73,7 @@ class IndexEntry {
         version: version,
         sequence: sequence,
         deleted: deleted,
+        deletionApproved: deletionApproved,
         blockHashes: blockHashes,
         localSha: sha,
         localSize: localSize,
@@ -83,6 +92,7 @@ class IndexEntry {
         version: v,
         sequence: sequence,
         deleted: deleted,
+        deletionApproved: deletionApproved,
         blockHashes: blockHashes,
         localSha: localSha,
         localSize: localSize,
@@ -111,6 +121,7 @@ class IndexEntry {
         'version': version.toJson(),
         'sequence': sequence,
         'deleted': deleted,
+        if (deleted && deletionApproved) 'deletionApproved': true,
         if (blockHashes.isNotEmpty) 'blocks': blockHashes,
       };
 
@@ -131,6 +142,7 @@ class IndexEntry {
           (j['version'] as Map<String, dynamic>).cast<String, dynamic>()),
       sequence: (j['sequence'] as num).toInt(),
       deleted: (j['deleted'] as bool?) ?? false,
+      deletionApproved: (j['deletionApproved'] as bool?) ?? false,
       blockHashes: blocks,
     );
   }
@@ -295,6 +307,7 @@ class IndexDb {
         version      TEXT NOT NULL,
         sequence     INTEGER NOT NULL,
         deleted      INTEGER NOT NULL,
+        delete_approved INTEGER NOT NULL DEFAULT 0,
         block_hashes TEXT,
         local_sha    TEXT NOT NULL DEFAULT '',
         local_size   INTEGER NOT NULL DEFAULT 0,
@@ -321,6 +334,10 @@ class IndexDb {
     if (!cols.any((c) => (c['name'] as String?) == 'local_mtime')) {
       await db.execute(
           'ALTER TABLE files ADD COLUMN local_mtime INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!cols.any((c) => (c['name'] as String?) == 'delete_approved')) {
+      await db.execute(
+          'ALTER TABLE files ADD COLUMN delete_approved INTEGER NOT NULL DEFAULT 0');
     }
   }
 
@@ -712,8 +729,11 @@ class IndexDb {
   ///
   /// Idempotent: deleting an already-deleted row is a no-op. Returns `true`
   /// iff a row was actually written.
-  Future<bool> markDeletedLocal(
-      {required String relPath, required String deviceId}) async {
+  Future<bool> markDeletedLocal({
+    required String relPath,
+    required String deviceId,
+    bool deletionApproved = false,
+  }) async {
     return _db.transaction((txn) async {
       final existing = await txn
           .rawQuery('SELECT * FROM files WHERE path = ? LIMIT 1', [relPath]);
@@ -733,6 +753,7 @@ class IndexDb {
           version: nextVersion,
           sequence: nextSeq,
           deleted: true,
+          deletionApproved: deletionApproved,
           blockHashes: prior?.blockHashes ?? const <String>[],
         )),
         conflictAlgorithm: ConflictAlgorithm.replace,
@@ -925,6 +946,7 @@ class IndexDb {
               version: mergedVersion,
               sequence: remote.sequence,
               deleted: remote.deleted,
+              deletionApproved: remote.deletionApproved,
               blockHashes: remote.blockHashes,
               localSha: priorLocalSha,
               localSize: prior.localSize,
@@ -995,6 +1017,7 @@ class IndexDb {
       version: VersionVector.fromJson(versionJson),
       sequence: row['sequence'] as int,
       deleted: (row['deleted'] as int) != 0,
+      deletionApproved: ((row['delete_approved'] as int?) ?? 0) != 0,
       blockHashes: blocks,
       localSha: localSha,
       localSize: (row['local_size'] as int?) ?? 0,
@@ -1011,6 +1034,7 @@ class IndexDb {
       'version': jsonEncode(e.version.toJson()),
       'sequence': e.sequence,
       'deleted': e.deleted ? 1 : 0,
+      'delete_approved': e.deletionApproved ? 1 : 0,
       'block_hashes': e.blockHashes.isEmpty ? null : jsonEncode(e.blockHashes),
       'local_sha': e.localSha,
       'local_size': e.localSize,

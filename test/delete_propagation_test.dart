@@ -174,16 +174,16 @@ void main() {
     // The peer learns of our edit on its next reconcile and resurrects the file.
   });
 
-  test('blocks a peer mass-delete frame without touching local files',
+  test(
+      'small peer delete burst is not blocked just because its frame is all deletes',
       () async {
-    h.aliceFs.files['a.txt'] = utf8.encode('a');
-    h.aliceFs.files['b.txt'] = utf8.encode('b');
-    h.aliceFs.files['c.txt'] = utf8.encode('c');
+    for (var i = 0; i < 20; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
     await h.alice.startPair(h.pair);
     final rows = [
-      await h.aliceDb.get('a.txt'),
-      await h.aliceDb.get('b.txt'),
-      await h.aliceDb.get('c.txt'),
+      await h.aliceDb.get('file_0.txt'),
+      await h.aliceDb.get('file_1.txt'),
     ];
     h.connectAlice();
 
@@ -196,7 +196,7 @@ void main() {
         mtime: row.mtime,
         sha256: row.sha256,
         version: row.version.bump(_peer),
-        sequence: row.sequence + rows.length,
+        sequence: row.sequence + 100,
         deleted: true,
       ).toJson());
     }
@@ -209,11 +209,164 @@ void main() {
       'fromSequence': 0,
     });
 
+    expect(h.aliceFs.files.containsKey('file_0.txt'), isFalse);
+    expect(h.aliceFs.files.containsKey('file_1.txt'), isFalse);
+    expect(h.aliceFs.files.containsKey('file_2.txt'), isTrue);
+  });
+
+  test('blocks a peer deletion burst at ten files and seventy percent',
+      () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    await h.alice.startPair(h.pair);
+    final rows = <IndexEntry>[];
+    for (var i = 0; i < 10; i++) {
+      rows.add((await h.aliceDb.get('file_$i.txt'))!);
+    }
+    h.connectAlice();
+
+    final tombstones = <Map<String, dynamic>>[];
+    for (var i = 0; i < rows.length; i++) {
+      final row = rows[i];
+      tombstones.add(IndexEntry(
+        relPath: row.relPath,
+        size: row.size,
+        mtime: row.mtime,
+        sha256: row.sha256,
+        version: row.version.bump(_peer),
+        sequence: row.sequence + 100,
+        deleted: true,
+      ).toJson());
+    }
+
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': tombstones,
+      'fromSequence': 0,
+    });
+
+    for (var i = 0; i < 14; i++) {
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isTrue);
+    }
+    for (var i = 0; i < 10; i++) {
+      expect((await h.aliceDb.get('file_$i.txt'))!.deleted, isFalse);
+    }
+  });
+
+  test('explicitly-approved peer mass-delete frame is applied', () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    await h.alice.startPair(h.pair);
+    final rows = <IndexEntry>[];
+    for (var i = 0; i < 10; i++) {
+      rows.add((await h.aliceDb.get('file_$i.txt'))!);
+    }
+    h.connectAlice();
+
+    final tombstones = <Map<String, dynamic>>[];
+    for (var i = 0; i < rows.length; i++) {
+      final row = rows[i];
+      tombstones.add(IndexEntry(
+        relPath: row.relPath,
+        size: row.size,
+        mtime: row.mtime,
+        sha256: row.sha256,
+        version: row.version.bump(_peer),
+        sequence: row.sequence + 100,
+        deleted: true,
+        deletionApproved: true,
+      ).toJson());
+    }
+
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': tombstones,
+      'fromSequence': 0,
+    });
+
+    for (var i = 0; i < 10; i++) {
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isFalse);
+      expect((await h.aliceDb.get('file_$i.txt'))!.deleted, isTrue);
+      expect((await h.aliceDb.get('file_$i.txt'))!.deletionApproved, isTrue);
+    }
+    for (var i = 10; i < 14; i++) {
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isTrue);
+    }
+  });
+
+  test('local mass-delete hold can be explicitly approved and advertised',
+      () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    await h.alice.startPair(h.pair);
+
+    for (var i = 0; i < 10; i++) {
+      h.aliceFs.files.remove('file_$i.txt');
+    }
+    await h.alice.reconcile(h.pair, h.session);
+    expect(h.alice.localDeletionHoldCountFor(h.pair.id), 10);
+    expect((await h.aliceDb.get('file_0.txt'))!.deleted, isFalse);
+
+    h.session.sent.clear();
+    final approved = await h.alice.approveLocalDeletionHold(h.pair);
+    await h.pump();
+
+    expect(approved, 10);
+    expect(h.alice.localDeletionHoldCountFor(h.pair.id), 0);
+    for (var i = 0; i < 10; i++) {
+      final row = (await h.aliceDb.get('file_$i.txt'))!;
+      expect(row.deleted, isTrue);
+      expect(row.deletionApproved, isTrue);
+    }
+
+    final advertised = h.session.sent
+        .where((frame) => frame['t'] == Msg.indexUpdate)
+        .expand((frame) => (frame['entries'] as List? ?? const []))
+        .whereType<Map>()
+        .where((entry) => entry['deleted'] == true)
+        .toList(growable: false);
+    expect(advertised.length, 10);
     expect(
-        h.aliceFs.files.keys, containsAll(<String>['a.txt', 'b.txt', 'c.txt']));
-    expect((await h.aliceDb.get('a.txt'))!.deleted, isFalse);
-    expect((await h.aliceDb.get('b.txt'))!.deleted, isFalse);
-    expect((await h.aliceDb.get('c.txt'))!.deleted, isFalse);
+        advertised.every((entry) => entry['deletionApproved'] == true), isTrue);
+  });
+
+  test('approved orphan tombstones are never re-blocked by retry safety',
+      () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    await h.alice.startPair(h.pair);
+
+    for (var i = 0; i < 10; i++) {
+      final row = (await h.aliceDb.get('file_$i.txt'))!;
+      await h.aliceDb.applyRemote(IndexEntry(
+        relPath: row.relPath,
+        size: row.size,
+        mtime: row.mtime,
+        sha256: row.sha256,
+        version: row.version.bump(_peer),
+        sequence: row.sequence + 100,
+        deleted: true,
+        deletionApproved: true,
+      ));
+    }
+
+    await h.alice.reconcile(h.pair, null);
+    await h.pump();
+
+    for (var i = 0; i < 10; i++) {
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isFalse);
+    }
+    for (var i = 10; i < 14; i++) {
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isTrue);
+    }
   });
 
   test(
@@ -454,6 +607,8 @@ class _FakeSession implements PeerSession {
     msg['msgId'] ??= 'test-${sent.length}';
     sent.add(msg);
   }
+
+  Future<void> sendAsync(Map<String, dynamic> msg) async => send(msg);
 
   @override
   void startHeartbeat({required void Function() onDead}) {}

@@ -1,5 +1,6 @@
 import '../core/relative_path.dart';
 import '../storage/index_db.dart';
+import 'delete_safety.dart';
 import '../sync/ignore_rules.dart';
 import '../sync/manifest.dart';
 
@@ -23,10 +24,17 @@ class ScanResult {
   /// storm on the other device.
   final int blockedDeletionCount;
 
+  /// Exact paths withheld by the mass-deletion safety hold. Capturing the
+  /// snapshot lets the UI approve only the deletions the user actually saw,
+  /// rather than blindly authorizing any additional files that disappear
+  /// between the warning and the confirmation tap.
+  final List<String> blockedDeletionPaths;
+
   ScanResult(
     this.changed,
     this.maxSequence, {
     this.blockedDeletionCount = 0,
+    this.blockedDeletionPaths = const <String>[],
   });
 
   bool get isEmpty => changed.isEmpty;
@@ -171,7 +179,7 @@ class IndexScanner {
     final missingLocalPaths = localPaths
         .where((path) => !seenPaths.contains(path))
         .toList(growable: false);
-    final blockMassDeletion = _isMassDeletion(
+    final blockMassDeletion = DeleteSafetyPolicy.shouldHold(
       deletedCount: missingLocalPaths.length,
       existingCount: localPaths.length,
     );
@@ -191,20 +199,9 @@ class IndexScanner {
       changed,
       maxSeq,
       blockedDeletionCount: blockMassDeletion ? missingLocalPaths.length : 0,
+      blockedDeletionPaths:
+          blockMassDeletion ? List.unmodifiable(missingLocalPaths) : const [],
     );
-  }
-
-  /// A complete/near-complete disappearance is ambiguous: it can be a real
-  /// user deletion, but it can also be a transient provider failure, a lost
-  /// SAF grant, or a freshly installed peer reporting an empty folder. The
-  /// latter must not delete the other device's files automatically.
-  static bool _isMassDeletion({
-    required int deletedCount,
-    required int existingCount,
-  }) {
-    if (deletedCount == 0 || existingCount == 0) return false;
-    if (deletedCount == existingCount) return true;
-    return deletedCount >= 2 && deletedCount * 2 >= existingCount;
   }
 
   /// Lists every file under [rootPath] with its size+mtime. Uses

@@ -186,6 +186,27 @@ void main() {
       await db.close();
     });
 
+    test('approved deletion persists and round-trips on the wire', () async {
+      final db = await IndexDb.open('p', stateDir);
+      await db.upsertLocal(
+          relPath: 'a.txt', size: 10, mtime: 1, sha256: 'aa', deviceId: 'A');
+      await db.markDeletedLocal(
+        relPath: 'a.txt',
+        deviceId: 'A',
+        deletionApproved: true,
+      );
+
+      final row = (await db.get('a.txt'))!;
+      expect(row.deleted, isTrue);
+      expect(row.deletionApproved, isTrue);
+
+      final wire = row.toJson();
+      expect(wire['deletionApproved'], isTrue);
+      final decoded = IndexEntry.fromJson(wire);
+      expect(decoded.deletionApproved, isTrue);
+      await db.close();
+    });
+
     test('deleting an already-deleted file is a no-op', () async {
       final db = await IndexDb.open('p', stateDir);
       await db.upsertLocal(

@@ -13,6 +13,7 @@ import '../net/transport.dart';
 import '../protocol/wire.dart';
 import '../storage/index_db.dart';
 import 'block_transfer.dart';
+import 'delete_safety.dart';
 import 'file_send.dart';
 import 'index_diff.dart';
 import 'manifest.dart';
@@ -333,6 +334,12 @@ class SyncEngine {
   final _localDeletionHolds = <String, int>{};
   final _remoteDeletionHolds = <String, int>{};
 
+  /// Exact source-side deletions currently withheld by the scanner's mass-
+  /// deletion guard. Kept separately from [_localDeletionHolds], which also
+  /// represents receive-side orphan cleanup holds. Only this map is eligible
+  /// for the explicit user action "Propagate deletions".
+  final _localDeletionHoldPaths = <String, Set<String>>{};
+
   /// Active block-fetch sinks, keyed by `"$pairId|$name"`. The `Msg.response`
   /// handler routes each incoming response into the sink for the file it's a
   /// reply to; [fetchFileBlockLevel]'s `sendRequest` pulls the next response
@@ -371,6 +378,87 @@ class SyncEngine {
     return blocked == 0
         ? fallback
         : 'Safety hold: $blocked deletion(s) blocked';
+  }
+
+  /// Number of LOCAL missing paths currently waiting for an explicit user
+  /// decision. A receive-side safety hold is intentionally not exposed as an
+  /// approvable source deletion here.
+  int localDeletionHoldCountFor(String pairId) =>
+      _localDeletionHoldPaths[pairId]?.length ?? 0;
+
+  List<String> localDeletionHoldPathsFor(String pairId) {
+    final paths = _localDeletionHoldPaths[pairId]?.toList(growable: false) ??
+        const <String>[];
+    if (paths.isEmpty) return const <String>[];
+    final sorted = List<String>.of(paths)..sort();
+    return List.unmodifiable(sorted);
+  }
+
+  /// Convert the exact locally-held paths into durable, explicitly-approved
+  /// tombstones. The approval bit is stored in the Index DB and rides with the
+  /// tombstone on the wire, so the peer may safely accept the bulk deletion
+  /// even after reconnect/restart.
+  ///
+  /// Paths are re-stat'ed before tombstoning: if the file reappeared since the
+  /// warning was raised it is NOT deleted. New disappearances that were not in
+  /// the warning snapshot are also not included; they require their own hold.
+  Future<int> approveLocalDeletionHold(FolderPair pair) async {
+    if (pair.direction == SyncDirection.receiveOnly) {
+      throw StateError(
+          'Receive-only folders cannot propagate local deletions.');
+    }
+    final held = _localDeletionHoldPaths[pair.id];
+    if (held == null || held.isEmpty) return 0;
+
+    final st = _states[pair.id] ??= PairSyncState(pairId: pair.id);
+    if (st.scanning) {
+      throw StateError('Sync is busy; try the deletion approval again.');
+    }
+
+    st.scanning = true;
+    st.status = 'Approving held deletions';
+    if (!_disposed) _stateController.add(st);
+
+    var approved = 0;
+    try {
+      final db = await _indexDbFor(pair);
+      for (final relPath in List<String>.of(held)) {
+        if (!isSyncableRelativePath(relPath)) continue;
+        // The hold is a snapshot, not a blanket permission. A restored path is
+        // no longer eligible and a newly-missing path was never approved.
+        if (await fs.stat(pair.localPath, relPath) != null) continue;
+        final wrote = await db.markDeletedLocal(
+          relPath: relPath,
+          deviceId: deviceId,
+          deletionApproved: true,
+        );
+        if (wrote) approved++;
+      }
+      _localDeletionHoldPaths.remove(pair.id);
+      _localDeletionHolds.remove(pair.id);
+      if (approved > 0) {
+        _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
+      }
+      st.status = approved == 0
+          ? 'Held deletions no longer present'
+          : 'Approved $approved deletion(s)';
+      log(
+        pair.id,
+        approved == 0
+            ? 'Deletion safety hold cleared; no held paths are still missing'
+            : 'User approved $approved held deletion(s) for propagation',
+        SyncEventLevel.info,
+      );
+    } finally {
+      st.scanning = false;
+      if (!_disposed) _stateController.add(st);
+    }
+
+    final peerId = pair.peerDeviceId;
+    final candidate = peerId == null ? null : registry.openSessionFor(peerId);
+    final session = candidate?.isLinkReady == true ? candidate : null;
+    await reconcile(pair, session);
+    return approved;
   }
 
   bool _disposed = false;
@@ -579,6 +667,7 @@ class SyncEngine {
     _peerUpdatedAt.remove(pairId);
     _localDeletionHolds.remove(pairId);
     _remoteDeletionHolds.remove(pairId);
+    _localDeletionHoldPaths.remove(pairId);
     _peerSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _sentSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _activeReconcileSessions.remove(pairId);
@@ -1396,6 +1485,7 @@ class SyncEngine {
     }
     if (scan.blockedDeletionCount > 0) {
       _localDeletionHolds[pair.id] = scan.blockedDeletionCount;
+      _localDeletionHoldPaths[pair.id] = scan.blockedDeletionPaths.toSet();
       log(
         pair.id,
         'Safety hold: blocked ${scan.blockedDeletionCount} suspected '
@@ -1404,6 +1494,7 @@ class SyncEngine {
       );
     } else {
       _localDeletionHolds.remove(pair.id);
+      _localDeletionHoldPaths.remove(pair.id);
     }
 
     if (session == null) {
@@ -1979,12 +2070,30 @@ class SyncEngine {
   bool _sessionOwnsPair(PeerSession session, FolderPair pair) =>
       pair.peerDeviceId == session.peer.deviceId;
 
-  bool _isMassDeleteFrame(List<dynamic> entries) {
-    final maps = entries.whereType<Map>();
-    final total = maps.length;
-    if (total == 0) return false;
-    final deletes = maps.where((entry) => entry['deleted'] == true).length;
-    return deletes >= 2 && deletes * 2 >= total;
+  Future<bool> _isMassDeleteFrame(
+    FolderPair pair,
+    List<dynamic> entries,
+  ) async {
+    // The transport page is NOT the denominator. A perfectly ordinary
+    // two-file cleanup may arrive in a frame containing only two tombstones,
+    // which made the old `deletes / frameEntries` heuristic call it a 100%
+    // wipe. Compare unapproved deletes against the receiver's actual current
+    // live index instead. Explicitly-approved tombstones are trusted user
+    // intent and are excluded from the suspicious-delete count.
+    final unapprovedDeletes = entries
+        .whereType<Map>()
+        .where((entry) =>
+            entry['deleted'] == true && entry['deletionApproved'] != true)
+        .length;
+    if (unapprovedDeletes < DeleteSafetyPolicy.minimumDeletionCount) {
+      return false;
+    }
+    final db = await _indexDbFor(pair);
+    final existingLiveCount = (await db.livePaths()).length;
+    return DeleteSafetyPolicy.shouldHold(
+      deletedCount: unapprovedDeletes,
+      existingCount: existingLiveCount,
+    );
   }
 
   /// Resolve a pair only when it belongs to the session's authenticated peer.
@@ -2348,11 +2457,12 @@ class SyncEngine {
     var maxSeq = priorSeq;
     final wasLiveEmpty = !_peerLive.containsKey(pairId);
     final live = _peerLive.putIfAbsent(pairId, () => <String, IndexEntry>{});
-    final massDeleteFrame = _isMassDeleteFrame(entriesRaw);
+    final massDeleteFrame = await _isMassDeleteFrame(pair, entriesRaw);
     if (massDeleteFrame) {
       final deleteCount = entriesRaw
           .whereType<Map>()
-          .where((entry) => entry['deleted'] == true)
+          .where((entry) =>
+              entry['deleted'] == true && entry['deletionApproved'] != true)
           .length;
       _remoteDeletionHolds[pairId] = deleteCount;
       log(
@@ -2360,8 +2470,9 @@ class SyncEngine {
         'Safety hold: blocked $deleteCount suspected peer mass deletion(s)',
         SyncEventLevel.warn,
       );
-    } else if (entriesRaw
-        .any((entry) => entry is Map && entry['deleted'] != true)) {
+    } else if (entriesRaw.isNotEmpty) {
+      // A clean/approved subsequent frame clears a stale warning. Explicitly
+      // approved tombstones are safe activity, not another suspicious event.
       _remoteDeletionHolds.remove(pairId);
     }
     var learned = 0;
@@ -2380,7 +2491,7 @@ class SyncEngine {
             SyncEventLevel.warn);
         continue;
       }
-      if (entry.deleted && massDeleteFrame) {
+      if (entry.deleted && massDeleteFrame && !entry.deletionApproved) {
         // Advance the peer watermark and remove the path from the peer live
         // view, but do not persist the tombstone or touch local disk. A
         // peer's empty/newly reinstalled folder is not sufficient authority
@@ -2617,18 +2728,31 @@ class SyncEngine {
       if (stat == null) continue; // already gone — nothing to do
       pending.add(t);
     }
+    final approvedPending = pending
+        .where((entry) => entry.deletionApproved)
+        .toList(growable: false);
+    final unapprovedPending = pending
+        .where((entry) => !entry.deletionApproved)
+        .toList(growable: false);
     final localPaths = await db.localLivePaths(deviceId);
-    if (pending.length >= 2 &&
-        pending.length * 2 >= pending.length + localPaths.length) {
-      _localDeletionHolds[pair.id] = pending.length;
+    final holdUnapproved = DeleteSafetyPolicy.shouldHold(
+      deletedCount: unapprovedPending.length,
+      // These tombstoned files are still physically present, so include them
+      // in the pre-delete population alongside rows that remain live. Approved
+      // tombstones are deliberately excluded: they must never be re-blocked by
+      // a later retry sweep if their first filesystem delete failed.
+      existingCount: unapprovedPending.length + localPaths.length,
+    );
+    if (holdUnapproved) {
+      _localDeletionHolds[pair.id] = unapprovedPending.length;
       log(
         pair.id,
-        'Safety hold: skipped ${pending.length} orphan mass deletion(s)',
+        'Safety hold: skipped ${unapprovedPending.length} orphan mass deletion(s)',
         SyncEventLevel.warn,
       );
-      return;
     }
-    for (final t in pending) {
+    final deletionsToApply = holdUnapproved ? approvedPending : pending;
+    for (final t in deletionsToApply) {
       final vault = await vaultBeforeDestructiveChange(
         pair: pair,
         relPath: t.relPath,

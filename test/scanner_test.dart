@@ -95,7 +95,7 @@ void main() {
     expect(result.changed.where((e) => e.relPath == 'b.txt'), isEmpty);
   });
 
-  test('blocks a mass disappearance instead of emitting delete tombstones',
+  test('small full-folder cleanup is not treated as a catastrophic wipe',
       () async {
     final fs = FakeFs({
       'a.txt': utf8Bytes('a'),
@@ -108,11 +108,29 @@ void main() {
     final result =
         await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
 
-    expect(result.blockedDeletionCount, 3);
+    expect(result.blockedDeletionCount, 0);
+    expect(result.changed.length, 3);
+    expect(result.changed.every((entry) => entry.deleted), isTrue);
+  });
+
+  test('blocks ten-or-more deletions when they remove at least seventy percent',
+      () async {
+    final fs = FakeFs({
+      for (var i = 0; i < 14; i++) 'file_$i.txt': utf8Bytes('$i'),
+    });
+    await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
+
+    for (var i = 0; i < 10; i++) {
+      fs.files.remove('file_$i.txt');
+    }
+    final result =
+        await scanner.scan(fs: fs, db: db, rootPath: 'r', deviceId: 'A');
+
+    expect(result.blockedDeletionCount, 10);
+    expect(result.blockedDeletionPaths.length, 10);
     expect(result.changed, isEmpty);
-    expect((await db.get('a.txt'))!.deleted, isFalse);
-    expect((await db.get('b.txt'))!.deleted, isFalse);
-    expect((await db.get('c.txt'))!.deleted, isFalse);
+    expect((await db.get('file_0.txt'))!.deleted, isFalse);
+    expect((await db.get('file_13.txt'))!.deleted, isFalse);
   });
 
   test('a file matching an ignore glob is never indexed at all', () async {

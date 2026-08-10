@@ -541,6 +541,8 @@ class _FolderPairCardState extends State<_FolderPairCard> {
     final p = widget.pair;
     final st = widget.state.stateFor(p.id);
     final status = st?.status ?? 'Idle';
+    final deletionHoldPaths = widget.state.localDeletionHoldPathsFor(p.id);
+    final deletionHoldCount = deletionHoldPaths.length;
 
     // Same status -> dot-color/live mapping _OverviewPage uses for its own
     // folder-pair rows — kept identical rather than reinventing a second
@@ -550,7 +552,7 @@ class _FolderPairCardState extends State<_FolderPairCard> {
     if (status == 'Error') {
       dotColor = c.danger;
       live = false;
-    } else if (status == 'Paused') {
+    } else if (status == 'Paused' || status.startsWith('Safety hold:')) {
       dotColor = c.amber;
       live = false;
     } else if (status.startsWith('Idle') || status == 'Peer offline') {
@@ -665,6 +667,74 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                       ],
                     ),
                   ],
+                  if (deletionHoldCount > 0) ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: c.amber.withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: c.amber.withValues(alpha: 0.24),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(Icons.health_and_safety_outlined,
+                                  size: 17, color: c.amber),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'Safety hold: $deletionHoldCount local '
+                                  'deletion(s) were not propagated.',
+                                  style: AppTypography.inter(
+                                    textStyle: TextStyle(
+                                      color: c.textSecondary,
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          if (p.direction != SyncDirection.receiveOnly) ...[
+                            const SizedBox(height: 10),
+                            SizedBox(
+                              width: double.infinity,
+                              child: GlassButton(
+                                icon: Icons.delete_forever_outlined,
+                                label: 'Propagate deletions',
+                                accentColor: c.danger,
+                                style: GlassButtonStyle.outline,
+                                compact: true,
+                                onTap: () => _confirmPropagateDeletions(
+                                  context,
+                                  deletionHoldPaths,
+                                ),
+                              ),
+                            ),
+                          ] else ...[
+                            const SizedBox(height: 6),
+                            Text(
+                              'This pair is receive-only, so local deletions '
+                              'cannot be sent to the peer.',
+                              style: AppTypography.inter(
+                                textStyle: TextStyle(
+                                  color: c.textTertiary,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 14),
                   Row(
                     children: [
@@ -721,6 +791,58 @@ class _FolderPairCardState extends State<_FolderPairCard> {
           ),
       ],
     );
+  }
+
+  Future<void> _confirmPropagateDeletions(
+    BuildContext context,
+    List<String> heldPaths,
+  ) async {
+    final deletionCount = heldPaths.length;
+    final previewPaths = heldPaths.take(6).map((path) => '• $path').join('\n');
+    final remaining = deletionCount - (deletionCount < 6 ? deletionCount : 6);
+    final preview =
+        remaining > 0 ? '$previewPaths\n• …and $remaining more' : previewPaths;
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: Text('Propagate $deletionCount deletions?'),
+        content: Text(
+          'Conduit blocked these deletions because many files disappeared at '
+          'once. Continue only if you intentionally deleted them. The matching '
+          'files on the peer device will be deleted during sync.\n\n$preview',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, false),
+            child: const Text('Keep blocked'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('Propagate deletions'),
+          ),
+        ],
+      ),
+    );
+    if (approved != true || !mounted) return;
+
+    try {
+      final count = await widget.state.propagateHeldDeletions(widget.pair);
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            count == 0
+                ? 'No held deletions were still missing.'
+                : 'Approved $count deletion(s) for sync.',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not approve deletions: $e')),
+      );
+    }
   }
 }
 

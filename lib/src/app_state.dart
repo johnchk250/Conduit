@@ -271,6 +271,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   List<PairedPeer> get pairedPeers => _config.pairedPeers;
   List<SyncEvent> get events => List.unmodifiable(_events);
   PairSyncState? stateFor(String pairId) => _engine.stateFor(pairId);
+  int localDeletionHoldCountFor(String pairId) =>
+      _engine.localDeletionHoldCountFor(pairId);
+  List<String> localDeletionHoldPathsFor(String pairId) =>
+      _engine.localDeletionHoldPathsFor(pairId);
   bool get bluetoothEnabled => _config.bluetoothEnabled;
   String get bluetoothStatus {
     for (final peer in _config.pairedPeers) {
@@ -332,6 +336,15 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       pair,
       session != null && session.isLinkReady ? session : null,
     );
+  }
+
+  /// Explicitly authorize the exact local deletions currently held by the
+  /// mass-deletion safety guard. The engine persists the approval on each
+  /// tombstone and reconciles immediately when possible.
+  Future<int> propagateHeldDeletions(FolderPair pair) async {
+    final approved = await _engine.approveLocalDeletionHold(pair);
+    notifyListeners();
+    return approved;
   }
 
   /// Force one manual reconcile for every configured folder pair.
