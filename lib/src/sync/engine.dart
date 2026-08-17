@@ -1737,6 +1737,21 @@ class SyncEngine {
           // spurious version and feed the re-advertise loop). This never bumps
           // the version — the authoritative sha already matches (the peer
           // advertised it and we just verified it).
+          // Do not commit sync state from the transfer result alone. A previous
+          // regression allowed the transfer pipeline to return successfully while
+          // the final rename was still not visible on disk. That leaves:
+          //   DB: synced
+          //   disk: only <file>.syncpart
+          //
+          // Manual sync fixes this because reconciliation runs again. Background
+          // sync must not create this poisoned state.
+          final finalStat = await fs.stat(pair.localPath, need.relPath);
+          if (finalStat == null || finalStat.size != need.peer.size) {
+            throw StateError(
+              'Transfer completed but final file is not visible: ${need.relPath}',
+            );
+          }
+
           await db.confirmLocalObservation(relPath: need.relPath, sha: sha);
           await transferReceipts?.upsert(TransferReceipt(
             receiptId:
