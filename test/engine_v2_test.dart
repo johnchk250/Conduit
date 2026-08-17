@@ -258,6 +258,29 @@ void main() {
     );
   });
 
+  test('a failed finalization is not reported as a successful sync', () async {
+    final content = utf8.encode('peer-content');
+    h.aliceFs.failFinalize = true;
+    h.bobFs.files['shared.txt'] = content;
+
+    await h.alice.startPair(h.pair);
+    final bobEntry = await _scanOne(h.bobFs, h.pair, 'shared.txt', content);
+
+    h.connectAlice();
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': [bobEntry.toJson()],
+      'fromSequence': 0,
+    });
+    await h.pumpUntil(
+        () => h.aliceFs.files.containsKey('shared.txt$syncPartSuffix'));
+
+    expect(h.alice.stateFor(h.pair.id)?.status, 'Error');
+    expect(h.aliceFs.files.containsKey('shared.txt'), isFalse);
+  });
+
   test('an empty indexUpdate does NOT kick a reconcile (no ping-pong)',
       () async {
     // The flaw-#1 guard: an empty delta doesn't advance maxSeq past priorSeq,
@@ -815,11 +838,12 @@ T? _firstWhereOrNull<T>(Iterable<T> it, bool Function(T) test) {
 // ---------------------------------------------------------------------------
 
 /// In-memory [FileSystemAccess]. Backs the engine's scan / read / write calls.
-class FakeFs implements FileSystemAccess {
+class FakeFs implements FileSystemAccess, TemporaryFileFinalizer {
   FakeFs([Map<String, List<int>>? initial]) {
     if (initial != null) files.addAll(initial);
   }
   final Map<String, List<int>> files = {};
+  bool failFinalize = false;
 
   Completer<void>? listFilesGate;
   int listFilesCalls = 0;
@@ -860,6 +884,22 @@ class FakeFs implements FileSystemAccess {
   @override
   Future<bool> delete(String rootPath, String relPath) async =>
       files.remove(relPath) != null;
+
+  @override
+  Future<void> replaceFromTemporary(
+    String rootPath,
+    String temporaryRelPath,
+    String destinationRelPath,
+  ) async {
+    if (failFinalize) {
+      throw StateError('simulated finalization failure');
+    }
+    final bytes = files.remove(temporaryRelPath);
+    if (bytes == null) {
+      throw StateError('missing temporary file: $temporaryRelPath');
+    }
+    files[destinationRelPath] = bytes;
+  }
 
   @override
   Future<String> moveToVault(String rootPath, String relPath) async =>

@@ -1685,6 +1685,8 @@ class SyncEngine {
     final transferLease = await heavyWorkScheduler.acquireTransfer();
     _beginTransfer(); // Phase 0.4: hold a wake lock only while bytes move
     var done = 0;
+    var completed = 0;
+    var failures = 0;
     final total = transferable.length;
     try {
       for (final need in transferable) {
@@ -1753,17 +1755,20 @@ class SyncEngine {
             confirmation: TransferConfirmation.localVerified,
             localDestinationAvailable: true,
           ));
+          completed++;
         } on TerminalFetchError catch (e) {
           // Peer's source is gone (or refused). Drop the need — DO NOT retry.
           // The file will be re-added by a future IndexUpdate if it reappears.
           log(pair.id, 'V2 drop ${need.relPath}: ${e.reason}',
               SyncEventLevel.warn);
+          failures++;
         } catch (e) {
           // Non-terminal error (session died mid-fetch, hash mismatch, ...).
           // Log and move on; the next reconcile (reconnect / local change)
           // retries.
           log(pair.id, 'V2 fetch ${need.relPath} failed: $e',
               SyncEventLevel.error);
+          failures++;
         } finally {
           // Release the per-file block sink regardless of outcome so a retry
           // opens a fresh one (no stale responses queued from the prior
@@ -1782,17 +1787,30 @@ class SyncEngine {
     }
     st.transferring = false;
     st.progress = null;
-    st.lastSyncedAt = DateTime.now();
-    st.status = deferred.isEmpty
-        ? _idleStatus(pair.id)
-        : 'Bluetooth · ${deferred.length} large file(s) paused';
+    if (failures > 0) {
+      st.status = 'Error';
+    } else {
+      if (deferred.isEmpty) st.lastSyncedAt = DateTime.now();
+      st.status = deferred.isEmpty
+          ? _idleStatus(pair.id)
+          : 'Bluetooth · ${deferred.length} large file(s) paused';
+    }
     if (!_disposed) _stateController.add(st);
-    log(
-      pair.id,
-      'V2 synced: $done/$total fetched'
-      '${deferred.isEmpty ? '' : ', ${deferred.length} deferred on Bluetooth'}',
-      SyncEventLevel.info,
-    );
+    if (failures > 0) {
+      log(
+        pair.id,
+        'V2 sync incomplete: $completed/$total fetched, '
+        '$failures failed',
+        SyncEventLevel.error,
+      );
+    } else {
+      log(
+        pair.id,
+        'V2 synced: $completed/$total fetched'
+        '${deferred.isEmpty ? '' : ', ${deferred.length} deferred on Bluetooth'}',
+        SyncEventLevel.info,
+      );
+    }
   }
 
   /// Reference-counted transfer tracking for the wake lock (Roadmap Phase 0.4).

@@ -139,6 +139,27 @@ void main() {
     expect(clientFs.files.containsKey('fast.bin$syncPartSuffix'), isFalse);
   });
 
+  test('completed fetch retries transient finalization failures', () async {
+    final content = bytes(4096);
+    final serverFs = FakeFs({'retry.bin': content});
+    final clientFs = _FlakyFinalizeFs({}, failuresBeforeSuccess: 2);
+
+    final b = bridge(serverFs: serverFs, relPath: 'retry.bin');
+    await fetchFileBlockLevel(
+      fs: clientFs,
+      rootPath: 'r',
+      relPath: 'retry.bin',
+      expectedSize: content.length,
+      expectedSha: sha(content),
+      blockHashes: blockHashesFor(content),
+      sendRequest: b.sendRequest,
+    );
+
+    expect(clientFs.finalizeCalls, 3);
+    expect(clientFs.files['retry.bin'], content);
+    expect(clientFs.files.containsKey('retry.bin$syncPartSuffix'), isFalse);
+  });
+
   test(
       'fetching a file that already exists locally vaults the old bytes '
       'under .syncversions/ and lands the new bytes at the live path '
@@ -192,6 +213,31 @@ void main() {
     );
     expect(result, sha(newContent));
     expect(clientFs.files['a.txt'], newContent);
+  });
+
+  test('an atomic-finalizer vault failure preserves the old file and part',
+      () async {
+    final oldContent = bytes(500);
+    final newContent = bytes(2048);
+    final serverFs = FakeFs({'a.txt': newContent});
+    final clientFs = _FailingVaultAndFinalizeFs({'a.txt': oldContent});
+
+    final b = bridge(serverFs: serverFs, relPath: 'a.txt');
+    await expectLater(
+      fetchFileBlockLevel(
+        fs: clientFs,
+        rootPath: 'r',
+        relPath: 'a.txt',
+        expectedSize: newContent.length,
+        expectedSha: sha(newContent),
+        blockHashes: blockHashesFor(newContent),
+        sendRequest: b.sendRequest,
+      ),
+      throwsA(isA<StateError>()),
+    );
+
+    expect(clientFs.files['a.txt'], oldContent);
+    expect(clientFs.files['a.txt$syncPartSuffix'], newContent);
   });
 
   test('hashless fetch can request smaller blocks for smoother ad-hoc I/O',
@@ -557,6 +603,25 @@ class _FailingVaultFs extends FakeFs {
   }
 }
 
+class _FailingVaultAndFinalizeFs extends FakeFs
+    implements TemporaryFileFinalizer {
+  _FailingVaultAndFinalizeFs([super.initial]);
+
+  @override
+  Future<String> moveToVault(String rootPath, String relPath) async {
+    throw StateError('simulated vault failure');
+  }
+
+  @override
+  Future<void> replaceFromTemporary(
+    String rootPath,
+    String temporaryRelPath,
+    String destinationRelPath,
+  ) async {
+    throw StateError('finalizer must not replace after vault failure');
+  }
+}
+
 class _FastFinalizeFs extends FakeFs implements TemporaryFileFinalizer {
   _FastFinalizeFs([super.initial]);
 
@@ -569,6 +634,33 @@ class _FastFinalizeFs extends FakeFs implements TemporaryFileFinalizer {
     String destinationRelPath,
   ) async {
     finalizeCalls++;
+    final bytes = files.remove(temporaryRelPath);
+    if (bytes == null) {
+      throw StateError('missing temporary file: $temporaryRelPath');
+    }
+    files[destinationRelPath] = bytes;
+  }
+}
+
+class _FlakyFinalizeFs extends FakeFs implements TemporaryFileFinalizer {
+  _FlakyFinalizeFs(
+    super.initial, {
+    required this.failuresBeforeSuccess,
+  });
+
+  final int failuresBeforeSuccess;
+  int finalizeCalls = 0;
+
+  @override
+  Future<void> replaceFromTemporary(
+    String rootPath,
+    String temporaryRelPath,
+    String destinationRelPath,
+  ) async {
+    finalizeCalls++;
+    if (finalizeCalls <= failuresBeforeSuccess) {
+      throw StateError('simulated transient finalization lock');
+    }
     final bytes = files.remove(temporaryRelPath);
     if (bytes == null) {
       throw StateError('missing temporary file: $temporaryRelPath');

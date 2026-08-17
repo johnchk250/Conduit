@@ -22,6 +22,12 @@ const int blockSize = 1 << 20; // 1 MiB
 /// once the whole file is filled AND its SHA-256 matches the Index entry.
 const syncPartSuffix = '.syncpart';
 
+// Windows security/indexing tools can hold a completed temporary file briefly
+// after the last write closes. Keep the verified .syncpart in place while we
+// retry the final move; deleting it would throw away resumable data.
+const _finalizeRetryAttempts = 4;
+const _finalizeRetryDelay = Duration(milliseconds: 150);
+
 /// Thrown by [fetchFileBlockLevel] when the peer reports a terminal error for
 /// a block (typically: source file vanished between Index advertise and
 /// Request). The caller (the engine's needs-queue processor) catches this and
@@ -289,6 +295,8 @@ Future<void> _replacePartWithFinal(
     await Directory(p.dirname(dest.path)).create(recursive: true);
     if (await dest.exists()) {
       var vaulted = false;
+      Object? vaultError;
+      StackTrace? vaultStack;
       try {
         // Stat BEFORE vaulting: moveToVault renames the file away, so
         // dest.length() would throw afterward.
@@ -296,16 +304,18 @@ Future<void> _replacePartWithFinal(
         final vaultPath = await fs.moveToVault(rootPath, relPath);
         vaulted = true;
         onVaulted?.call(vaultPath, oldSize);
-      } catch (_) {
-        // Best-effort — fall through to the pre-existing delete-and-replace
-        // behavior below so a vault failure never blocks the transfer.
+      } catch (e, stack) {
+        vaultError = e;
+        vaultStack = stack;
       }
-      // moveToVault already removed the file at `dest` by renaming it away;
-      // only delete here if that didn't happen (vault failed, or `dest`
-      // reappeared/still exists for some other reason).
-      if (!vaulted && await dest.exists()) await dest.delete();
+      // If the recovery move failed, keep the existing destination and the
+      // verified part. Deleting the old file here could lose the user's only
+      // good copy when the failure was caused by a lock or disk problem.
+      if (!vaulted && await dest.exists()) {
+        Error.throwWithStackTrace(vaultError!, vaultStack!);
+      }
     }
-    await part.rename(dest.path);
+    await _withFinalizeRetries(() => part.rename(dest.path));
     return;
   }
   final existing = await fs.stat(rootPath, relPath);
@@ -313,19 +323,43 @@ Future<void> _replacePartWithFinal(
     try {
       final vaultPath = await fs.moveToVault(rootPath, relPath);
       onVaulted?.call(vaultPath, existing.size);
-    } catch (_) {
-      // Best-effort — the write below overwrites in place either way,
-      // matching pre-existing behavior when vaulting isn't possible.
+    } catch (e, stack) {
+      // SAF finalization deletes/replaces an existing destination. If the
+      // recovery move failed, do not let that replacement destroy the only
+      // known-good copy; keep the verified part for a later retry instead.
+      if (fs is TemporaryFileFinalizer) {
+        Error.throwWithStackTrace(e, stack);
+      }
+      // Test/custom backends that do not provide an atomic finalizer retain
+      // their legacy best-effort overwrite behavior below.
     }
   }
   if (fs is TemporaryFileFinalizer) {
-    await (fs as TemporaryFileFinalizer)
-        .replaceFromTemporary(rootPath, partRel, relPath);
+    await _withFinalizeRetries(() => (fs as TemporaryFileFinalizer)
+        .replaceFromTemporary(rootPath, partRel, relPath));
     return;
   }
   final bytes = await _readAll(fs, rootPath, partRel);
   await fs.write(rootPath, relPath, bytes);
   await fs.delete(rootPath, partRel);
+}
+
+Future<void> _withFinalizeRetries(Future<void> Function() operation) async {
+  Object? lastError;
+  StackTrace? lastStack;
+  for (var attempt = 0; attempt < _finalizeRetryAttempts; attempt++) {
+    try {
+      await operation();
+      return;
+    } catch (e, stack) {
+      lastError = e;
+      lastStack = stack;
+      if (attempt + 1 < _finalizeRetryAttempts) {
+        await Future<void>.delayed(_finalizeRetryDelay);
+      }
+    }
+  }
+  Error.throwWithStackTrace(lastError!, lastStack!);
 }
 
 /// Serve a file block-by-block in response to `request` frames. Streams each
