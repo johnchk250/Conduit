@@ -1,3 +1,4 @@
+import '../sync/file_utils.dart';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -86,7 +87,7 @@ abstract class FileSystemAccess {
     final destName = '$base.$stamp$ext';
     final dest = p.join(vaultDir, destName);
     final src = p.join(rootPath, relPath);
-    await File(src).rename(dest);
+    await safeAtomicRename(File(src), File(dest));
     final vaultRelDir =
         relDir == '.' ? '.syncversions' : p.join('.syncversions', relDir);
     return p.join(vaultRelDir, destName);
@@ -287,7 +288,7 @@ class LocalFileSystemAccess
     final destName = '$base.$stamp$ext';
     final dest = _containedPath(rootPath, p.join(vaultRelDir, destName));
     final src = _containedPath(rootPath, relPath);
-    await File(src).rename(dest);
+    await safeAtomicRename(File(src), File(dest));
     return p.join(vaultRelDir, destName);
   }
 
@@ -307,7 +308,7 @@ class LocalFileSystemAccess
     Object? lastError;
     for (var attempt = 0; attempt < 12; attempt++) {
       try {
-        await source.rename(destination);
+        await safeAtomicRename(File(source.path), File(destination));
         if (!await File(destination).exists() || await source.exists()) {
           throw FileSystemException(
             'Temporary file rename was not visible after completion',

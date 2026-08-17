@@ -1,3 +1,4 @@
+import '../sync/file_utils.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -316,7 +317,7 @@ Future<void> _replacePartWithFinal(
       }
     }
     await _withFinalizeRetries(() async {
-      await part.rename(dest.path);
+      await safeAtomicRename(File(part.path), File(dest.path));
       if (!await dest.exists() || await part.exists()) {
         throw FileSystemException(
           'Temporary file rename was not visible after completion',
