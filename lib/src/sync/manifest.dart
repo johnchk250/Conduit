@@ -304,7 +304,24 @@ class LocalFileSystemAccess
     await Directory(p.dirname(destination)).create(recursive: true);
     final existing = File(destination);
     if (await existing.exists()) await existing.delete();
-    await source.rename(destination);
+    Object? lastError;
+    for (var attempt = 0; attempt < 12; attempt++) {
+      try {
+        await source.rename(destination);
+        if (!await File(destination).exists() || await source.exists()) {
+          throw FileSystemException(
+            'Temporary file rename was not visible after completion',
+            destination,
+          );
+        }
+        return;
+      } catch (e) {
+        lastError = e;
+        if (attempt == 11) rethrow;
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+    }
+    throw lastError!;
   }
 }
 

@@ -25,8 +25,8 @@ const syncPartSuffix = '.syncpart';
 // Windows security/indexing tools can hold a completed temporary file briefly
 // after the last write closes. Keep the verified .syncpart in place while we
 // retry the final move; deleting it would throw away resumable data.
-const _finalizeRetryAttempts = 4;
-const _finalizeRetryDelay = Duration(milliseconds: 150);
+const _finalizeRetryAttempts = 12;
+const _finalizeRetryDelay = Duration(milliseconds: 250);
 
 /// Thrown by [fetchFileBlockLevel] when the peer reports a terminal error for
 /// a block (typically: source file vanished between Index advertise and
@@ -315,7 +315,15 @@ Future<void> _replacePartWithFinal(
         Error.throwWithStackTrace(vaultError!, vaultStack!);
       }
     }
-    await _withFinalizeRetries(() => part.rename(dest.path));
+    await _withFinalizeRetries(() async {
+      await part.rename(dest.path);
+      if (!await dest.exists() || await part.exists()) {
+        throw FileSystemException(
+          'Temporary file rename was not visible after completion',
+          dest.path,
+        );
+      }
+    });
     return;
   }
   final existing = await fs.stat(rootPath, relPath);
