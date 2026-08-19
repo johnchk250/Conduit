@@ -11,6 +11,7 @@ add_executable(${BINARY_NAME} WIN32
   "main.cpp"
   "utils.cpp"
   "win32_window.cpp"
+  "send_popup.cpp"
   "send_to_shortcut.cpp"
   "bluetooth_proxy_win.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
@@ -36,6 +37,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "Comctl32.lib")
 # Phase 3d: Shell32 + Ole32 for IShellLinkW / CoCreateInstance (Send-to shortcut).
 target_link_libraries(${BINARY_NAME} PRIVATE "Shell32.lib" "Ole32.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "Bthprops.lib" "Ws2_32.lib")

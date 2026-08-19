@@ -57,8 +57,14 @@ static HWND FindExistingInstance() {
   return FindWindowW(kWindowClass, kWindowTitle);
 }
 
-// Forward paths to an already-running instance via WM_COPYDATA and bring
-// its window to the foreground.
+// Forward paths to an already-running instance via WM_COPYDATA.
+//
+// Deliberately does NOT ShowWindow/SetForegroundWindow here: a "Send to
+// Conduit" delivery must never pop the full-size main window into view. The
+// Dart share handler (AppState._onIncomingSharedFiles) keeps the window
+// hidden and drives the native SendPopup (send_popup.cpp) for progress, so
+// the user only ever sees the small transfer notification. The plain
+// (non-send) second-launch path in wWinMain keeps the show/focus behavior.
 static void ForwardToExistingInstance(HWND existing,
                                       const std::vector<std::wstring>& paths) {
   std::wstring encoded = EncodePaths(paths);
@@ -68,10 +74,6 @@ static void ForwardToExistingInstance(HWND existing,
       static_cast<DWORD>((encoded.size() + 1) * sizeof(wchar_t));
   cds.lpData = const_cast<wchar_t*>(encoded.c_str());
   SendMessageW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds));
-  // Bring the existing window to the front. Close-to-tray hides the top-level
-  // window rather than minimizing it, so always show it before focusing.
-  ShowWindow(existing, IsIconic(existing) ? SW_RESTORE : SW_SHOWNORMAL);
-  SetForegroundWindow(existing);
 }
 
 // ── wWinMain ─────────────────────────────────────────────────────────────
@@ -120,22 +122,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // once the MethodChannel is ready.
   window.SetPendingSendPaths(sendPaths);
 
-  // Phase 4: when this cold start is itself a "Send to Conduit" delivery
-  // (ParseSendArgs found --send paths, and — since we only reach this line
-  // at all when the single-instance gate above found no existing window to
-  // forward to — this process is about to become the one and only window),
-  // create the native window at roughly the compact size SendWidgetScreen
-  // (lib/src/ui/send_widget_screen.dart) resizes it to anyway, instead of
-  // the normal 1280x720. Dart would shrink an oversized window down a frame
-  // or two after launch regardless, but sizing it here avoids a visible
-  // flash of the full-size window first. windowManager.center() on the Dart
-  // side repositions it properly once the engine is up, so only the size —
-  // not this initial origin — needs to roughly match; kept in sync manually
-  // with SendWidgetScreen's _popupWidth/_popupHeight since native and Dart
-  // code can't share a source file across the platform boundary.
+  // Phase 4: a cold-start "Send to Conduit" delivery is created at the normal
+  // size but is deliberately never shown — show_on_first_frame_ (set by
+  // SetPendingSendPaths) keeps the first-frame callback from calling Show(),
+  // and the Dart share handler + native SendPopup (send_popup.cpp) report the
+  // background transfer instead. The window stays hidden in the tray; the
+  // tray's Show action surfaces it later if the user wants to pick a
+  // destination.
   Win32Window::Point origin(10, 10);
-  Win32Window::Size size = sendPaths.empty() ? Win32Window::Size(1280, 720)
-                                              : Win32Window::Size(400, 560);
+  Win32Window::Size size(1280, 720);
   if (!window.Create(L"Conduit", origin, size)) {
     return EXIT_FAILURE;
   }

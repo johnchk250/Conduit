@@ -9,44 +9,6 @@ import 'package:window_manager/window_manager.dart';
 
 import '../app_state.dart';
 
-/// Roadmap Phase 4: while true, [_CloseHandler]'s resize/move listeners skip
-/// persisting the window's current bounds to SharedPreferences.
-///
-/// [SendWidgetScreen] sets this before it shrinks the shared window into the
-/// compact send popup, and clears it after restoring normal bounds on the
-/// way out. Without this, the very act of shrinking the window for the
-/// widget would itself fire `onWindowResized` and silently overwrite the
-/// user's real saved window size/position with the tiny popup's geometry.
-bool suppressWindowBoundsPersistence = false;
-
-/// Roadmap Phase 4 bug fix: monotonic counter identifying the current
-/// "send widget" session (one open→close cycle of [SendWidgetScreen]).
-///
-/// [SendWidgetScreen] claims a new epoch synchronously in `initState`, and
-/// its `_close()` cleanup — which fires `setAlwaysOnTop(false)` and
-/// [DesktopTray.restoreNormalBounds] *unawaited*, deliberately, so a stalled
-/// window-manager call can't hang the close — re-checks its epoch is still
-/// current before actually applying each step. Without this, a new "Send to
-/// Conduit" arriving while a previous send widget's cleanup is still
-/// in-flight (e.g. two files sent back-to-back, or a second send triggered
-/// right as the first auto-closes) could race: the new widget resizes/
-/// focuses/pins itself, then the *old* widget's stale cleanup finishes a
-/// moment later and undoes it — leaving the window at full size, unfocused,
-/// or not on top right after the new send widget was supposed to open. From
-/// the user's side that looks exactly like "the send UI doesn't open" (it's
-/// there, just not visible/focused) or opens and then visibly reverts.
-int sendWidgetEpoch = 0;
-
-/// Claims and returns the next send-widget epoch. Call once, synchronously,
-/// from [SendWidgetScreen.initState] — synchronous so ordering across rapid
-/// mounts is deterministic (no await gap where two mounts could race to
-/// claim the same epoch).
-int beginSendWidgetEpoch() => ++sendWidgetEpoch;
-
-/// True if [epoch] is still the current send-widget session — i.e. no newer
-/// [SendWidgetScreen] has been mounted since [epoch] was claimed.
-bool isCurrentSendWidgetEpoch(int epoch) => epoch == sendWidgetEpoch;
-
 /// Desktop close-to-tray + system tray integration (Roadmap Phase 1).
 ///
 /// On Windows the user expects closing the window to keep Conduit running
@@ -81,13 +43,8 @@ class DesktopTray with TrayListener {
     windowManager.setAspectRatio(0); // allow free resize
     windowManager.addListener(closeHandler);
 
-    // Restore window bounds if saved. Skip if a send-widget entry is already
-    // under way and has flagged the window as off-limits — otherwise this
-    // startup restore could land right after the widget shrinks the window
-    // and stomp its compact geometry with the user's normal saved size.
-    if (!suppressWindowBoundsPersistence) {
-      await restoreNormalBounds();
-    }
+    // Restore window bounds if saved (startup restore).
+    await restoreNormalBounds();
 
     // Tray icon: prefer the bundled runner .ico (the same icon Windows shows
     // for the .exe), located relative to the running app. Failing to set an
@@ -105,11 +62,8 @@ class DesktopTray with TrayListener {
 
   /// Restore the window to its last saved normal size/position, falling back
   /// to centering a default-sized window if nothing has been saved yet (e.g.
-  /// the very first run). Shared by [init]'s startup restore and by
-  /// [SendWidgetScreen] when it hands the shared window back after a compact
-  /// send — both need the exact same "what does normal look like" logic, so
-  /// there is only one place that can drift from the values [_CloseHandler]
-  /// persists.
+  /// the very first run). Used by [init]'s startup restore so a cold-started
+  /// app reappears where the user last left it.
   static Future<void> restoreNormalBounds() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -253,7 +207,6 @@ class _CloseHandler extends WindowListener {
   }
 
   Future<void> _saveWindowBounds() async {
-    if (suppressWindowBoundsPersistence) return;
     try {
       if (await windowManager.isMaximized() ||
           await windowManager.isMinimized()) {

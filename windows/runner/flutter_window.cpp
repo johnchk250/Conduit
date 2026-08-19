@@ -6,10 +6,41 @@
 #include "flutter/generated_plugin_registrant.h"
 #include "send_to_shortcut.h"
 #include "bluetooth_proxy_win.h"
+#include "utils.h"
 
 namespace {
 constexpr UINT kPlatformTaskMessage = WM_APP + 73;
+
+// Read a string/int/bool out of a method-call argument map, falling back to a
+// default when the key is absent or the type differs.
+std::string ArgString(const flutter::EncodableMap* args, const char* key,
+                      const std::string& fallback) {
+  if (args == nullptr) return fallback;
+  auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) return fallback;
+  if (const auto* value = std::get_if<std::string>(&it->second)) return *value;
+  return fallback;
 }
+
+int ArgInt(const flutter::EncodableMap* args, const char* key, int fallback) {
+  if (args == nullptr) return fallback;
+  auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) return fallback;
+  if (const auto* value = std::get_if<int>(&it->second)) return *value;
+  if (const auto* value64 = std::get_if<int64_t>(&it->second))
+    return static_cast<int>(*value64);
+  return fallback;
+}
+
+bool ArgBool(const flutter::EncodableMap* args, const char* key,
+             bool fallback) {
+  if (args == nullptr) return fallback;
+  auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) return fallback;
+  if (const auto* value = std::get_if<bool>(&it->second)) return *value;
+  return fallback;
+}
+}  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -99,7 +130,8 @@ bool FlutterWindow::OnCreate() {
         }
       });
 
-  // Handle "conduit/shell" methods (e.g. creating the Send To shortcut).
+  // Handle "conduit/shell" methods (e.g. creating the Send To shortcut and
+  // driving the native background-transfer progress popup).
   shell_channel_->SetMethodCallHandler(
       [this](const flutter::MethodCall<flutter::EncodableValue>& call,
          std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
@@ -110,13 +142,72 @@ bool FlutterWindow::OnCreate() {
           share_handler_ready_ = true;
           FlushPendingSendPaths();
           result->Success(flutter::EncodableValue(true));
+        } else if (call.method_name() == "sendPopupShow") {
+          // Roadmap Phase 4: a background "Send to Conduit" batch is starting.
+          // Pop up the small native tool window — never the main Flutter
+          // window. Args: peerName, fileName, batchTotal.
+          const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+          const std::wstring peer = Utf16FromUtf8(ArgString(args, "peerName", ""));
+          const std::wstring file = Utf16FromUtf8(ArgString(args, "fileName", ""));
+          const int batch_total = ArgInt(args, "batchTotal", 1);
+          if (send_popup_) {
+            std::wstring title =
+                batch_total > 1
+                    ? L"Sending " + std::to_wstring(batch_total) +
+                          L" files to " + peer
+                    : L"Sending to " + peer;
+            send_popup_->Show(title, file);
+          }
+          result->Success();
+        } else if (call.method_name() == "sendPopupProgress") {
+          // Per-file/batch progress update. Args: fileName, percent (0..100),
+          // fileIndex, batchTotal.
+          const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+          const std::wstring file = Utf16FromUtf8(ArgString(args, "fileName", ""));
+          const int percent = ArgInt(args, "percent", 0);
+          const int index = ArgInt(args, "fileIndex", 1);
+          const int batch_total = ArgInt(args, "batchTotal", 1);
+          if (send_popup_) {
+            std::wstring subtitle = file;
+            if (batch_total > 1) {
+              subtitle += L" (file " + std::to_wstring(index) + L" of " +
+                          std::to_wstring(batch_total) + L")";
+            }
+            subtitle += L" \u2014 " + std::to_wstring(percent) + L"%";
+            send_popup_->UpdateProgress(subtitle, percent);
+          }
+          result->Success();
+        } else if (call.method_name() == "sendPopupComplete") {
+          // Terminal event. Success hides/destroys the popup; failure leaves
+          // it up showing |message| so the outcome stays understandable
+          // without revealing the (hidden) overview window. Args: success,
+          // message.
+          const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+          const bool success = ArgBool(args, "success", false);
+          const std::wstring message =
+              Utf16FromUtf8(ArgString(args, "message", ""));
+          if (send_popup_) {
+            send_popup_->Complete(success, message);
+          }
+          result->Success();
+        } else if (call.method_name() == "sendPopupHide") {
+          if (send_popup_) {
+            send_popup_->Hide();
+          }
+          result->Success();
         } else {
           result->NotImplemented();
         }
       });
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
+    // A cold-start "Send to Conduit" delivery must NOT surface the main
+    // Flutter window — show_on_first_frame_ is false exactly then, and the
+    // native SendPopup reports the transfer instead. Normal launches and the
+    // tray's Show action keep the existing behavior.
+    if (show_on_first_frame_) {
+      this->Show();
+    }
     // Mark the engine as ready. Shared files are flushed only after Dart
     // registers its method-channel handler and calls shareHandlerReady.
     is_dart_ready_ = true;
@@ -128,12 +219,18 @@ bool FlutterWindow::OnCreate() {
   // window is shown. It is a no-op if the first frame hasn't completed yet.
   flutter_controller_->ForceRedraw();
 
+  // Roadmap Phase 4: the native background-transfer progress popup. Created
+  // on the platform thread; driven from the shell channel handlers above.
+  send_popup_ = std::make_unique<SendPopup>();
+
   return true;
 }
 
 void FlutterWindow::OnDestroy() {
   if (bluetooth_proxy_) bluetooth_proxy_->Stop();
   bluetooth_proxy_.reset();
+  // Destroy the native popup (if still up) before tearing down the window.
+  send_popup_.reset();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }

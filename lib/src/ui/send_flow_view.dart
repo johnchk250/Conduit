@@ -12,19 +12,15 @@ import '../core/config_store.dart';
 import 'glass.dart';
 
 /// The ad-hoc "send a file to a paired device" flow (Roadmap Phase 3d),
-/// factored out of the old `SendPanel` so it can be shared by two hosts:
+/// used as the full-shell "Send" tab (desktop NavigationRail / mobile bottom
+/// nav destination) and pushed as a sub-route by the OS-share path.
 ///
-///   - [SendPanel]: the full-shell "Send" tab (desktop NavigationRail /
-///     mobile bottom nav destination). Uses `compact: false`.
-///   - `SendWidgetScreen` (Roadmap Phase 4): the small KDE-Connect-style
-///     popup a Windows "Send to Conduit" opens instead of the full app.
-///     Uses `compact: true`.
+/// Windows Explorer "Send to Conduit" deliveries no longer route through
+/// this view at all — a native runner popup (windows/runner/send_popup.cpp)
+/// reports the background transfer while the main window stays hidden.
 ///
 /// All the actual send logic (file queueing, peer selection/auto-select,
-/// the block-pull progress callback) lives here exactly once; [compact] only
-/// changes layout — spacing, whether the device row gets a labelled card,
-/// and whether finishing a send asks the host to close via
-/// [onRequestClose] instead of resetting in place.
+/// the block-pull progress callback) lives here exactly once.
 class SendFlowView extends StatefulWidget {
   const SendFlowView({
     super.key,
@@ -122,7 +118,7 @@ class _SendFlowViewState extends State<SendFlowView> {
     // here, synchronously. didChangeDependencies runs while this widget is
     // being *mounted*, and for both hosts of SendFlowView that mount happens
     // *inside* an ancestor's own build() — DashboardScreen.build() either
-    // returns SendWidgetScreen directly, or switches SendPanel in via
+    // returns the Send panel directly, or switches it in via
     // setState(() => _index = 3). clearPendingSharedFiles() calls
     // notifyListeners(), and notifying the very ChangeNotifier an ancestor is
     // currently watching, from mid-build, is the classic Flutter

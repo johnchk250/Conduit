@@ -49,13 +49,11 @@ class LifecycleSnapshot {
   const LifecycleSnapshot({
     required this.isStarted,
     required this.status,
-    required this.sendWidgetMode,
     required this.onboardingVersion,
   });
 
   final bool isStarted;
   final String status;
-  final bool sendWidgetMode;
   final int onboardingVersion;
 
   @override
@@ -63,12 +61,10 @@ class LifecycleSnapshot {
       other is LifecycleSnapshot &&
       other.isStarted == isStarted &&
       other.status == status &&
-      other.sendWidgetMode == sendWidgetMode &&
       other.onboardingVersion == onboardingVersion;
 
   @override
-  int get hashCode =>
-      Object.hash(isStarted, status, sendWidgetMode, onboardingVersion);
+  int get hashCode => Object.hash(isStarted, status, onboardingVersion);
 }
 
 class AppLifecycleController extends AppController<LifecycleSnapshot> {
@@ -80,7 +76,6 @@ class AppLifecycleController extends AppController<LifecycleSnapshot> {
   LifecycleSnapshot buildSnapshot() => LifecycleSnapshot(
         isStarted: appState.isStarted,
         status: appState.status,
-        sendWidgetMode: appState.sendWidgetMode,
         onboardingVersion:
             appState.isStarted ? appState.config.onboardingVersion : 0,
       );
@@ -372,7 +367,6 @@ class TransferController extends AppController<TransferSnapshot> {
       );
 
   void consumePendingShare() => appState.clearPendingSharedFiles();
-  void exitCompactMode() => appState.exitSendWidgetMode();
 
   Future<List<TransferReceipt>> recentReceipts({int limit = 100}) async =>
       appState.transferReceipts?.recent(limit: limit) ?? const [];

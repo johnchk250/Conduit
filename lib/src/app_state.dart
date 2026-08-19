@@ -5,7 +5,6 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:path/path.dart' as p;
-import 'package:window_manager/window_manager.dart';
 
 import 'core/config_store.dart';
 import 'core/identity.dart';
@@ -241,16 +240,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   bool _started = false;
 
-  // Roadmap Phase 4: true while the compact, KDE-Connect-style "send widget"
-  // (see SendWidgetScreen) is standing in for the full dashboard shell so a
-  // Windows "Send to Conduit" doesn't have to open the whole app just to push
-  // one file. Windows-only — the sole place that sets it is
-  // [_onIncomingSharedFiles] — so nothing in the full-shell "Send" tab can
-  // ever trigger it by accident. AppState deliberately knows nothing about
-  // window geometry itself; window_manager calls live in the UI layer
-  // alongside the rest of the desktop window plumbing (desktop/tray.dart) —
-  // this flag is purely the on/off signal DashboardScreen.build() switches on.
-  bool _sendWidgetMode = false;
   String _status = 'Starting…';
 
   DeviceIdentity get identity => _identity;
@@ -261,7 +250,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool get syncAllRunning => _syncAllRunning;
   DateTime? get lastSyncAllAt => _lastSyncAllAt;
   String? get lastSyncAllSummary => _lastSyncAllSummary;
-  bool get sendWidgetMode => _sendWidgetMode;
   String get status => _status;
   List<DiscoveredPeer> get discoveredPeers => <DiscoveredPeer>{
         ..._discoveredPeers.values,
@@ -2546,10 +2534,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// Handles a list of URIs / paths delivered by the OS share/send mechanism.
   ///
   /// On Android each entry is a `content://` URI; on Windows each is a
-  /// file-system path. Resolves each to (name, bytes) then either:
-  ///   - auto-sends to the single connected peer (1 peer connected), or
-  ///   - queues them in [pendingSharedFiles] and notifies the UI to open the
-  ///     Send panel with the peer-picker (0 or 2+ peers connected).
+  /// file-system path. Resolves each to (name, bytes) then:
+  ///   - Windows with exactly one connected peer: auto-sends the whole batch
+  ///     in the background (native SendPopup progress; the main window stays
+  ///     hidden) — see [_sendBackgroundBatch].
+  ///   - Windows with zero or multiple peers: queues them in
+  ///     [pendingSharedFiles] WITHOUT opening or focusing any window, so the
+  ///     user can use the tray's Show action to pick a destination (the
+  ///     destination-safety rule: never silently choose an arbitrary peer).
+  ///   - Android: queues them in [pendingSharedFiles] and the full-screen
+  ///     Send tab auto-starts when exactly one peer is connected.
   Future<void> _onIncomingSharedFiles(List<String> uris) async {
     final resolved = <PendingSharedFile>[];
     for (final uri in uris) {
@@ -2589,27 +2583,106 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (resolved.isEmpty) return;
 
     final peers = connectedPeers;
-    // Always route OS share/send through the Send panel. If exactly one peer is
-    // live, the panel auto-starts after rendering so the sender still sees a
-    // real progress indicator instead of a silent background transfer.
+    if (Platform.isWindows) {
+      // Roadmap Phase 4: a Windows "Send to Conduit" is a background
+      // delivery. It must never open, focus, resize, or reveal the full
+      // Flutter window, so there is no send-widget mode and no
+      // windowManager.show()/focus() here.
+      if (peers.length == 1) {
+        // Exactly one connected peer: auto-send the whole batch in the
+        // background, reporting progress to the native SendPopup.
+        unawaited(_sendBackgroundBatch(resolved, peers.single));
+        return;
+      }
+      // Zero or multiple peers: keep the destination-safety rule — never
+      // silently pick an arbitrary peer. Queue the files (pendingSharedFiles)
+      // so the tray's Show action opens the Send tab with the peer picker.
+      // The main window stays hidden in the meantime.
+      _pendingSharedFiles = resolved;
+      _pendingSharedFilesAutoStart = false;
+      notifyListeners();
+      return;
+    }
+    // Android: full-screen Send-tab navigation (there is no window to keep
+    // hidden). If exactly one peer is live the panel auto-starts after
+    // rendering so the sender still sees a real progress indicator.
     _pendingSharedFiles = resolved;
     _pendingSharedFilesAutoStart = peers.length == 1;
-    // Roadmap Phase 4: a Windows "Send to Conduit" (or share-sheet) delivery
-    // pops the compact send widget instead of forcing the full dashboard
-    // open just to push one file — see SendWidgetScreen and
-    // DashboardScreen's sendWidgetMode branch. Android has no window to
-    // shrink, so it keeps the existing full-screen Send-tab navigation
-    // unconditionally.
-    if (Platform.isWindows) {
-      _sendWidgetMode = true;
-      try {
-        // Eagerly show and focus the window to wake up the Flutter engine/renderer
-        // immediately, ensuring the first frame paints and the build runs without delay.
-        windowManager.show().then((_) => windowManager.focus());
-      } catch (_) {}
-    }
     notifyListeners();
   }
+
+  /// Roadmap Phase 4 (Windows only): send an OS-delivered batch to exactly
+  /// one connected peer in the background while the main Flutter window stays
+  /// hidden. The transfer uses the existing ad-hoc send engine
+  /// ([sendAdHocFile]) so receipts, pause/resume and session-loss handling
+  /// are unchanged; progress and the terminal result are reported to the
+  /// native SendPopup over the `conduit/shell` method channel.
+  Future<void> _sendBackgroundBatch(
+      List<PendingSharedFile> files, PairedPeer peer) async {
+    final total = files.length;
+    _reportBackgroundStart(files, peer);
+    var sent = 0;
+    var failed = 0;
+    var fileIndex = 0;
+    for (final f in files) {
+      fileIndex++;
+      final ok = await sendAdHocFile(
+        peerId: peer.deviceId,
+        fileName: f.name,
+        fileBytes: f.bytes,
+        safUri: f.safUri,
+        filePath: f.filePath,
+        fileSize: f.size,
+        onProgress: (sentBytes, totalBytes) {
+          _reportBackgroundProgress(
+              f.name, sentBytes, totalBytes, fileIndex, total);
+        },
+      );
+      ok ? sent++ : failed++;
+    }
+    final allOk = failed == 0 && sent == files.length;
+    final message = allOk
+        ? 'Sent $sent of ${files.length} to ${peer.name}'
+        : sent == 0
+            ? (lastTransferBlockReason ?? "Couldn't send to ${peer.name}")
+            : 'Sent $sent, failed $failed to ${peer.name}';
+    _reportBackgroundComplete(allOk, message);
+  }
+
+  void _reportBackgroundStart(List<PendingSharedFile> files, PairedPeer peer) {
+    _chShell.invokeMethod<void>('sendPopupShow', {
+      'fileName':
+          files.length == 1 ? files.first.name : '${files.length} files',
+      'peerName': peer.name,
+      'batchTotal': files.length,
+    }).catchError((_) {});
+  }
+
+  void _reportBackgroundProgress(String fileName, int sentBytes, int totalBytes,
+      int fileIndex, int batchTotal) {
+    final percent = totalBytes > 0 ? (sentBytes * 100 / totalBytes).floor() : 0;
+    _chShell.invokeMethod<void>('sendPopupProgress', {
+      'fileName': fileName,
+      'percent': percent,
+      'fileIndex': fileIndex,
+      'batchTotal': batchTotal,
+    }).catchError((_) {});
+  }
+
+  void _reportBackgroundComplete(bool success, String message) {
+    _chShell.invokeMethod<void>('sendPopupComplete', {
+      'success': success,
+      'message': message,
+    }).catchError((_) {});
+  }
+
+  /// Test seam: routes OS share/send deliveries through the same handler as
+  /// the native `conduit/share_receive` channel without requiring a full
+  /// [start] (which touches the network and platform channels). Production
+  /// code never calls this.
+  @visibleForTesting
+  Future<void> handleIncomingSharedFilesForTest(List<String> uris) =>
+      _onIncomingSharedFiles(uris);
 
   // -------------------------------------------------------------------------
 
@@ -2895,16 +2968,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   bool cancelAdHocTransfer(String peerId) =>
       _adHoc?.cancelOutboundForPeer(peerId) ?? false;
-
-  /// Roadmap Phase 4: called by [SendWidgetScreen] once its compact window
-  /// has been resized/moved back to normal (or the user dismissed it), so
-  /// the dashboard shell reappears exactly where the user left it. AppState
-  /// itself never touches window geometry — see desktop/tray.dart for that.
-  void exitSendWidgetMode() {
-    if (!_sendWidgetMode) return;
-    _sendWidgetMode = false;
-    notifyListeners();
-  }
 
   /// Engine → host: bytes started/stopped moving (Phase 0.4). On Android we ask
   /// SyncService to acquire a short, renewable partial wake lock only while

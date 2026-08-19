@@ -17,7 +17,6 @@ import 'pairing_screen.dart';
 import 'folder_pairs_screen.dart';
 import 'activity_screen.dart';
 import 'send_panel.dart';
-import 'send_widget_screen.dart';
 import 'remote_control_screen.dart';
 import 'glass.dart';
 import 'connection_doctor_screen.dart';
@@ -187,26 +186,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (lifecycle.onboardingVersion <
         AppLifecycleController.currentOnboardingVersion) {
       return const OnboardingScreen();
-    }
-    // Roadmap Phase 4: a KDE-Connect-style compact "send widget" stands in
-    // for the full shell while a Windows-triggered ad-hoc send is active, so
-    // "Send to Conduit" from Explorer never has to open the whole app just
-    // to push one file. Checked before _showInviteDialogIfNeeded and
-    // _navigateToSendIfSharedFiles below, so returning early here skips both
-    // — a stray folder invite never tries to render on top of the tiny
-    // popup, and _index (the NavigationRail/BottomNav selection) is left
-    // completely untouched, which is what lets the dashboard reappear
-    // exactly where the user left it once the widget closes — see
-    // SendWidgetScreen's doc comment. Android has no window to shrink, so it
-    // keeps the existing full-screen Send-tab navigation unconditionally.
-    if (Platform.isWindows && lifecycle.sendWidgetMode) {
-      // Pop all sub-routes to root so the SendWidgetScreen is visible
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) {
-          Navigator.of(context).popUntil((route) => route.isFirst);
-        }
-      });
-      return const SendWidgetScreen();
     }
 
     final isWide = MediaQuery.of(ctx).size.width >= 900;
@@ -551,9 +530,8 @@ class _OverviewPage extends StatelessWidget {
           GlassListTile(
             leadingIcon: Icons.sync_rounded,
             accentColor: c.violet,
-            title: state.syncAllRunning
-                ? 'Syncing all folders…'
-                : 'Sync all now',
+            title:
+                state.syncAllRunning ? 'Syncing all folders…' : 'Sync all now',
             subtitle: _syncAllSubtitle(state, pairs.length),
             trailing: state.syncAllRunning
                 ? SizedBox(

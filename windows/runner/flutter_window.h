@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "win32_window.h"
+#include "send_popup.h"
 
 class BluetoothProxyWin;
 
@@ -27,6 +28,10 @@ class FlutterWindow : public Win32Window {
   // Phase 3d: set pending paths from the command line (--send).
   void SetPendingSendPaths(const std::vector<std::wstring>& paths) {
     pending_send_paths_ = paths;
+    // A cold start launched by Explorer's "Send to Conduit" must keep the
+    // main Flutter window hidden — the native SendPopup reports transfer
+    // progress instead. Normal launches and tray Show still surface it.
+    show_on_first_frame_ = paths.empty();
   }
 
  protected:
@@ -49,16 +54,24 @@ class FlutterWindow : public Win32Window {
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
 
-  // Phase 3d: Pending paths to send to Dart when the engine is initialized.
+// Phase 3d: Pending paths to send to Dart when the engine is initialized.
   std::vector<std::wstring> pending_send_paths_;
   bool is_dart_ready_ = false;
   bool share_handler_ready_ = false;
+  // True unless this cold start is itself a "Send to Conduit" delivery, in
+  // which case the first-frame callback must NOT call Show() on the main
+  // Flutter window (it stays hidden in the tray while the SendPopup reports
+  // the background transfer).
+  bool show_on_first_frame_ = true;
 
   // Phase 3d: Method channels for shell operations and sending shared files.
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> shell_channel_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> share_channel_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> bluetooth_channel_;
   std::unique_ptr<BluetoothProxyWin> bluetooth_proxy_;
+  // Roadmap Phase 4: the native background-transfer progress popup. Owned on
+  // the platform thread like the rest of the runner's window plumbing.
+  std::unique_ptr<SendPopup> send_popup_;
   std::mutex platform_tasks_mutex_;
   std::deque<std::function<void()>> platform_tasks_;
 };
