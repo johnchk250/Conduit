@@ -3,6 +3,7 @@ import '../storage/index_db.dart';
 import 'delete_safety.dart';
 import '../sync/ignore_rules.dart';
 import '../sync/manifest.dart';
+import 'file_utils.dart';
 
 /// Result of one [IndexScanner.scan] pass: the entries whose rows actually
 /// moved (created, modified, or tombstoned) since the last scan, plus the new
@@ -119,6 +120,7 @@ class IndexScanner {
     var signatureSize = 0;
     var signatureNewest = 0;
     for (final fileEntry in diskEntries) {
+      if (isIgnoredSyncPath(fileEntry.relPath)) continue;
       final rel = fileEntry.relPath;
       if (!isSyncableRelativePath(rel)) {
         seenPaths.add(rel);
@@ -222,6 +224,7 @@ class IndexScanner {
     final out = <FileEntry>[];
     final diskFiles = await fs.listFiles(rootPath);
     for (final rel in diskFiles) {
+      if (isIgnoredSyncPath(rel)) continue;
       final stat = await fs.stat(rootPath, rel);
       if (stat == null) continue; // raced away between list and stat
       out.add(stat);

@@ -281,6 +281,80 @@ void main() {
     expect(h.aliceFs.files.containsKey('shared.txt'), isFalse);
   });
 
+  test('serve requests stay in wire order while metadata lookup is pending',
+      () async {
+    final content =
+        List<int>.generate(blockSize * 4 + 123, (i) => i.remainder(251));
+    h.aliceFs.files['ordered.bin'] = content;
+    await h.alice.startPair(h.pair);
+    h.connectAlice();
+    h.session.sent.clear();
+
+    final statGate = Completer<void>();
+    h.aliceFs.statGate = statGate;
+    final requests = <Map<String, dynamic>>[
+      for (var i = 0; i < 5; i++)
+        {
+          't': Msg.request,
+          'pairId': h.pair.id,
+          'folderId': h.pair.id,
+          'name': 'ordered.bin',
+          'offset': i * blockSize,
+          'size': i == 4 ? 123 : blockSize,
+        },
+    ];
+
+    final handlers = [
+      for (final request in requests)
+        h.alice.handlePeerMessageForTest(h.session, request),
+    ];
+    await h.pump();
+    statGate.complete();
+    await Future.wait(handlers);
+    await h.pump();
+
+    final offsets = h.session.sent
+        .where((message) => message['t'] == Msg.response)
+        .map((message) => (message['offset'] as num).toInt())
+        .toList();
+    expect(
+        offsets, [0, blockSize, blockSize * 2, blockSize * 3, blockSize * 4]);
+  });
+
+  test('out-of-order block responses are matched by offset', () async {
+    final content = List<int>.generate(blockSize * 4, (i) => i.remainder(251));
+    h.bobFs.files['reverse.bin'] = content;
+
+    await h.alice.startPair(h.pair);
+    final bobEntry = await _scanOne(h.bobFs, h.pair, 'reverse.bin', content);
+    h.connectAlice();
+
+    final pending = h.alice.handlePeerMessageForTest(h.session, {
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': [bobEntry.toJson()],
+      'fromSequence': 0,
+    });
+    await h.pumpUntil(() =>
+        h.session.sent.where((message) => message['t'] == Msg.request).length >=
+        4);
+
+    final requests = h.session.sent
+        .where((message) =>
+            message['t'] == Msg.request && message['name'] == 'reverse.bin')
+        .toList();
+    expect(requests, hasLength(4));
+    for (final request in requests.reversed) {
+      final response = await _serveBlock(h.bobFs, request);
+      await h.alice.handlePeerMessageForTest(h.session, response);
+    }
+
+    await h.pumpUntil(() => h.aliceFs.files.containsKey('reverse.bin'));
+    await pending;
+    expect(h.aliceFs.files['reverse.bin'], content);
+  });
+
   test('an empty indexUpdate does NOT kick a reconcile (no ping-pong)',
       () async {
     // The flaw-#1 guard: an empty delta doesn't advance maxSeq past priorSeq,
@@ -846,6 +920,7 @@ class FakeFs implements FileSystemAccess, TemporaryFileFinalizer {
   bool failFinalize = false;
 
   Completer<void>? listFilesGate;
+  Completer<void>? statGate;
   int listFilesCalls = 0;
   @override
   bool get isAndroidSAF => false;
@@ -860,6 +935,11 @@ class FakeFs implements FileSystemAccess, TemporaryFileFinalizer {
 
   @override
   Future<FileEntry?> stat(String rootPath, String relPath) async {
+    final gate = statGate;
+    if (gate != null) {
+      statGate = null;
+      await gate.future;
+    }
     final data = files[relPath];
     if (data == null) return null;
     return FileEntry(relPath: relPath, size: data.length, mtime: 1, sha256: '');

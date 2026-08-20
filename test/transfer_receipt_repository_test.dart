@@ -32,11 +32,12 @@ void main() {
 
   test('insert, update, reopen, and query by peer/pair', () async {
     var repo = await TransferReceiptRepository.open(root);
-    final original = receipt('one', DateTime.utc(2026, 7, 17));
+    final now = DateTime.now().toUtc();
+    final original = receipt('one', now);
     await repo.upsert(original);
     await repo.upsert(original.copyWith(
       status: TransferStatus.completedUnconfirmed,
-      completedAt: DateTime.utc(2026, 7, 17, 1),
+      completedAt: now.add(const Duration(hours: 1)),
     ));
     expect((await repo.forPeer('peer')).single.status,
         TransferStatus.completedUnconfirmed);

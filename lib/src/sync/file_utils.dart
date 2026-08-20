@@ -1,7 +1,34 @@
 import 'dart:io';
 
-/// Checks if a given path should be ignored by scanners, watchers, and indexing.
-bool isIgnoredSyncPath(String path) {
+/// Safely checks if a file/path/entity should be excluded from sync and indexing.
+bool isIgnoredSyncPath(dynamic entity) {
+  if (entity == null) return false;
+  String? path;
+  if (entity is String) {
+    path = entity;
+  } else if (entity is FileSystemEntity) {
+    path = entity.path;
+  } else {
+    final dynamic value = entity;
+    try {
+      final candidate = value.path;
+      if (candidate is String) path = candidate;
+    } catch (_) {}
+    if (path == null) {
+      try {
+        final candidate = value.relativePath;
+        if (candidate is String) path = candidate;
+      } catch (_) {}
+    }
+    if (path == null) {
+      try {
+        final candidate = value.relPath;
+        if (candidate is String) path = candidate;
+      } catch (_) {}
+    }
+  }
+
+  if (path == null) return false;
   final normalized = path.replaceAll('\\', '/');
   final segments = normalized.split('/');
   final fileName = segments.isNotEmpty ? segments.last : normalized;
@@ -21,15 +48,19 @@ bool isIgnoredSyncPath(String path) {
   return false;
 }
 
-/// Safely renames/moves [source] to [destination], handling Windows file locking,
+/// Safely renames [source] to [destination], handling Windows file locking,
 /// target collisions, case-only renames, and transient sharing violations.
 Future<void> safeAtomicRename(
-  File source,
-  File destination, {
+  dynamic source,
+  dynamic destination, {
   int maxRetries = 6,
   Duration initialDelay = const Duration(milliseconds: 50),
 }) async {
-  final destDir = destination.parent;
+  final srcFile = source is File ? source : File(source.toString());
+  final dstFile =
+      destination is File ? destination : File(destination.toString());
+
+  final destDir = dstFile.parent;
   if (!await destDir.exists()) {
     await destDir.create(recursive: true);
   }
@@ -39,38 +70,35 @@ Future<void> safeAtomicRename(
     try {
       attempt++;
 
-      if (await destination.exists()) {
+      if (await dstFile.exists()) {
         final samePathCaseInsensitive =
-            source.path.toLowerCase() == destination.path.toLowerCase();
+            srcFile.path.toLowerCase() == dstFile.path.toLowerCase();
 
-        if (samePathCaseInsensitive && source.path != destination.path) {
+        if (samePathCaseInsensitive && srcFile.path != dstFile.path) {
           // Case-only rename: NTFS requires moving to an intermediate temporary name
           final tempIntermediate = File(
-            '${destination.path}.case_tmp_${DateTime.now().microsecondsSinceEpoch}',
+            '${dstFile.path}.case_tmp_${DateTime.now().microsecondsSinceEpoch}',
           );
-          final tempFile = await source.rename(tempIntermediate.path);
-          await tempFile.rename(destination.path);
+          final tempFile = await srcFile.rename(tempIntermediate.path);
+          await tempFile.rename(dstFile.path);
           return;
         } else {
           // Delete existing destination to prevent Win32 ERROR_ALREADY_EXISTS (183)
-          await destination.delete();
+          await dstFile.delete();
         }
       }
 
-      await source.rename(destination.path);
+      await srcFile.rename(dstFile.path);
       return;
     } on FileSystemException catch (e) {
       final errorCode = e.osError?.errorCode;
       final isLockOrCollision = Platform.isWindows &&
-          (errorCode == 32 || // ERROR_SHARING_VIOLATION
-              errorCode == 5 ||  // ERROR_ACCESS_DENIED
-              errorCode == 183); // ERROR_ALREADY_EXISTS
+          (errorCode == 32 || errorCode == 5 || errorCode == 183);
 
       if (!isLockOrCollision || attempt >= maxRetries) {
         rethrow;
       }
 
-      // Linear backoff to allow background indexers/antivirus to release handles
       await Future.delayed(initialDelay * attempt);
     }
   }

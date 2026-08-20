@@ -14,6 +14,7 @@ import '../protocol/wire.dart';
 import '../storage/index_db.dart';
 import 'block_transfer.dart';
 import 'delete_safety.dart';
+import 'file_utils.dart';
 import 'file_send.dart';
 import 'index_diff.dart';
 import 'manifest.dart';
@@ -871,7 +872,8 @@ class SyncEngine {
       final destination = File(p.join(rootPath, destinationRelPath));
       await Directory(p.dirname(destination.path)).create(recursive: true);
       if (await destination.exists()) await destination.delete();
-      await File(p.join(rootPath, temporaryRelPath)).rename(destination.path);
+      await safeAtomicRename(
+          File(p.join(rootPath, temporaryRelPath)), destination.path);
     } else {
       // Test/custom backends still stream to the destination rather than
       // retaining the restored version in one giant Dart list.
@@ -1895,8 +1897,10 @@ class SyncEngine {
       'folderId': pairId,
       'name': name,
     };
+    final expectedOffset = (req['offset'] as num?)?.toInt();
+    final response = sink.nextFor(expectedOffset);
     session.send(frame);
-    return sink.next();
+    return response;
   }
 
   String _peerKey(String peerId, String pairId) => '$peerId|$pairId';
@@ -1937,6 +1941,10 @@ class SyncEngine {
       // stat() is pending.
       ctrl = StreamController<Map<String, dynamic>>();
       _serveStreams[key] = ctrl;
+      // Enqueue before awaiting metadata. Frame decoding invokes message
+      // handlers concurrently, so later pipelined requests can arrive while
+      // this await is suspended.
+      ctrl.add(req);
       final sourceStat = await fs.stat(pair.localPath, name);
       var servedRecorded = false;
       // Spawn the serve loop. It owns the file cache for this fetch and
@@ -1989,8 +1997,9 @@ class SyncEngine {
           c?.close();
         }),
       );
+    } else {
+      ctrl.add(req);
     }
-    ctrl.add(req);
   }
 
   // ---- Folder-pair contract (invite/accept) -----------------------------
@@ -2862,20 +2871,39 @@ class SyncEngine {
 /// [SyncEngine._sendBlockRequest] pulls via [next]. Closing marks the fetch
 /// done so any late stray responses are dropped instead of buffered forever
 /// (used by [SyncEngine.onPeerSessionLost] and the fetch's finally block).
+class _BlockWaiter {
+  _BlockWaiter(this.expectedOffset, this.completer);
+
+  final int? expectedOffset;
+  final Completer<Map<String, dynamic>?> completer;
+}
+
 class _BlockSink {
   final _queue = <Map<String, dynamic>>[];
+  final _responsesByOffset = <int, List<Map<String, dynamic>>>{};
   bool _closed = false;
-  final _waiters = <Completer<Map<String, dynamic>?>>[];
+  final _waiters = <_BlockWaiter>[];
 
   bool get isClosed => _closed;
 
-  /// Push one response. If a fetcher is already awaiting via [next], it is
-  /// woken and handed the response; otherwise the response buffers until the
-  /// next [next] call.
+  /// Push one response. V2 responses carry their requested offset, so match
+  /// them to the corresponding waiter even when the peer sends them out of
+  /// order. Responses from older peers without an offset retain FIFO behavior.
   void add(Map<String, dynamic> resp) {
     if (_closed) return;
+    final offset = (resp['offset'] as num?)?.toInt();
+    if (offset != null) {
+      final waiterIndex =
+          _waiters.indexWhere((waiter) => waiter.expectedOffset == offset);
+      if (waiterIndex >= 0) {
+        _waiters.removeAt(waiterIndex).completer.complete(resp);
+      } else {
+        (_responsesByOffset[offset] ??= <Map<String, dynamic>>[]).add(resp);
+      }
+      return;
+    }
     if (_waiters.isNotEmpty) {
-      _waiters.removeAt(0).complete(resp);
+      _waiters.removeAt(0).completer.complete(resp);
     } else {
       _queue.add(resp);
     }
@@ -2885,34 +2913,45 @@ class _BlockSink {
     if (_closed) return;
     _closed = true;
     // Wake any stranded awaiters with null so they unwind instead of hanging.
-    for (final w in _waiters) {
-      w.complete(null);
+    for (final waiter in _waiters) {
+      waiter.completer.complete(null);
     }
     _waiters.clear();
   }
 
-  /// Await the next response, or null if the sink is closed (session lost /
-  /// cancelled) before one arrives. A closed sink with buffered responses
-  /// still drains them — close only stops NEW responses, it doesn't discard
-  /// already-received ones (the file may be one block from complete).
-  Future<Map<String, dynamic>?> next() async {
+  /// Await the response for [expectedOffset], or null if the sink is closed
+  /// (session lost / cancelled) before one arrives.
+  Future<Map<String, dynamic>?> nextFor(int? expectedOffset) async {
+    if (expectedOffset != null) {
+      final responses = _responsesByOffset[expectedOffset];
+      if (responses != null && responses.isNotEmpty) {
+        final response = responses.removeAt(0);
+        if (responses.isEmpty) {
+          _responsesByOffset.remove(expectedOffset);
+        }
+        return response;
+      }
+    }
     if (_queue.isNotEmpty) {
       return _queue.removeAt(0);
     }
     if (_closed) return null;
-    final c = Completer<Map<String, dynamic>?>();
-    _waiters.add(c);
+    final completer = Completer<Map<String, dynamic>?>();
+    final waiter = _BlockWaiter(expectedOffset, completer);
+    _waiters.add(waiter);
     // Stall backstop: if nothing arrives for this long, self-close so the
     // fetcher unwinds. onPeerSessionLost usually closes us first; this is the
     // backstop for any failure mode that doesn't.
     Future.delayed(const Duration(seconds: 45), () {
-      if (!c.isCompleted) {
-        _waiters.remove(c);
-        c.complete(null);
+      if (!completer.isCompleted) {
+        _waiters.remove(waiter);
+        completer.complete(null);
       }
     });
-    return c.future;
+    return completer.future;
   }
+
+  Future<Map<String, dynamic>?> next() => nextFor(null);
 }
 
 /// A bounded, TTL-evicting set of recently-seen message ids, for idempotent

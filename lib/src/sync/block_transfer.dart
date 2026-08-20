@@ -226,6 +226,11 @@ Future<String> fetchFileBlockLevel({
     if (resp['error'] != null) {
       throw TerminalFetchError(relPath, resp['error'].toString());
     }
+    final responseOffset = (resp['offset'] as num?)?.toInt();
+    if (responseOffset != null && responseOffset != offset) {
+      throw StateError(
+          'block $i ($relPath) response offset mismatch: expected $offset, got $responseOffset');
+    }
     final data = _wireBytes(resp['data']);
     final respSha = resp['sha256'] as String?;
     final actualSha = sha256.convert(data).toString();
