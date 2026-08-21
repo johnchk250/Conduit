@@ -466,40 +466,92 @@ class PeerConnectionManager {
   // to the permanent engine handler via _publishSession. There is no window
   // where a message can arrive unowned: the handler is set BEFORE listen()
   // starts pumping the socket.
+  //
+  // Pre-auth hardening: sockets that never complete a hello are destroyed
+  // after a deadline, and only a bounded number of handshakes may be in
+  // flight at once. Both are far above what legitimate peers produce (a
+  // reconnect is one connection; two devices dialing each other is two), so
+  // normal auto-connect behavior is unaffected — they only bound how long an
+  // attacker can hold sockets open without speaking (slowloris-style
+  // exhaustion) and how much pre-hello work (X25519 keygen) each accepted
+  // socket can force.
+
+  /// Maximum simultaneous not-yet-established incoming connections.
+  static const int _maxConcurrentHandshakes = 12;
+
+  /// How long an accepted socket may stay silent before it is destroyed.
+  static const Duration _preHelloDeadline = Duration(seconds: 10);
+
+  int _incomingHandshakes = 0;
 
   void _handleIncoming(Socket socket) async {
-    // Perf: mirror the client-side setting in connectMultiHost — whichever
-    // side dialed, both ends of the socket should skip Nagle's algorithm.
+    if (_incomingHandshakes >= _maxConcurrentHandshakes) {
+      try {
+        socket.destroy();
+      } catch (_) {}
+      return;
+    }
+    _incomingHandshakes++;
+    var settled = false;
+    void settle() {
+      if (settled) return;
+      settled = true;
+      _incomingHandshakes--;
+    }
+
     try {
-      socket.setOption(SocketOption.tcpNoDelay, true);
-    } catch (_) {}
-    final codec = FrameCodec(socket);
-    final secureOffer = await SecureHandshake.createOffer();
-    // Temp handshake handler. Owns all messages until hello/welcome completes,
-    // then _publishSession hands the codec to PeerSession and the engine
-    // reassigns onMessage.
-    codec.onMessage = (msg) async {
-      final type = msg['t'] as String?;
-      if (type == Msg.hello) {
-        try {
-          await _onHello(socket, codec, secureOffer, msg);
-        } catch (e, st) {
-          // ignore: avoid_print
-          print('[Conduit] _onHello failed: $e\n$st');
+      // Perf: mirror the client-side setting in connectMultiHost — whichever
+      // side dialed, both ends of the socket should skip Nagle's algorithm.
+      try {
+        socket.setOption(SocketOption.tcpNoDelay, true);
+      } catch (_) {}
+      final codec = FrameCodec(socket);
+      final secureOffer = await SecureHandshake.createOffer();
+      // Temp handshake handler. Owns all messages until hello/welcome completes,
+      // then _publishSession hands the codec to PeerSession and the engine
+      // reassigns onMessage.
+      codec.onMessage = (msg) async {
+        final type = msg['t'] as String?;
+        if (type == Msg.hello) {
           try {
-            await codec.send(
-                {'t': Msg.error, 'message': 'internal error processing hello'});
-          } catch (_) {}
-          await socket.close();
+            await _onHello(socket, codec, secureOffer, msg);
+          } catch (e, st) {
+            // ignore: avoid_print
+            print('[Conduit] _onHello failed: $e\n$st');
+            try {
+              await codec.send({
+                't': Msg.error,
+                'message': 'internal error processing hello'
+              });
+            } catch (_) {}
+            await socket.close();
+          }
+          // The hello has been handled — accepted, rejected, or failed. The
+          // session (if any) now lives outside the handshake budget.
+          settle();
         }
-      }
-      // Any other message during the handshake phase is unexpected; ignore.
-    };
-    codec.onError = (Object e) {
-      // ignore: avoid_print
-      print('[Conduit] server codec error: $e');
-    };
-    codec.listen();
+        // Any other message during the handshake phase is unexpected; ignore.
+      };
+      codec.onError = (Object e) {
+        settle();
+        // ignore: avoid_print
+        print('[Conduit] server codec error: $e');
+      };
+      codec.listen();
+      Timer(_preHelloDeadline, () {
+        if (!settled && !codec.isClosed) {
+          Diag.session('pre_hello_timeout');
+          try {
+            socket.destroy();
+          } catch (_) {}
+          settle();
+        }
+      });
+    } catch (e) {
+      settle();
+      // Never let an accept-path failure escape as an unhandled zone error.
+      Diag.session('incoming_accept_failed', fields: {'error': e.toString()});
+    }
   }
 
   Future<void> _onHello(
@@ -538,6 +590,10 @@ class PeerConnectionManager {
         config.pairedPeers.any((p) => p.deviceId == peerDeviceId);
     final forceTakeover = hello['takeover'] == true && isAlreadyPaired;
 
+    // When this hello completes a first-time pairing, remember the accepted
+    // secret so the welcome can carry a responder-side proof of it (see
+    // _responderPairingProof).
+    String? acceptedPairingSecret;
     if (!isAlreadyPaired) {
       final pending = _pendingIncomingPairCode;
       final proof = hello['pairingProof'] as String?;
@@ -566,6 +622,7 @@ class PeerConnectionManager {
         await socket.close();
         return;
       }
+      acceptedPairingSecret = pending.code;
     } else {
       if (peerPubKey != known.publicKeyB64) {
         await codec.send({'t': Msg.error, 'message': 'pinned pubkey mismatch'});
@@ -638,6 +695,14 @@ class PeerConnectionManager {
       'features': supportedPeerFeatures,
       ...secureOffer.toJson(),
     };
+    // Responder-side proof of the pairing secret (first-time pairing only).
+    // Added BEFORE the transcript is signed so it travels with the welcome;
+    // the HMAC itself binds both ephemeral keys and both identities, so a
+    // man-in-the-middle cannot recompute or transplant it without the code.
+    if (acceptedPairingSecret != null) {
+      welcome['pairingProof'] =
+          _responderPairingProof(acceptedPairingSecret, hello, welcome);
+    }
     final transcript = SecureHandshake.transcript(
       initiator: hello,
       responder: welcome,
@@ -830,6 +895,7 @@ class PeerConnectionManager {
         deviceId: target.deviceId,
         isPaired: isPaired,
         pairCode: pairCode,
+        expectedPubKeyB64: target.publicKeyB64,
         timeout: timeout,
         forceTakeover: forceTakeover,
         transport: ConnectionTransport.bluetooth,
@@ -891,6 +957,7 @@ class PeerConnectionManager {
           deviceId: deviceId,
           isPaired: isPaired,
           pairCode: pairCode,
+          expectedPubKeyB64: publicKeyB64,
           timeout: timeout,
           forceTakeover: forceTakeover,
           transport: ConnectionTransport.lan,
@@ -939,6 +1006,7 @@ class PeerConnectionManager {
     required String deviceId,
     required bool isPaired,
     String? pairCode,
+    String? expectedPubKeyB64,
     required Duration timeout,
     bool forceTakeover = false,
     ConnectionTransport transport = ConnectionTransport.lan,
@@ -992,6 +1060,7 @@ class PeerConnectionManager {
     )) {
       throw StateError('secure handshake signature mismatch');
     }
+
     final features = (welcome['features'] as List?)?.cast<String>().toList() ??
         const <String>[];
     final peer = PairedPeer(
@@ -1018,6 +1087,40 @@ class PeerConnectionManager {
       if (peer.deviceId != expected.deviceId ||
           peer.publicKeyB64 != expected.publicKeyB64) {
         throw StateError('paired peer identity mismatch');
+      }
+    }
+
+    // First-time pairing hardening (two independent layers):
+    //
+    // 1. Expected-key pinning. When the caller supplied a public key out of
+    //    band — the QR connect token, a discovery beacon, or a Bluetooth
+    //    advertisement — the responder must present exactly that identity.
+    //    Without this check an active man-in-the-middle could answer the
+    //    first connection with its own key and get pinned as the peer.
+    if (!isPaired &&
+        expectedPubKeyB64 != null &&
+        expectedPubKeyB64.isNotEmpty) {
+      if (peer.publicKeyB64 != expectedPubKeyB64) {
+        throw StateError(
+            'responder identity does not match the expected public key');
+      }
+    }
+    //
+    // 2. Responder-side proof of the pairing secret. The hello's pairingProof
+    //    only proves the INITIATOR knows the code. Newer responders also sign
+    //    an HMAC over both ephemeral keys with the same secret (carried inside
+    //    the signed welcome), which proves the RESPONDER knows it too —
+    //    closing the MITM gap even when no expected key is available (the
+    //    manual host:port flow). Older peers omit the field; with them we fall
+    //    back to layer 1 only, preserving compatibility.
+    if (hello['pairingProof'] != null && pairCode != null) {
+      final responderProof = welcome['pairingProof'] as String?;
+      if (responderProof != null) {
+        final expectedProof = _responderPairingProof(pairCode, hello, welcome);
+        if (!_constantTimeEquals(responderProof, expectedProof)) {
+          throw StateError(
+              'pairing proof mismatch: the responder does not know the pairing code');
+        }
       }
     }
 
@@ -1090,7 +1193,42 @@ String _pairingProof(String secret, Map<String, dynamic> hello) {
       Hmac(sha256, utf8.encode(normalizedSecret)).convert(input).bytes);
 }
 
+/// HMAC proving the RESPONDER also knows the first-time pairing secret.
+///
+/// The hello's [ _pairingProof] only authenticates initiator→responder. This
+/// proof closes the reverse direction: it covers both devices' identities and
+/// both ephemeral X25519 keys, so a man-in-the-middle that substitutes its own
+/// key during a first pairing cannot produce it. The field is carried in the
+/// welcome (which the responder signs) but deliberately kept OUT of the
+/// transcript so the transcript format stays byte-compatible with older
+/// peers; the fresh nonce + ephemeral keys inside the HMAC input make replay
+/// impossible anyway.
+String _responderPairingProof(
+  String secret,
+  Map<String, dynamic> hello,
+  Map<String, dynamic> welcome,
+) {
+  final input = utf8.encode(jsonEncode({
+    'v': 1,
+    'initiatorDeviceId': hello['deviceId'],
+    'initiatorPubKey': hello['pubKey'],
+    'initiatorEphemeralKey': hello['ephemeralKey'],
+    'secureNonce': hello['secureNonce'],
+    'secureVersion': hello['secureVersion'],
+    'responderDeviceId': welcome['deviceId'],
+    'responderPubKey': welcome['pubKey'],
+    'responderEphemeralKey': welcome['ephemeralKey'],
+  }));
+  final normalizedSecret =
+      secret.trim().toLowerCase().replaceAll(RegExp(r'[\s-]+'), ' ');
+  return base64Encode(
+      Hmac(sha256, utf8.encode(normalizedSecret)).convert(input).bytes);
+}
+
 bool _constantTimeEquals(String left, String right) {
+  // An empty operand must reject cleanly — the modulo walk below would throw
+  // a range error on an empty `a`.
+  if (left.isEmpty || right.isEmpty) return left.isEmpty && right.isEmpty;
   final a = utf8.encode(left);
   final b = utf8.encode(right);
   var difference = a.length ^ b.length;

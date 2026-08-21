@@ -11,6 +11,28 @@
 namespace {
 constexpr UINT kPlatformTaskMessage = WM_APP + 73;
 
+// True when [pid] is another process running THIS executable image. Used to
+// authenticate WM_COPYDATA senders: the message cannot identify its poster,
+// so the sender includes its own PID and we verify the image path. A same-user
+// process that is not Conduit (script, browser helper, sandboxed app) is
+// rejected; UIPI already blocks lower-integrity posters.
+bool IsOwnExecutablePid(DWORD pid) {
+  if (pid == 0) return false;
+  if (pid == GetCurrentProcessId()) return true;
+  wchar_t module_path[MAX_PATH];
+  DWORD module_len = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+  if (module_len == 0 || module_len >= MAX_PATH) return false;
+  HANDLE process =
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (process == nullptr) return false;
+  wchar_t sender_path[MAX_PATH];
+  DWORD sender_len = MAX_PATH;
+  BOOL ok = QueryFullProcessImageNameW(process, 0, sender_path, &sender_len);
+  CloseHandle(process);
+  if (!ok || sender_len == 0 || sender_len >= MAX_PATH) return false;
+  return _wcsicmp(sender_path, module_path) == 0;
+}
+
 // Read a string/int/bool out of a method-call argument map, falling back to a
 // default when the key is absent or the type differs.
 std::string ArgString(const flutter::EncodableMap* args, const char* key,
@@ -309,12 +331,19 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     case WM_COPYDATA: {
       auto cds = reinterpret_cast<COPYDATASTRUCT*>(lparam);
       if (cds && cds->dwData == 1) { // magic ID for SendTo paths
+        // Reject payloads that are not a whole number of UTF-16 code units.
+        if (cds->cbData % sizeof(wchar_t) != 0 || cds->cbData == 0) {
+          return TRUE;
+        }
         const wchar_t* data = reinterpret_cast<const wchar_t*>(cds->lpData);
         size_t len = cds->cbData / sizeof(wchar_t);
         // Copy to wstring safely (data might not be null-terminated depending on cbData).
         std::wstring encoded(data, len);
-        // The paths are separated by U+001F (unit separator).
-        std::vector<std::wstring> paths;
+        // Segments are separated by U+001F (unit separator). The FIRST
+        // segment must be the sender's PID and must resolve to another
+        // process running this same executable — see ForwardToExistingInstance
+        // in main.cpp. Anything else is dropped silently.
+        std::vector<std::wstring> segments;
         std::wstringstream wss(encoded);
         std::wstring segment;
         while (std::getline(wss, segment, L'\x1F')) {
@@ -322,9 +351,17 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
             segment.pop_back(); // Remove null terminator if it was copied
           }
           if (!segment.empty()) {
-            paths.push_back(segment);
+            segments.push_back(segment);
           }
         }
+        if (segments.empty()) {
+          return TRUE;
+        }
+        DWORD sender_pid = wcstoul(segments.front().c_str(), nullptr, 10);
+        if (!IsOwnExecutablePid(sender_pid)) {
+          return TRUE;
+        }
+        std::vector<std::wstring> paths(segments.begin() + 1, segments.end());
 
         if (!paths.empty()) {
           if (is_dart_ready_ && share_handler_ready_) {

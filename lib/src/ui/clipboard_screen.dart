@@ -215,6 +215,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                       style: GlassButtonStyle.primary,
                       enabled: !_sending,
                       selected: _sendResultShown,
+                      selectedLabel: 'Sent!',
                       onTap: _sendClipboard,
                     ),
                   ],

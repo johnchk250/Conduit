@@ -11,8 +11,10 @@ class AppRuntime {
             AppState(
                 dependencies: dependencies ?? AppDependencies.production()) {
     lifecycle = AppLifecycleController(this.appState);
-    connections = ConnectionController(this.appState);
-    folders = FolderSyncController(this.appState);
+    connections =
+        ConnectionController(this.appState, pulse: this.appState.syncPulse);
+    folders =
+        FolderSyncController(this.appState, pulse: this.appState.syncPulse);
     transfers = TransferController(this.appState);
     deviceServices = DeviceServicesController(this.appState);
   }

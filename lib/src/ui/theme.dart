@@ -113,6 +113,9 @@ Color statusColor(BuildContext ctx, String? status) {
   if (status.contains('Transferring') || status.contains('Scanning')) {
     return scheme.primary;
   }
+  if (status.startsWith('Safety hold')) {
+    return Colors.amber.shade700;
+  }
   if (status.contains('offline') || status.contains('Waiting')) {
     return Colors.amber.shade700;
   }

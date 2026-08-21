@@ -1,6 +1,7 @@
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'typography.dart';
 
 /// Liquid-glass design tokens + shared widgets used across every screen.
@@ -160,7 +161,10 @@ class GlassColors {
     danger: const Color(0xFFF87171), // designed extension, see field doc
     textPrimary: const Color(0xFFF4F6FA), // --text-primary
     textSecondary: const Color(0xFF93A0B4), // --text-secondary
-    textTertiary: const Color(0xFF5F6D82), // --text-tertiary
+    // Lifted from the sampled --text-tertiary (#5F6D82, ~3.6:1 on the deep
+    // background — below WCAG AA) to the nearest step that clears 4.5:1 while
+    // keeping the tertiary < secondary < primary hierarchy.
+    textTertiary: const Color(0xFF76839B),
     bgTop: const Color(0xFF0D1220),
     bgMid: const Color(0xFF0A0E17), // also --bg-deep
     bgBottom: const Color(0xFF090C14),
@@ -193,7 +197,8 @@ class GlassColors {
     danger: const Color(0xFFDC2626),
     textPrimary: const Color(0xFF1B1D28),
     textSecondary: const Color(0xFF4B4F63),
-    textTertiary: const Color(0xFF767B93),
+    // Darkened from #767B93 (~3.4:1 on the light backdrop) to clear WCAG AA.
+    textTertiary: const Color(0xFF5D6379),
     bgTop: const Color(0xFFF1EEFA),
     bgMid: const Color(0xFFE9E6F5),
     bgBottom: const Color(0xFFE2DEF0),
@@ -988,11 +993,15 @@ class GlassChip extends StatelessWidget {
       ),
     );
     if (onTap == null) return chip;
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(20),
-      child: Material(
-        type: MaterialType.transparency,
-        child: InkWell(onTap: onTap, child: chip),
+    return Semantics(
+      button: true,
+      label: label,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: Material(
+          type: MaterialType.transparency,
+          child: InkWell(onTap: onTap, child: chip),
+        ),
       ),
     );
   }
@@ -1011,6 +1020,7 @@ class GlassButton extends StatefulWidget {
     required this.accentColor,
     this.enabled = true,
     this.selected = false,
+    this.selectedLabel,
     this.onTap,
     this.style = GlassButtonStyle.tint,
     this.compact = false,
@@ -1020,6 +1030,11 @@ class GlassButton extends StatefulWidget {
   final String label;
   final Color accentColor;
   final bool enabled;
+
+  /// Label shown while [selected] is true. Defaults to [label]; pass a
+  /// short confirmation word (e.g. 'Sent!') only where that feedback is
+  /// meaningful for THIS button's action.
+  final String? selectedLabel;
   final bool selected;
   final VoidCallback? onTap;
   final GlassButtonStyle style;
@@ -1075,58 +1090,95 @@ class _GlassButtonState extends State<GlassButton>
                 ? 0.4
                 : 0.30;
 
-    return GestureDetector(
-      onTapDown: widget.enabled ? (_) => _ctrl.forward() : null,
-      onTapUp: widget.enabled
-          ? (_) {
-              _ctrl.reverse();
-              widget.onTap?.call();
-            }
-          : null,
-      onTapCancel: () => _ctrl.reverse(),
-      child: ScaleTransition(
-        scale: _scale,
-        child: Container(
-          padding: EdgeInsets.symmetric(vertical: widget.compact ? 8 : 11),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(12),
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [
-                accent.withValues(alpha: widget.enabled ? fillA : 0.05),
-                accent.withValues(alpha: widget.enabled ? fillB : 0.02),
-              ],
-            ),
-            border: Border.all(
-              color: accent.withValues(alpha: widget.enabled ? borderA : 0.14),
-            ),
+    return Semantics(
+      button: true,
+      enabled: widget.enabled,
+      label: widget.label,
+      child: FocusableActionDetector(
+        enabled: widget.enabled,
+        mouseCursor:
+            widget.enabled ? SystemMouseCursors.click : MouseCursor.defer,
+        shortcuts: const {
+          SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
+          SingleActivator(LogicalKeyboardKey.space): ActivateIntent(),
+          SingleActivator(LogicalKeyboardKey.numpadEnter): ActivateIntent(),
+        },
+        actions: {
+          ActivateIntent: CallbackAction<ActivateIntent>(
+            onInvoke: (_) => _activate(),
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                widget.selected ? Icons.check_rounded : widget.icon,
-                size: widget.compact ? 17 : 20,
-                color: fg,
-              ),
-              const SizedBox(height: 3),
-              Text(
-                widget.selected ? 'Sent!' : widget.label,
-                textAlign: TextAlign.center,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: fg,
-                  fontWeight: FontWeight.w600,
-                  fontSize: widget.compact ? 9.5 : 10.5,
+        },
+        // Pointer input stays on a GestureDetector nested INSIDE the
+        // detector — FocusableActionDetector only supplies focus, cursor,
+        // and keyboard activation; it never handles taps.
+        child: GestureDetector(
+          onTapDown: widget.enabled ? (_) => _ctrl.forward() : null,
+          onTapUp: widget.enabled
+              ? (_) {
+                  _ctrl.reverse();
+                  widget.onTap?.call();
+                }
+              : null,
+          onTapCancel: () => _ctrl.reverse(),
+          child: ScaleTransition(
+            scale: _scale,
+            child: Container(
+              padding: EdgeInsets.symmetric(vertical: widget.compact ? 8 : 11),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    accent.withValues(alpha: widget.enabled ? fillA : 0.05),
+                    accent.withValues(alpha: widget.enabled ? fillB : 0.02),
+                  ],
+                ),
+                border: Border.all(
+                  color:
+                      accent.withValues(alpha: widget.enabled ? borderA : 0.14),
                 ),
               ),
-            ],
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    widget.selected ? Icons.check_rounded : widget.icon,
+                    size: widget.compact ? 17 : 20,
+                    color: fg,
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    widget.selected
+                        ? (widget.selectedLabel ?? widget.label)
+                        : widget.label,
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: fg,
+                      fontWeight: FontWeight.w600,
+                      fontSize: widget.compact ? 9.5 : 10.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
       ),
     );
+  }
+
+  /// Activate via keyboard (Enter/Space). Mirrors the pointer path's press
+  /// animation so keyboard users get the same feedback.
+  void _activate() {
+    if (!widget.enabled) return;
+    _ctrl.forward();
+    Future.delayed(const Duration(milliseconds: 80), () {
+      if (mounted) _ctrl.reverse();
+    });
+    widget.onTap?.call();
   }
 }
 
@@ -1226,10 +1278,12 @@ class GlassNavBar extends StatelessWidget {
                 d.label,
                 maxLines: 1,
                 softWrap: false,
-                overflow: TextOverflow.visible,
+                // Ellipsize instead of painting over neighbouring
+                // destinations on narrow phones.
+                overflow: TextOverflow.ellipsis,
                 style: AppTypography.manrope(
                   textStyle: TextStyle(
-                    fontSize: 9.5,
+                    fontSize: 10.5,
                     fontWeight: FontWeight.w600,
                     color: active ? c.textPrimary : c.textTertiary,
                   ),

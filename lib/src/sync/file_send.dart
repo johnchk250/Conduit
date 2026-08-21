@@ -273,6 +273,9 @@ class AdHocFileSend {
   // Inbound offers being fetched (auto-receive), keyed by offerId.
   final _inbound = <String, _InboundOffer>{};
 
+  /// Maximum simultaneously-tracked inbound offers (see [handleFileOffer]).
+  static const int maxConcurrentInboundOffers = 8;
+
   static const _uuid = Uuid();
 
   // SAF method channel — used only on Android for the streaming path.
@@ -477,6 +480,19 @@ class AdHocFileSend {
         final reqOffset = (req['offset'] as num?)?.toInt() ?? 0;
         final reqSize = (req['size'] as num?)?.toInt() ?? blockSize;
         if (session.isClosed || offer.canceled) break;
+        // Bound every served read to one protocol block, mirroring the sync
+        // serve loop. A hostile receiver could otherwise request the whole
+        // file in a single block and force it fully into memory.
+        if (reqSize < 0 || reqSize > blockSize) {
+          session.send({
+            't': Msg.fileOfferData,
+            'offerId': offer.offerId,
+            'name': fileName,
+            'offset': reqOffset,
+            'error': 'requested block size exceeds the protocol maximum',
+          });
+          continue;
+        }
         try {
           await offer.waitIfPaused();
           final blockBytes = await offer.readBlock(reqOffset, reqSize);
@@ -655,6 +671,22 @@ class AdHocFileSend {
       return;
     }
     if (_inbound.containsKey(offerId)) return; // duplicate, ignore
+    // Bound concurrent inbound offers. Each offer holds a receipt row, a
+    // notification slot, and (once started) a transfer lease; a peer spamming
+    // offers must not grow those without limit. The cap is far above any
+    // legitimate batch size.
+    if (_inbound.length >= maxConcurrentInboundOffers) {
+      onLog('Inbound offer cap reached — rejecting $name (offerId=$offerId)',
+          isError: true);
+      _sendReceipt(
+        session,
+        offerId,
+        'rejected',
+        0,
+        TransferFailureCode.unknown,
+      );
+      return;
+    }
 
     final offer = _InboundOffer(
       offerId: offerId,

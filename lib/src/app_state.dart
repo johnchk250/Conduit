@@ -263,6 +263,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       _engine.localDeletionHoldCountFor(pairId);
   List<String> localDeletionHoldPathsFor(String pairId) =>
       _engine.localDeletionHoldPathsFor(pairId);
+  int incomingDeletionHoldCountFor(String pairId) =>
+      _engine.incomingDeletionHoldCountFor(pairId);
+  List<String> incomingDeletionHoldPathsFor(String pairId) =>
+      _engine.incomingDeletionHoldPathsFor(pairId);
+  int pendingDeletionApprovalCountFor(String pairId) =>
+      _engine.pendingDeletionApprovalCountFor(pairId);
+  List<String> pendingDeletionApprovalPathsFor(String pairId) =>
+      _engine.pendingDeletionApprovalPathsFor(pairId);
   bool get bluetoothEnabled => _config.bluetoothEnabled;
   String get bluetoothStatus {
     for (final peer in _config.pairedPeers) {
@@ -331,6 +339,25 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// tombstone and reconciles immediately when possible.
   Future<int> propagateHeldDeletions(FolderPair pair) async {
     final approved = await _engine.approveLocalDeletionHold(pair);
+    notifyListeners();
+    return approved;
+  }
+
+  /// Explicitly accept the incoming deletions (peer tombstones and
+  /// sweep-withheld bytes) currently stopped by the safety guard on this
+  /// device. Files concurrently edited locally are kept.
+  Future<int> acceptIncomingDeletions(FolderPair pair) async {
+    final accepted = await _engine.acceptIncomingDeletionHold(pair);
+    notifyListeners();
+    return accepted;
+  }
+
+  /// Retroactively approve the durable backlog of past unapproved deletions
+  /// (bytes already gone). One click resolves the hold permanently — the
+  /// approved tombstones ride to the peer as trusted and its echoes stop
+  /// re-raising phantom holds.
+  Future<int> confirmPastDeletions(FolderPair pair) async {
+    final approved = await _engine.confirmPastDeletions(pair);
     notifyListeners();
     return approved;
   }
@@ -1628,6 +1655,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _networkRecoveryTimer?.cancel();
     _resumeProbeTimer?.cancel();
     _highFrequencyUiTimer?.cancel();
+    _syncPulse.dispose();
     _cancelNetworkReannounces();
     _networkingReady = false;
     if (Platform.isAndroid) {
@@ -1946,10 +1974,20 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     return true;
   }
 
+  /// High-frequency change signal for live UI (transfer progress ticks,
+  /// heartbeat RTT updates). Deliberately separate from [notifyListeners]:
+  /// these changes used to fan out through the global notifier and rebuild
+  /// every AppState watcher ~8x/second during a transfer. Widgets that show
+  /// live progress subscribe to this listenable (directly or through the
+  /// scoped controllers); everything else rebuilds only on real state
+  /// transitions.
+  final ChangeNotifier _syncPulse = ChangeNotifier();
+  Listenable get syncPulse => _syncPulse;
+
   void _notifyHighFrequency() {
     _highFrequencyUiTimer ??= Timer(const Duration(milliseconds: 120), () {
       _highFrequencyUiTimer = null;
-      notifyListeners();
+      _syncPulse.notifyListeners();
     });
   }
 
@@ -1959,7 +1997,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     final pair = draft.materialize(DeviceIdentity.uuid.v4());
     await _config.upsertPair(pair);
     try {
-      await _engine.startPair(pair);
+      // Pairing is instant: the pair is registered and the invite can go out
+      // while the initial index build runs in the background.
+      await _engine.startPair(pair, awaitInitialSeed: false);
     } catch (_) {
       await _config.removePair(pair.id);
       rethrow;
@@ -2619,8 +2659,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// native SendPopup over the `conduit/shell` method channel.
   Future<void> _sendBackgroundBatch(
       List<PendingSharedFile> files, PairedPeer peer) async {
-    final total = files.length;
-    _reportBackgroundStart(files, peer);
+    final reporter = _BackgroundTransferReporter(
+      _chShell,
+      files: files,
+      peer: peer,
+    )..start();
     var sent = 0;
     var failed = 0;
     var fileIndex = 0;
@@ -2634,8 +2677,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         filePath: f.filePath,
         fileSize: f.size,
         onProgress: (sentBytes, totalBytes) {
-          _reportBackgroundProgress(
-              f.name, sentBytes, totalBytes, fileIndex, total);
+          reporter.recordProgress(
+            fileName: f.name,
+            sentBytes: sentBytes,
+            totalBytes: totalBytes,
+            fileIndex: fileIndex,
+          );
         },
       );
       ok ? sent++ : failed++;
@@ -2646,34 +2693,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         : sent == 0
             ? (lastTransferBlockReason ?? "Couldn't send to ${peer.name}")
             : 'Sent $sent, failed $failed to ${peer.name}';
-    _reportBackgroundComplete(allOk, message);
-  }
-
-  void _reportBackgroundStart(List<PendingSharedFile> files, PairedPeer peer) {
-    _chShell.invokeMethod<void>('sendPopupShow', {
-      'fileName':
-          files.length == 1 ? files.first.name : '${files.length} files',
-      'peerName': peer.name,
-      'batchTotal': files.length,
-    }).catchError((_) {});
-  }
-
-  void _reportBackgroundProgress(String fileName, int sentBytes, int totalBytes,
-      int fileIndex, int batchTotal) {
-    final percent = totalBytes > 0 ? (sentBytes * 100 / totalBytes).floor() : 0;
-    _chShell.invokeMethod<void>('sendPopupProgress', {
-      'fileName': fileName,
-      'percent': percent,
-      'fileIndex': fileIndex,
-      'batchTotal': batchTotal,
-    }).catchError((_) {});
-  }
-
-  void _reportBackgroundComplete(bool success, String message) {
-    _chShell.invokeMethod<void>('sendPopupComplete', {
-      'success': success,
-      'message': message,
-    }).catchError((_) {});
+    await reporter.complete(success: allOk, message: message);
   }
 
   /// Test seam: routes OS share/send deliveries through the same handler as
@@ -2914,8 +2934,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     void progressWrapper(int sent, int total) {
-      // Update the Android status-bar notification.
-      _adHoc!.notifier.showSendProgress(fileName, sent, total);
+      // Update the Android status-bar notification. The Windows Explorer
+      // background flow has its own native presenter, so keep its transfer
+      // hot path free of notification work.
+      if (Platform.isAndroid) {
+        unawaited(_adHoc!.notifier.showSendProgress(fileName, sent, total));
+      }
       // Notify the UI caller.
       final now = DateTime.now();
       if (sent >= total ||
@@ -3359,6 +3383,111 @@ class PendingSharedFile {
     this.filePath,
     required this.size,
   });
+}
+
+/// Coalesces native progress-window updates for a background Windows send.
+///
+/// The block server invokes its progress callback from the transfer hot path.
+/// Recording the latest sample is deliberately synchronous and allocation
+/// light; a timer publishes at most five platform messages per second on a
+/// separate event-loop turn. This keeps presentation work from competing with
+/// file reads, hashing, or network writes. The channel tail preserves the
+/// show → progress → terminal ordering without making the transfer await a
+/// renderer update.
+class _BackgroundTransferReporter {
+  _BackgroundTransferReporter(
+    this._channel, {
+    required List<PendingSharedFile> files,
+    required PairedPeer peer,
+  })  : _files = files,
+        _peer = peer;
+
+  static const _publishInterval = Duration(milliseconds: 200);
+
+  final MethodChannel _channel;
+  final List<PendingSharedFile> _files;
+  final PairedPeer _peer;
+
+  Timer? _timer;
+  _BackgroundProgressSample? _latestSample;
+  Future<void> _channelTail = Future<void>.value();
+
+  void start() {
+    _enqueue('sendPopupShow', {
+      'fileName':
+          _files.length == 1 ? _files.first.name : '${_files.length} files',
+      'peerName': _peer.name,
+      'batchTotal': _files.length,
+    });
+    _timer = Timer.periodic(_publishInterval, (_) => _publishLatest());
+  }
+
+  void recordProgress({
+    required String fileName,
+    required int sentBytes,
+    required int totalBytes,
+    required int fileIndex,
+  }) {
+    _latestSample = _BackgroundProgressSample(
+      fileName: fileName,
+      sentBytes: sentBytes,
+      totalBytes: totalBytes,
+      fileIndex: fileIndex,
+    );
+  }
+
+  Future<void> complete(
+      {required bool success, required String message}) async {
+    _timer?.cancel();
+    _timer = null;
+    _publishLatest();
+    await _enqueue('sendPopupComplete', {
+      'success': success,
+      'message': message,
+    });
+  }
+
+  void _publishLatest() {
+    final sample = _latestSample;
+    if (sample == null) return;
+    _latestSample = null;
+    final percent = sample.totalBytes > 0
+        ? (sample.sentBytes * 100 / sample.totalBytes).floor()
+        : 0;
+    final clampedPercent = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
+    _enqueue('sendPopupProgress', {
+      'fileName': sample.fileName,
+      'percent': clampedPercent,
+      'fileIndex': sample.fileIndex,
+      'batchTotal': _files.length,
+    });
+  }
+
+  Future<void> _enqueue(String method, Map<String, dynamic> arguments) {
+    _channelTail = _channelTail.then<void>((_) async {
+      try {
+        await _channel.invokeMethod<void>(method, arguments);
+      } catch (_) {
+        // The main transfer remains valid if the native surface is gone
+        // during shutdown or if the runner cannot present it.
+      }
+    });
+    return _channelTail;
+  }
+}
+
+class _BackgroundProgressSample {
+  const _BackgroundProgressSample({
+    required this.fileName,
+    required this.sentBytes,
+    required this.totalBytes,
+    required this.fileIndex,
+  });
+
+  final String fileName;
+  final int sentBytes;
+  final int totalBytes;
+  final int fileIndex;
 }
 
 class DeviceDashboardState {

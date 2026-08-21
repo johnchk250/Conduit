@@ -570,55 +570,7 @@ class _OverviewPage extends StatelessWidget {
               onTap: () => _goToFolders(ctx),
             )
           else
-            ...pairs.map((p) {
-              final st = state.stateFor(p.id);
-              final status = st?.status ?? 'Idle';
-              // Reference only shows `.status-idle`/`.status-live`
-              // (green); `Paused`/`Error` are this app's own states with
-              // no reference example, mapped to sensible dot colors from
-              // the same accent family rather than left unstyled.
-              final Color dotColor;
-              final bool live;
-              if (status == 'Error') {
-                dotColor = c.danger;
-                live = false;
-              } else if (status == 'Paused') {
-                dotColor = c.amber;
-                live = false;
-              } else if (status.startsWith('Idle') ||
-                  status.startsWith('Waiting') ||
-                  status == 'Peer offline') {
-                dotColor = c.textTertiary;
-                live = false;
-              } else {
-                // Scanning / Requesting peer index / actively
-                // transferring — matches reference `.status-live`.
-                dotColor = c.mint;
-                live = true;
-              }
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: GlassListTile(
-                  leadingIcon: Icons.folder,
-                  accentColor: c.violet,
-                  title: p.name,
-                  subtitle: '${p.direction.label} · $status',
-                  subtitleDotColor: dotColor,
-                  subtitleLive: live,
-                  trailing: st?.progress != null
-                      ? SizedBox(
-                          width: 40,
-                          child: LinearProgressIndicator(
-                            value: st!.progress,
-                            color: c.violet,
-                            backgroundColor: c.violet.withValues(alpha: 0.15),
-                          ),
-                        )
-                      : Icon(Icons.chevron_right, color: c.textTertiary),
-                  onTap: () => _goToFolders(ctx),
-                ),
-              );
-            }),
+            _OverviewPairRows(state: state, onTap: () => _goToFolders(ctx)),
           const SizedBox(height: 26),
           const GlassSectionLabel('Devices on this network'),
           if (discovered.isEmpty)
@@ -691,6 +643,106 @@ class _OverviewPage extends StatelessWidget {
 
   void _navigate(BuildContext ctx, int i) {
     onNavigate(i);
+  }
+}
+
+/// The Overview page's folder-pair rows. Subscribes to [AppState.syncPulse]
+/// instead of the global notifier so per-tick transfer progress rebuilds only
+/// these rows — not the banner, quick actions, and device list above/below.
+class _OverviewPairRows extends StatelessWidget {
+  const _OverviewPairRows({required this.state, required this.onTap});
+  final AppState state;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = GlassColors.of(context);
+    return AnimatedBuilder(
+      animation: state.syncPulse,
+      builder: (context, _) {
+        final pairs = state.config.folderPairs;
+        return Column(
+          children: [
+            for (final p in pairs) ...[
+              _OverviewPairRow(
+                state: state,
+                pair: p,
+                colors: c,
+                onTap: onTap,
+              ),
+            ],
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _OverviewPairRow extends StatelessWidget {
+  const _OverviewPairRow({
+    required this.state,
+    required this.pair,
+    required this.colors,
+    required this.onTap,
+  });
+
+  final AppState state;
+  final FolderPair pair;
+  final GlassColors colors;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = colors;
+    final st = state.stateFor(pair.id);
+    final status = st?.status ?? 'Idle';
+    // Reference only shows `.status-idle`/`.status-live`
+    // (green); `Paused`/`Error` are this app's own states with
+    // no reference example, mapped to sensible dot colors from
+    // the same accent family rather than left unstyled.
+    final Color dotColor;
+    final bool live;
+    if (status == 'Error') {
+      dotColor = c.danger;
+      live = false;
+    } else if (status == 'Paused' || status.startsWith('Safety hold:')) {
+      dotColor = c.amber;
+      live = false;
+    } else if (status.startsWith('Idle') ||
+        status.startsWith('Waiting') ||
+        status == 'Peer offline') {
+      dotColor = c.textTertiary;
+      live = false;
+    } else {
+      // Scanning / Requesting peer index / actively
+      // transferring — matches reference `.status-live`.
+      dotColor = c.mint;
+      live = true;
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: GlassListTile(
+        leadingIcon: Icons.folder,
+        accentColor: c.violet,
+        title: pair.name,
+        subtitle: '${pair.direction.label} · $status',
+        subtitleDotColor: dotColor,
+        subtitleLive: live,
+        trailing: st?.progress != null
+            ? SizedBox(
+                width: 40,
+                child: LinearProgressIndicator(
+                  value: st!.progress,
+                  color: c.violet,
+                  backgroundColor: c.violet.withValues(alpha: 0.15),
+                ),
+              )
+            : status.startsWith('Safety hold:')
+                ? Icon(Icons.health_and_safety_outlined, color: c.amber)
+                : Icon(Icons.chevron_right, color: c.textTertiary),
+        onTap: onTap,
+      ),
+    );
   }
 }
 

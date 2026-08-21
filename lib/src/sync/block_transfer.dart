@@ -232,6 +232,17 @@ Future<String> fetchFileBlockLevel({
           'block $i ($relPath) response offset mismatch: expected $offset, got $responseOffset');
     }
     final data = _wireBytes(resp['data']);
+    final want = (offset + transferBlockSize > expectedSize)
+        ? expectedSize - offset
+        : transferBlockSize;
+    // The response must carry exactly the bytes that were requested. A short
+    // or oversized payload would silently corrupt the assembled file (the
+    // final whole-file hash would catch it only when one is available), so
+    // treat any length mismatch as a hard protocol error.
+    if (data.length != want) {
+      throw StateError(
+          'block $i ($relPath @ $offset) length mismatch: expected $want, got ${data.length}');
+    }
     final respSha = resp['sha256'] as String?;
     final actualSha = sha256.convert(data).toString();
     if (respSha != null && respSha != actualSha) {
@@ -414,6 +425,19 @@ Future<void> serveFileBlockLevel({
         'name': relPath,
         'offset': offset,
         'error': 'offset out of range',
+      });
+      continue;
+    }
+    // Bound every response to one protocol block. Legitimate receivers never
+    // request more than [blockSize] bytes, so this only rejects hostile or
+    // broken requests that would otherwise force a whole-file read into
+    // memory in a single frame.
+    if (want > blockSize) {
+      await respond({
+        't': Msg.response,
+        'name': relPath,
+        'offset': offset,
+        'error': 'requested block size exceeds the protocol maximum',
       });
       continue;
     }

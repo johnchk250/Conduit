@@ -474,6 +474,31 @@ class IndexDb {
     return rows.map(_rowToEntry).toList(growable: false);
   }
 
+  /// Strip the per-block hash arrays from every tombstone row.
+  ///
+  /// Tombstone rows must be KEPT (they are the versioned delete record that
+  /// propagates to peers and wins dominance comparisons), but their
+  /// [blockHashes] payload is dead weight: nothing ever fetches blocks of a
+  /// deleted path, and a resurrected row takes fresh hashes from the peer's
+  /// live entry. For large files that JSON array is by far the largest thing
+  /// in the row (~64 hex chars per MiB of file), so without this sweep the
+  /// index grows without bound as history accumulates. Rows themselves are
+  /// never removed — deleting them would silently break delete propagation
+  /// to a peer that reconnects after a long offline period.
+  ///
+  /// Returns the number of rows compacted. Atomic; safe to run at any time.
+  Future<int> compactTombstonePayloads() async {
+    return _db.transaction((txn) async {
+      final rows = await txn.rawQuery('SELECT COUNT(*) AS c FROM files '
+          'WHERE deleted = 1 AND block_hashes IS NOT NULL');
+      final count = (rows.firstOrNull?['c'] as num?)?.toInt() ?? 0;
+      if (count == 0) return 0;
+      await txn.update('files', {'block_hashes': null},
+          where: 'deleted = 1 AND block_hashes IS NOT NULL');
+      return count;
+    });
+  }
+
   /// Just the live (non-deleted) relPaths — used to detect tombstones (a path
   /// that's in the DB as live but absent from disk). Cheaper than
   /// [liveSnapshot] since it skips the version/blocks columns the scanner
@@ -707,6 +732,7 @@ class IndexDb {
           version: prior.version.bump(deviceId),
           sequence: nextSequence,
           deleted: true,
+          deletionApproved: true,
           blockHashes: prior.blockHashes,
         );
         await txn.insert('files', _entryToRow(tombstone),
@@ -760,6 +786,43 @@ class IndexDb {
       );
       return true;
     });
+  }
+
+  /// Mark existing unapproved tombstones as explicitly user-approved (durable).
+  /// Used by the retroactive "confirm past deletions" flow: rows written before
+  /// the approval bit existed remain unapproved forever otherwise, echoing back
+  /// as phantom remote holds. Returns how many rows changed.
+  Future<int> approveDeletions(Iterable<String> relPaths) async {
+    var changed = 0;
+    await _db.transaction((txn) async {
+      for (final relPath in relPaths) {
+        final existing = await txn
+            .rawQuery('SELECT * FROM files WHERE path = ? LIMIT 1', [relPath]);
+        if (existing.isEmpty) continue;
+        final prior = _rowToEntry(existing.first);
+        if (!prior.deleted || prior.deletionApproved) continue;
+        await txn.insert(
+          'files',
+          _entryToRow(IndexEntry(
+            relPath: prior.relPath,
+            size: prior.size,
+            mtime: prior.mtime,
+            sha256: prior.sha256,
+            version: prior.version,
+            sequence: prior.sequence,
+            deleted: true,
+            deletionApproved: true,
+            blockHashes: prior.blockHashes,
+            localSha: prior.localSha,
+            localSize: prior.localSize,
+            localMtime: prior.localMtime,
+          )),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        changed++;
+      }
+    });
+    return changed;
   }
 
   /// Record that THIS device has CONFIRMED the bytes on disk hash to [sha] —
@@ -937,7 +1000,22 @@ class IndexDb {
       // baseline across the peer's content update — see the next block.)
       final priorLocalSha = prior?.localSha ?? '';
       final merged = prior == null
-          ? remote.withLocalSha('')
+          ? (remote.deleted
+              ? IndexEntry(
+                  relPath: remote.relPath,
+                  size: remote.size,
+                  mtime: remote.mtime,
+                  sha256: remote.sha256,
+                  version: mergedVersion,
+                  sequence: remote.sequence,
+                  deleted: true,
+                  deletionApproved: true,
+                  blockHashes: remote.blockHashes,
+                  localSha: '',
+                  localSize: -1,
+                  localMtime: -1,
+                )
+              : remote.withLocalSha(''))
           : IndexEntry(
               relPath: remote.relPath,
               size: remote.size,
@@ -946,7 +1024,7 @@ class IndexDb {
               version: mergedVersion,
               sequence: remote.sequence,
               deleted: remote.deleted,
-              deletionApproved: remote.deletionApproved,
+              deletionApproved: remote.deleted ? true : remote.deletionApproved,
               blockHashes: remote.blockHashes,
               localSha: priorLocalSha,
               localSize: prior.localSize,

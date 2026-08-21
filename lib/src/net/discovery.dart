@@ -90,6 +90,56 @@ class Discovery {
   Timer? _interfaceWatchTimer;
   String? _lastInterfaceSignature;
 
+  // ---- Unicast-reply budget (probe-flood hardening) -----------------------
+  //
+  // Every received `probe` triggers a unicast announce reply to the sender's
+  // source address:port. UDP source addresses are trivially spoofed, so an
+  // attacker could otherwise use Conduit as a reflection/amplification stack
+  // or keep it busy replying all day. Replies are therefore rate-limited per
+  // source address. The budget is far above what legitimate discovery
+  // produces — a real peer probes a given address at most a few times per
+  // recovery burst (which itself is seconds apart) — so normal auto-connect,
+  // recovery sweeps, and battery-driven beacon backoff are unaffected.
+  static const _maxRepliesPerSourcePerWindow = 4;
+  static const _replyWindow = Duration(seconds: 30);
+  static const _maxTrackedReplySources = 256;
+
+  /// Source address -> timestamps of recent unicast replies.
+  final _probeReplies = <String, List<DateTime>>{};
+
+  /// Maximum number of distinct device ids tracked in [_seen]. Real LANs have
+  /// a handful of Conduit devices; the cap only matters under an attack that
+  /// floods unique ids, and simply stops learning NEW ids when full (known
+  /// ids keep refreshing) so memory stays bounded.
+  static const _maxSeenDevices = 1024;
+
+  /// Beacons are ~300 bytes; anything larger is malformed by definition.
+  static const _maxDatagramBytes = 4096;
+
+  bool _consumeReplyBudget(String sourceAddress) {
+    final now = DateTime.now();
+    final windowStart = now.subtract(_replyWindow);
+    var stamps = _probeReplies[sourceAddress];
+    if (stamps == null) {
+      if (_probeReplies.length >= _maxTrackedReplySources) {
+        // Evict expired sources first; if still full, shed the oldest entry.
+        _probeReplies.removeWhere(
+            (_, stamps) => stamps.every((t) => t.isBefore(windowStart)));
+        if (_probeReplies.length >= _maxTrackedReplySources) {
+          final oldest = _probeReplies.entries
+              .reduce((a, b) => a.value.first.isBefore(b.value.first) ? a : b);
+          _probeReplies.remove(oldest.key);
+        }
+      }
+      stamps = <DateTime>[];
+      _probeReplies[sourceAddress] = stamps;
+    }
+    stamps.removeWhere((t) => t.isBefore(windowStart));
+    if (stamps.length >= _maxRepliesPerSourcePerWindow) return false;
+    stamps.add(now);
+    return true;
+  }
+
   static const _sweepInterval = Duration(minutes: 1);
   static const _staleAfter = Duration(minutes: 5);
   static final InternetAddress _multicastGroup =
@@ -320,6 +370,7 @@ class Discovery {
     _recoverySweepRetryTimer = null;
     _lastSubnetSweepAt = null;
     _seen.clear();
+    _probeReplies.clear();
   }
 
   /// Fire an immediate beacon outside the periodic timer's schedule. Used on
@@ -353,8 +404,8 @@ class Discovery {
         'pubKey': self.publicKeyB64,
         'port': listenPort,
         if (kind == 'probe')
-          'targets': recoveryDeviceIds?.call().toSet().toList() ??
-              const <String>[],
+          'targets':
+              recoveryDeviceIds?.call().toSet().toList() ?? const <String>[],
       };
 
   void _broadcast() {
@@ -380,8 +431,7 @@ class Discovery {
     if (shouldSweepSubnet != null && !shouldSweepSubnet!()) return;
     _recoverySweepRetryTimer = Timer(const Duration(seconds: 20), () {
       _recoverySweepRetryTimer = null;
-      if (!_running ||
-          (shouldSweepSubnet != null && !shouldSweepSubnet!())) {
+      if (!_running || (shouldSweepSubnet != null && !shouldSweepSubnet!())) {
         return;
       }
       // The first sweep may have happened before the peer's service finished
@@ -435,6 +485,7 @@ class Discovery {
 
   void _handleDatagram(Datagram dg) {
     try {
+      if (dg.data.length > _maxDatagramBytes) return;
       final j = jsonDecode(utf8.decode(dg.data)) as Map<String, dynamic>;
       if (j['v'] != 1) return;
       final id = j['deviceId'];
@@ -452,7 +503,9 @@ class Discovery {
       }
       final tcpPort = advertisedPort.toInt();
       if (tcpPort <= 0 || tcpPort > 65535) return;
-      _seen[id] = DateTime.now();
+      if (_seen.containsKey(id) || _seen.length < _maxSeenDevices) {
+        _seen[id] = DateTime.now();
+      }
       onPeer(DiscoveredPeer(
         deviceId: id,
         name: name,
@@ -465,11 +518,15 @@ class Discovery {
       // A probe is both an announcement from its sender and an explicit
       // request for a direct reply. The unicast response is important on
       // routers that permit client-to-client traffic but filter broadcasts.
+      // Replies are budgeted per source address so a spoofed-probe flood
+      // cannot turn this listener into a reflection engine; legitimate peers
+      // never come close to the cap.
       final kind = j['kind'] as String? ?? 'announce';
       if (kind == 'probe') {
         final targets = (j['targets'] as List?)?.whereType<String>().toSet() ??
             const <String>{};
-        if (targets.isEmpty || targets.contains(self.deviceId)) {
+        if ((targets.isEmpty || targets.contains(self.deviceId)) &&
+            _consumeReplyBudget(dg.address.address)) {
           final jitter = Random().nextInt(180);
           Timer(Duration(milliseconds: jitter), () {
             if (_running) _sendUnicastAnnouncement(dg.address, dg.port);
@@ -518,9 +575,7 @@ class Discovery {
     if (!_running || _subnetSweep != null) return;
     final now = DateTime.now();
     final last = _lastSubnetSweepAt;
-    if (!force &&
-        last != null &&
-        now.difference(last) < _subnetSweepCooldown) {
+    if (!force && last != null && now.difference(last) < _subnetSweepCooldown) {
       return;
     }
     _lastSubnetSweepAt = now;

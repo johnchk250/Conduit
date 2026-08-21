@@ -19,9 +19,13 @@
 //   * WS_EX_NOACTIVATE  -> never steals focus/activation from the user.
 //   * bottom-right of the work area of the monitor under the cursor, so it
 //     reads as a system transfer notification instead of a centered dialog.
-//   * only a title line, a progress bar, a file/peer subtitle and a close
-//     button — no peer chips, no file picker, no ready-to-send card, and
-//     never the full app shell.
+//   * a draggable, compact transfer panel with a visible Minimize control.
+//     Minimize collapses it into a short progress pill; Show restores it.
+//     This preserves a discoverable status surface without forcing a taskbar
+//     entry or exposing the full app shell.
+//   * only transfer status, progress, a file/peer subtitle and dismiss/
+//     collapse controls — no peer chips, file picker, ready-to-send card, or
+//     full app shell.
 class SendPopup {
  public:
   SendPopup();
@@ -36,10 +40,9 @@ class SendPopup {
   // Updates the subtitle and the progress bar. |percent| is 0..100.
   void UpdateProgress(const std::wstring& subtitle, int percent);
 
-  // Terminal state. A successful send hides/destroys the popup immediately.
-  // A failure leaves it visible with the failure message so the user
-  // understands what happened — without ever revealing the main overview
-  // window (which remains hidden).
+  // Terminal state. Success remains visible briefly as confirmation before
+  // disappearing; failure remains visible until dismissed. Neither outcome
+  // reveals the hidden main window.
   void Complete(bool success, const std::wstring& message);
 
   // Hides and destroys the popup window (user clicked its close button).
@@ -55,24 +58,32 @@ class SendPopup {
   HWND CreateWindowAndControls(int dpi);
   void Layout(int dpi);
   void PlaceBottomRight();
+  void SetCollapsed(bool collapsed);
   HFONT CreateFontAtDpi(int dpi);
   void ApplyFont();
   static void SetText(HWND control, const std::wstring& text);
 
   // Logical (96-dpi) popup metrics; scaled by the target monitor DPI.
-  static constexpr int kWidth = 360;
-  static constexpr int kHeight = 96;
+  static constexpr int kExpandedWidth = 400;
+  static constexpr int kCollapsedWidth = 320;
+  static constexpr int kExpandedHeight = 104;
+  static constexpr int kCollapsedHeight = 52;
+  static constexpr UINT_PTR kCompletionTimerId = 1;
 
   HWND hwnd_ = nullptr;
   HWND title_ = nullptr;
+  HWND status_ = nullptr;
   HWND subtitle_ = nullptr;
   HWND progress_ = nullptr;
+  HWND collapse_button_ = nullptr;
   HWND close_button_ = nullptr;
 
   HFONT font_ = nullptr;
   HBRUSH background_brush_ = nullptr;
   COLORREF text_color_ = RGB(0x1F, 0x1F, 0x1F);
   int dpi_ = 96;
+  bool collapsed_ = false;
+  bool terminal_ = false;
 };
 
 #endif  // RUNNER_SEND_POPUP_H_

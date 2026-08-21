@@ -3,6 +3,7 @@ import 'dart:ui';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'typography.dart';
 import 'package:provider/provider.dart';
 
@@ -490,16 +491,40 @@ class _GlassFabState extends State<_GlassFab>
       );
     }
 
-    return GestureDetector(
-      onTapDown: (_) => _ctrl.forward(),
-      onTapUp: (_) {
-        _ctrl.reverse();
-        widget.onTap();
-      },
-      onTapCancel: () => _ctrl.reverse(),
-      child: ScaleTransition(
-        scale: _scale,
-        child: buttonBody,
+    return Semantics(
+      button: true,
+      label: widget.label,
+      child: FocusableActionDetector(
+        mouseCursor: SystemMouseCursors.click,
+        shortcuts: const {
+          SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
+          SingleActivator(LogicalKeyboardKey.space): ActivateIntent(),
+          SingleActivator(LogicalKeyboardKey.numpadEnter): ActivateIntent(),
+        },
+        actions: {
+          ActivateIntent: CallbackAction<ActivateIntent>(
+            onInvoke: (_) {
+              _ctrl.forward();
+              Future.delayed(const Duration(milliseconds: 80), () {
+                if (mounted) _ctrl.reverse();
+              });
+              widget.onTap();
+              return null;
+            },
+          ),
+        },
+        child: GestureDetector(
+          onTapDown: (_) => _ctrl.forward(),
+          onTapUp: (_) {
+            _ctrl.reverse();
+            widget.onTap();
+          },
+          onTapCancel: () => _ctrl.reverse(),
+          child: ScaleTransition(
+            scale: _scale,
+            child: buttonBody,
+          ),
+        ),
       ),
     );
   }
@@ -543,6 +568,10 @@ class _FolderPairCardState extends State<_FolderPairCard> {
     final status = st?.status ?? 'Idle';
     final deletionHoldPaths = widget.state.localDeletionHoldPathsFor(p.id);
     final deletionHoldCount = deletionHoldPaths.length;
+    final incomingHoldPaths = widget.state.incomingDeletionHoldPathsFor(p.id);
+    final incomingHoldCount = incomingHoldPaths.length;
+    final pendingPaths = widget.state.pendingDeletionApprovalPathsFor(p.id);
+    final pendingCount = pendingPaths.length;
 
     // Same status -> dot-color/live mapping _OverviewPage uses for its own
     // folder-pair rows — kept identical rather than reinventing a second
@@ -735,6 +764,118 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                       ),
                     ),
                   ],
+                  if (incomingHoldCount > 0) ...[
+                    SizedBox(height: deletionHoldCount > 0 ? 10 : 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: c.amber.withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: c.amber.withValues(alpha: 0.24),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(Icons.health_and_safety_outlined,
+                                  size: 17, color: c.amber),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'Safety hold: $incomingHoldCount incoming '
+                                  'deletion(s) were blocked. Your copies were '
+                                  'kept.',
+                                  style: AppTypography.inter(
+                                    textStyle: TextStyle(
+                                      color: c.textSecondary,
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: GlassButton(
+                              icon: Icons.delete_forever_outlined,
+                              label: 'Accept deletions',
+                              accentColor: c.danger,
+                              style: GlassButtonStyle.outline,
+                              compact: true,
+                              onTap: () => _confirmAcceptIncomingDeletions(
+                                context,
+                                incomingHoldPaths,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                  if (pendingCount > 0) ...[
+                    SizedBox(
+                        height: (deletionHoldCount > 0 || incomingHoldCount > 0)
+                            ? 10
+                            : 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: c.amber.withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: c.amber.withValues(alpha: 0.24),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(Icons.health_and_safety_outlined,
+                                  size: 17, color: c.amber),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'Safety hold: $pendingCount earlier '
+                                  'deletion(s) not yet confirmed for sync.',
+                                  style: AppTypography.inter(
+                                    textStyle: TextStyle(
+                                      color: c.textSecondary,
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: GlassButton(
+                              icon: Icons.verified_outlined,
+                              label: 'Confirm deletions',
+                              accentColor: c.amber,
+                              style: GlassButtonStyle.outline,
+                              compact: true,
+                              onTap: () => _confirmPastDeletions(
+                                context,
+                                pendingPaths,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 14),
                   Row(
                     children: [
@@ -841,6 +982,111 @@ class _FolderPairCardState extends State<_FolderPairCard> {
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Could not approve deletions: $e')),
+      );
+    }
+  }
+
+  Future<void> _confirmAcceptIncomingDeletions(
+    BuildContext context,
+    List<String> heldPaths,
+  ) async {
+    final deletionCount = heldPaths.length;
+    final previewPaths = heldPaths.take(6).map((path) => '• $path').join('\n');
+    final remaining = deletionCount - (deletionCount < 6 ? deletionCount : 6);
+    final preview =
+        remaining > 0 ? '$previewPaths\n• …and $remaining more' : previewPaths;
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: Text('Accept $deletionCount deletions?'),
+        content: Text(
+          'The other device deleted these files, but Conduit blocked the bulk '
+          'deletion because it looked accidental. Your copies are untouched. '
+          'Accepting moves them to the recovery vault and deletes them here. '
+          'Files you edited since will be kept.\n\n$preview',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, false),
+            child: const Text('Keep my copies'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('Accept deletions'),
+          ),
+        ],
+      ),
+    );
+    if (approved != true || !mounted) return;
+
+    try {
+      final count = await widget.state.acceptIncomingDeletions(widget.pair);
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            count == 0
+                ? 'Nothing was left to accept.'
+                : 'Accepted $count deletion(s).',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not accept deletions: $e')),
+      );
+    }
+  }
+
+  Future<void> _confirmPastDeletions(
+    BuildContext context,
+    List<String> heldPaths,
+  ) async {
+    final deletionCount = heldPaths.length;
+    final previewPaths = heldPaths.take(6).map((path) => '• $path').join('\n');
+    final remaining = deletionCount - (deletionCount < 6 ? deletionCount : 6);
+    final preview =
+        remaining > 0 ? '$previewPaths\n• …and $remaining more' : previewPaths;
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: Text('Confirm $deletionCount deletions?'),
+        content: Text(
+          'These files were already deleted here. Confirming marks them as '
+          'intentional so the other device will apply them even in a large '
+          'batch. A recovery copy is kept in the version history.\n\n$preview',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, false),
+            child: const Text('Keep pending'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('Confirm deletions'),
+          ),
+        ],
+      ),
+    );
+    if (approved != true || !mounted) return;
+
+    try {
+      final count = await widget.state.confirmPastDeletions(widget.pair);
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            count == 0
+                ? 'Nothing was left to confirm.'
+                : 'Confirmed $count deletion(s) for sync.',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not confirm deletions: $e')),
       );
     }
   }

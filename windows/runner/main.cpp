@@ -41,16 +41,6 @@ static std::vector<std::wstring> ParseSendArgs(int argc, wchar_t** argv) {
   return paths;
 }
 
-// Encode a list of paths into a single WM_COPYDATA string (U+001F separator).
-static std::wstring EncodePaths(const std::vector<std::wstring>& paths) {
-  std::wstring out;
-  for (size_t i = 0; i < paths.size(); ++i) {
-    if (i) out += L'\x1F';
-    out += paths[i];
-  }
-  return out;
-}
-
 // Find the first top-level Conduit window.
 // Returns NULL if none is found.
 static HWND FindExistingInstance() {
@@ -58,6 +48,13 @@ static HWND FindExistingInstance() {
 }
 
 // Forward paths to an already-running instance via WM_COPYDATA.
+//
+// Payload format: "<senderPid>" U+001F "path1" U+001F "path2" ... The PID lets
+// the receiver verify the sender is another Conduit process (see
+// FlutterWindow::MessageHandler's WM_COPYDATA case). WM_COPYDATA cannot
+// authenticate its poster, and UIPI only blocks lower-integrity processes —
+// without this check any same-user process could post file paths and have
+// them auto-sent to the paired peer.
 //
 // Deliberately does NOT ShowWindow/SetForegroundWindow here: a "Send to
 // Conduit" delivery must never pop the full-size main window into view. The
@@ -67,7 +64,11 @@ static HWND FindExistingInstance() {
 // (non-send) second-launch path in wWinMain keeps the show/focus behavior.
 static void ForwardToExistingInstance(HWND existing,
                                       const std::vector<std::wstring>& paths) {
-  std::wstring encoded = EncodePaths(paths);
+  std::wstring encoded = std::to_wstring(GetCurrentProcessId());
+  for (const auto& path : paths) {
+    encoded += L'\x1F';
+    encoded += path;
+  }
   COPYDATASTRUCT cds{};
   cds.dwData = 1;  // magic: "these are --send paths"
   cds.cbData =

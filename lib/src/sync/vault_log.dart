@@ -178,6 +178,25 @@ class VaultLog {
 
   VaultLog._(this._file);
 
+  /// Decoded in-memory copy of the catalog. Null until first read; every
+  /// mutation updates it so consecutive writes never need a re-read.
+  List<VaultLogEntry>? _cache;
+
+  /// Serializes read-modify-write cycles. [record], [remove],
+  /// [markRestored], and [replaceAll] each do load→mutate→rewrite; without
+  /// this queue two overlapping mutations would both start from the same
+  /// on-disk list and the second write would silently drop the first
+  /// entry. Chained futures guarantee one writer at a time for the life of
+  /// this instance.
+  Future<void> _queue = Future<void>.value();
+
+  Future<T> _serialized<T>(Future<T> Function() operation) {
+    final run = _queue.then((_) => operation());
+    // Keep the chain alive after a failed operation.
+    _queue = run.then((_) {}, onError: (Object _) {});
+    return run;
+  }
+
   static Future<VaultLog> open(String pairId, Directory stateDir) async {
     final dir = Directory(p.join(stateDir.path, 'vault_log'));
     if (!await dir.exists()) await dir.create(recursive: true);
@@ -185,12 +204,16 @@ class VaultLog {
     return VaultLog._(File(p.join(dir.path, '$safe.json')));
   }
 
-  /// All entries, most recent first. Never throws: a missing or corrupt
-  /// log file (this is a convenience index, not the source of truth — the
-  /// actual vaulted files on disk are unaffected either way) is treated as
-  /// empty rather than surfacing an error to the UI.
-  Future<List<VaultLogEntry>> all() async {
-    if (!await _file.exists()) return [];
+  /// Decode the on-disk catalog into [_cache] if not already loaded.
+  /// When [throwOnError] is false a missing or corrupt file degrades to an
+  /// empty catalog (this is a convenience index, not the source of truth —
+  /// the actual vaulted files on disk are unaffected either way).
+  Future<void> _ensureLoaded({required bool throwOnError}) async {
+    if (_cache != null) return;
+    if (!await _file.exists()) {
+      _cache = <VaultLogEntry>[];
+      return;
+    }
     try {
       final raw = await _file.readAsString();
       final list = jsonDecode(raw) as List;
@@ -198,57 +221,78 @@ class VaultLog {
           .map((e) => VaultLogEntry.fromJson(e as Map<String, dynamic>))
           .toList();
       entries.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-      return entries;
-    } catch (_) {
-      return [];
+      _cache = entries;
+    } catch (e) {
+      if (throwOnError) throw VaultLogReadException(e);
+      _cache = <VaultLogEntry>[];
     }
   }
 
-  Future<List<VaultLogEntry>> allForMaintenance() async {
-    if (!await _file.exists()) return [];
-    try {
-      final raw = await _file.readAsString();
-      final list = jsonDecode(raw) as List;
-      final entries = list
-          .map((e) => VaultLogEntry.fromJson(e as Map<String, dynamic>))
-          .toList();
-      entries.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-      return entries;
-    } catch (e) {
-      throw VaultLogReadException(e);
-    }
+  /// All entries, most recent first. Never throws: a missing or corrupt log
+  /// file is treated as empty rather than surfacing an error to the UI.
+  Future<List<VaultLogEntry>> all() {
+    return _serialized(() async {
+      await _ensureLoaded(throwOnError: false);
+      return List<VaultLogEntry>.unmodifiable(_cache!);
+    });
+  }
+
+  /// Like [all], but a corrupt catalog surfaces as [VaultLogReadException]
+  /// so maintenance callers can distinguish "nothing vaulted" from "the
+  /// catalog could not be read".
+  Future<List<VaultLogEntry>> allForMaintenance() {
+    return _serialized(() async {
+      await _ensureLoaded(throwOnError: true);
+      return List<VaultLogEntry>.unmodifiable(_cache!);
+    });
   }
 
   /// Appends one entry before the engine applies the retention policy.
-  Future<void> record(VaultLogEntry entry) async {
-    final entries = await all();
-    entries.add(entry);
-    await replaceAll(entries);
+  Future<void> record(VaultLogEntry entry) {
+    return _serialized(() async {
+      await _ensureLoaded(throwOnError: false);
+      _cache!.add(entry);
+      // Preserve the documented most-recent-first ordering.
+      _cache!.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+      await _writeAll(_cache!);
+    });
   }
 
   /// Removes one entry (used after a successful restore, or if the
   /// underlying vault file has gone missing) without touching any other
   /// entry. No-ops if the exact entry can't be found — restore proceeds
   /// either way, this only tidies the catalog.
-  Future<void> remove(VaultLogEntry entry) async {
-    final entries = await all();
-    entries.removeWhere((e) =>
-        e.relPath == entry.relPath &&
-        e.vaultPath == entry.vaultPath &&
-        e.timestamp == entry.timestamp);
-    await replaceAll(entries);
+  Future<void> remove(VaultLogEntry entry) {
+    return _serialized(() async {
+      await _ensureLoaded(throwOnError: false);
+      _cache!.removeWhere((e) =>
+          e.relPath == entry.relPath &&
+          e.vaultPath == entry.vaultPath &&
+          e.timestamp == entry.timestamp);
+      await _writeAll(_cache!);
+    });
   }
 
-  Future<void> markRestored(String entryId, DateTime restoredAt) async {
-    final entries = await all();
-    final updated = [
-      for (final entry in entries)
-        if (entry.entryId == entryId) entry.markRestored(restoredAt) else entry,
-    ];
-    await replaceAll(updated);
+  Future<void> markRestored(String entryId, DateTime restoredAt) {
+    return _serialized(() async {
+      await _ensureLoaded(throwOnError: false);
+      for (var i = 0; i < _cache!.length; i++) {
+        if (_cache![i].entryId == entryId) {
+          _cache![i] = _cache![i].markRestored(restoredAt);
+        }
+      }
+      await _writeAll(_cache!);
+    });
   }
 
-  Future<void> replaceAll(List<VaultLogEntry> entries) async {
+  Future<void> replaceAll(List<VaultLogEntry> entries) {
+    return _serialized(() async {
+      _cache = List<VaultLogEntry>.from(entries);
+      await _writeAll(_cache!);
+    });
+  }
+
+  Future<void> _writeAll(List<VaultLogEntry> entries) async {
     final tmp = File('${_file.path}.tmp');
     final sink = tmp.openWrite();
     sink.write(jsonEncode(entries.map((e) => e.toJson()).toList()));

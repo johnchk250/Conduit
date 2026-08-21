@@ -14,13 +14,22 @@ import '../transfers/transfer_receipt.dart';
 
 /// A scoped-listenable bridge used while [AppState] remains the compatibility
 /// facade. Each controller publishes only its immutable feature snapshot.
+///
+/// Controllers may additionally subscribe to [AppState.syncPulse] (via the
+/// [pulse] argument) so snapshots that include live progress / RTT data stay
+/// fresh after high-frequency updates moved off the global notifier.
 abstract class AppController<T> extends ChangeNotifier {
-  AppController(this.appState) {
+  AppController(this.appState, {Listenable? pulse}) {
     _snapshot = buildSnapshot();
     appState.addListener(_handleAppStateChanged);
+    if (pulse != null) {
+      _pulse = pulse;
+      pulse.addListener(_handleAppStateChanged);
+    }
   }
 
   final AppState appState;
+  Listenable? _pulse;
   late T _snapshot;
   bool _disposed = false;
 
@@ -40,6 +49,7 @@ abstract class AppController<T> extends ChangeNotifier {
     if (_disposed) return;
     _disposed = true;
     appState.removeListener(_handleAppStateChanged);
+    _pulse?.removeListener(_handleAppStateChanged);
     super.dispose();
   }
 }
@@ -139,7 +149,7 @@ class ConnectionSnapshot {
 }
 
 class ConnectionController extends AppController<ConnectionSnapshot> {
-  ConnectionController(super.appState);
+  ConnectionController(super.appState, {super.pulse});
 
   @override
   ConnectionSnapshot buildSnapshot() {
@@ -196,7 +206,7 @@ class FolderSyncSnapshot {
 }
 
 class FolderSyncController extends AppController<FolderSyncSnapshot> {
-  FolderSyncController(super.appState);
+  FolderSyncController(super.appState, {super.pulse});
 
   @override
   FolderSyncSnapshot buildSnapshot() {

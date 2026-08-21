@@ -300,6 +300,118 @@ void main() {
     }
   });
 
+  test('blocked peer mass-delete can be accepted on the receiving device',
+      () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    await h.alice.startPair(h.pair);
+    final rows = <IndexEntry>[];
+    for (var i = 0; i < 14; i++) {
+      rows.add((await h.aliceDb.get('file_$i.txt'))!);
+    }
+    h.connectAlice();
+
+    final tombstones = <Map<String, dynamic>>[];
+    for (var i = 0; i < 10; i++) {
+      final row = rows[i];
+      tombstones.add(IndexEntry(
+        relPath: row.relPath,
+        size: row.size,
+        mtime: row.mtime,
+        sha256: row.sha256,
+        version: row.version.bump(_peer),
+        sequence: row.sequence + 100,
+        deleted: true,
+      ).toJson());
+    }
+
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': tombstones,
+      'fromSequence': 0,
+    });
+    await h.pump();
+
+    expect(h.alice.incomingDeletionHoldCountFor(h.pair.id), 10);
+    for (var i = 0; i < 10; i++) {
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isTrue);
+      expect((await h.aliceDb.get('file_$i.txt'))!.deleted, isFalse);
+    }
+
+    final accepted = await h.alice.acceptIncomingDeletionHold(h.pair);
+    await h.pump();
+
+    expect(accepted, 10);
+    expect(h.alice.incomingDeletionHoldCountFor(h.pair.id), 0);
+    for (var i = 0; i < 10; i++) {
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isFalse);
+      final row = (await h.aliceDb.get('file_$i.txt'))!;
+      expect(row.deleted, isTrue);
+      expect(row.deletionApproved, isTrue);
+    }
+    for (var i = 10; i < 14; i++) {
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isTrue);
+    }
+  });
+
+  test('accepting a blocked peer mass-delete keeps concurrently edited files',
+      () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    await h.alice.startPair(h.pair);
+    final rows = <IndexEntry>[];
+    for (var i = 0; i < 14; i++) {
+      rows.add((await h.aliceDb.get('file_$i.txt'))!);
+    }
+
+    // Local edit of file_5 AFTER the rows above were read: our live version
+    // now beats the peer's tombstone for that one path.
+    h.aliceFs.files['file_5.txt'] = utf8.encode('edited locally');
+    await h.alice.reconcile(h.pair, null);
+    h.connectAlice();
+
+    final tombstones = <Map<String, dynamic>>[];
+    for (var i = 0; i < 10; i++) {
+      final row = rows[i];
+      tombstones.add(IndexEntry(
+        relPath: row.relPath,
+        size: row.size,
+        mtime: row.mtime,
+        sha256: row.sha256,
+        version: row.version.bump(_peer),
+        sequence: row.sequence + 100,
+        deleted: true,
+      ).toJson());
+    }
+
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': tombstones,
+      'fromSequence': 0,
+    });
+    await h.pump();
+    expect(h.alice.incomingDeletionHoldCountFor(h.pair.id), 10);
+
+    final accepted = await h.alice.acceptIncomingDeletionHold(h.pair);
+    await h.pump();
+
+    expect(accepted, 9);
+    expect(h.aliceFs.files.containsKey('file_5.txt'), isTrue);
+    expect((await h.aliceDb.get('file_5.txt'))!.deleted, isFalse);
+    expect(h.alice.incomingDeletionHoldCountFor(h.pair.id), 0);
+    for (var i = 0; i < 10; i++) {
+      if (i == 5) continue;
+      expect(h.aliceFs.files.containsKey('file_$i.txt'), isFalse);
+      expect((await h.aliceDb.get('file_$i.txt'))!.deleted, isTrue);
+    }
+  });
+
   test('local mass-delete hold can be explicitly approved and advertised',
       () async {
     for (var i = 0; i < 14; i++) {
@@ -458,6 +570,116 @@ void main() {
     expect(h.alice.peerLiveFor(h.pair.id)?.containsKey('x.txt'), isTrue,
         reason: 'a live advertisement for a previously-tombstoned path must '
             're-add it to the live map (resurrection path)');
+  });
+
+  test('pairing returns before the initial index build finishes', () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    // Park the scanner inside its first directory listing.
+    final gate = Completer<void>();
+    h.aliceFs.listGate = gate;
+
+    // Must return while the scan is still blocked — this is what keeps the
+    // folder invite/accept handshake instant for large folders.
+    await h.alice.startPair(h.pair, awaitInitialSeed: false);
+    expect((await h.aliceDb.get('file_0.txt')), isNull,
+        reason: 'the pair must be registered and usable before any file has '
+            'been indexed');
+
+    gate.complete();
+    h.aliceFs.listGate = null;
+    for (var i = 0;
+        i < 100 && (await h.aliceDb.get('file_0.txt')) == null;
+        i++) {
+      await h.pump();
+    }
+    final seeded = (await h.aliceDb.get('file_0.txt'))!;
+    expect(seeded.deleted, isFalse,
+        reason: 'the background seed must complete once unblocked');
+  });
+
+  test('own deletion echoes are excluded from remote mass-delete hold',
+      () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    await h.alice.startPair(h.pair);
+    for (var i = 0; i < 10; i++) {
+      h.aliceFs.files.remove('file_$i.txt');
+      await h.aliceDb.markDeletedLocal(
+        relPath: 'file_$i.txt',
+        deviceId: _me,
+        deletionApproved: false,
+      );
+    }
+    await h.alice.reconcile(h.pair, null);
+    await h.pump();
+    expect(h.alice.pendingDeletionApprovalCountFor(h.pair.id), 10);
+
+    h.connectAlice();
+    final rows = <IndexEntry>[];
+    for (var i = 0; i < 10; i++) {
+      rows.add((await h.aliceDb.get('file_$i.txt'))!);
+    }
+    final echo = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      echo.add(IndexEntry(
+        relPath: row.relPath,
+        size: row.size,
+        mtime: row.mtime,
+        sha256: row.sha256,
+        version: row.version.bump(_peer),
+        sequence: row.sequence + 100,
+        deleted: true,
+      ).toJson());
+    }
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': echo,
+      'fromSequence': 0,
+    });
+    await h.pump();
+    expect(h.alice.incomingDeletionHoldCountFor(h.pair.id), 0,
+        reason:
+            'echoes of our own deleted paths must not count toward the guard');
+  });
+
+  test('unapproved tombstone backlog can be confirmed durably', () async {
+    for (var i = 0; i < 14; i++) {
+      h.aliceFs.files['file_$i.txt'] = utf8.encode('$i');
+    }
+    await h.alice.startPair(h.pair);
+    for (var i = 0; i < 10; i++) {
+      h.aliceFs.files.remove('file_$i.txt');
+      await h.aliceDb.markDeletedLocal(
+        relPath: 'file_$i.txt',
+        deviceId: _me,
+        deletionApproved: false,
+      );
+    }
+    await h.alice.reconcile(h.pair, null);
+    await h.pump();
+    expect(h.alice.pendingDeletionApprovalCountFor(h.pair.id), 10);
+    h.connectAlice();
+    final approved = await h.alice.confirmPastDeletions(h.pair);
+    await h.pump();
+    expect(approved, 10);
+    expect(h.alice.pendingDeletionApprovalCountFor(h.pair.id), 0);
+    for (var i = 0; i < 10; i++) {
+      final row = (await h.aliceDb.get('file_$i.txt'))!;
+      expect(row.deleted, isTrue);
+      expect(row.deletionApproved, isTrue);
+    }
+    final advertised = h.session.sent
+        .where((f) => f['t'] == Msg.indexUpdate)
+        .expand((f) => (f['entries'] as List? ?? const []))
+        .whereType<Map>()
+        .where((e) => e['deleted'] == true)
+        .toList(growable: false);
+    expect(advertised.any((e) => e['deletionApproved'] == true), isTrue);
   });
 }
 
@@ -643,12 +865,19 @@ class FakeFs implements FileSystemAccess {
     _nextWriteRelease = release;
   }
 
+  /// When set, every [listFiles] call parks until completed — used to hold
+  /// the scanner mid-traversal deterministically.
+  Completer<void>? listGate;
+
   @override
   bool get isAndroidSAF => false;
 
   @override
-  Future<List<String>> listFiles(String rootPath) async =>
-      files.keys.toList(growable: false);
+  Future<List<String>> listFiles(String rootPath) async {
+    final gate = listGate;
+    if (gate != null) await gate.future;
+    return files.keys.toList(growable: false);
+  }
 
   @override
   Future<FileEntry?> stat(String rootPath, String relPath) async {
