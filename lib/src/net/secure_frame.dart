@@ -67,9 +67,22 @@ class FrameCodec {
   SecureFrameKeys? _secureKeys;
   int _sendSequence = 0;
   int _receiveSequence = 0;
+  int _sentBytes = 0;
+  int _receivedBytes = 0;
+  final DateTime createdAt = DateTime.now();
   Future<void> _sendChain = Future.value();
   Future<void> _receiveChain = Future.value();
   static final _aead = Chacha20.poly1305Aead();
+
+  int get sendSequence => _sendSequence;
+  int get receiveSequence => _receiveSequence;
+  int get sentBytes => _sentBytes;
+  int get receivedBytes => _receivedBytes;
+
+  /// Whether the session has exceeded recommended frame or byte thresholds
+  /// and should be refreshed gracefully at a quiescent boundary.
+  bool get shouldRefreshKeys =>
+      _sendSequence >= 0x100000 || _sentBytes >= 64 * 1024 * 1024 * 1024;
 
   void enableSecurity(SecureFrameKeys keys) {
     if (_secureKeys != null) throw StateError('secure framing already enabled');
@@ -163,6 +176,7 @@ class FrameCodec {
         aad: _aad(keys.receiveNoncePrefix, sequence, cipherText.length),
       );
       _receiveSequence++;
+      _receivedBytes += raw.length;
     }
     final msg = _decodePayload(clear);
     Diag.recv(msg);
@@ -183,7 +197,9 @@ class FrameCodec {
     _sendChain = _sendChain.then((_) async {
       if (_closed) return;
       if (keys == null) {
-        _writeFrame(_encodePayload(queued));
+        final raw = _encodePayload(queued);
+        _sentBytes += raw.length;
+        _writeFrame(raw);
         await _socket.flush();
         return;
       }
@@ -203,7 +219,9 @@ class FrameCodec {
         ..add((ByteData(8)..setUint64(0, sequence)).buffer.asUint8List())
         ..add(box.cipherText)
         ..add(box.mac.bytes);
-      _writeFrame(record.takeBytes());
+      final bytes = record.takeBytes();
+      _sentBytes += bytes.length;
+      _writeFrame(bytes);
       await _socket.flush();
       _sendSequence++;
     }).catchError((Object e) {

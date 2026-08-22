@@ -253,6 +253,20 @@ void main() {
     await w.stop();
     expect(fs.stopped, [root]);
   });
+
+  test('FolderWatcher stop cancels active timers and closes cleanly', () async {
+    const root = 'content://tree/primary%3ACleanup';
+    final fs = _SafLikeFs({'a.txt': _b('hello')});
+    final w = FolderWatcher(
+      fs: fs,
+      rootPath: root,
+      interval: const Duration(seconds: 1),
+    );
+    w.start();
+    expect(w.isRunning, isTrue);
+    await w.stop();
+    expect(w.isRunning, isFalse);
+  });
 }
 
 Future<void> _settle([Duration d = const Duration(milliseconds: 160)]) async {

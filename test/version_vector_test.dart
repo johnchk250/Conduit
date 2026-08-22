@@ -233,4 +233,35 @@ void main() {
       expect(v('B', 2, 'A', 1).toString(), 'VV{A:1,B:2}');
     });
   });
+
+  group('tombstone causality invariants (SAFE_DURABLE_IMPROVEMENT_PLAN §A4)',
+      () {
+    test(
+        'local tombstone strictly dominates stale live version from long-offline peer',
+        () {
+      // Node A deleted the file: local tombstone bumped to A:2.
+      // Node B was disconnected for >30 days with stale live version A:1.
+      final tombstoneVector = v('A', 2);
+      final stalePeerLiveVector = v('A', 1);
+
+      expect(tombstoneVector.dominates(stalePeerLiveVector), isTrue,
+          reason:
+              'Tombstone must strictly dominate stale live version to propagate delete without resurrection');
+      expect(stalePeerLiveVector.dominates(tombstoneVector), isFalse);
+    });
+
+    test(
+        'retained device counters in merged vector maintain correct multi-peer causality',
+        () {
+      final nodeA = v('A', 3, 'B', 2);
+      final nodeB = v('A', 3, 'B', 1, 'C', 1);
+      final merged = nodeA.merge(nodeB);
+
+      expect(merged.countFor('A'), 3);
+      expect(merged.countFor('B'), 2);
+      expect(merged.countFor('C'), 1);
+      expect(merged.dominatesEq(nodeA), isTrue);
+      expect(merged.dominatesEq(nodeB), isTrue);
+    });
+  });
 }

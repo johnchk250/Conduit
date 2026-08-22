@@ -194,9 +194,10 @@ class ConnectionDoctor {
             status: discovered ? DiagnosticStatus.ok : DiagnosticStatus.warning,
             explanation: discovered
                 ? 'The peer is visible on a current transport.'
-                : 'The peer is not currently discovered; a saved address may still work.',
-            remediationAction:
-                discovered ? null : 'Check that both devices share a network.',
+                : 'The peer is not currently discovered via broadcast/multicast. A saved route may still connect, or local traffic may be affected by AP/client isolation, firewall, or network policy.',
+            remediationAction: discovered
+                ? null
+                : 'Ensure devices are on the same subnet, check firewall rules, or use Bluetooth fallback.',
           ),
         );
         checks.add(
@@ -212,10 +213,10 @@ class ConnectionDoctor {
                 ? 'TCP and secure verification succeeded over ${connection.transport?.label ?? 'the active transport'}.'
                 : connection.phase == PeerConnectionPhase.connecting
                     ? 'A connection attempt is in progress.'
-                    : 'No verified secure session is active.',
+                    : 'No verified secure session is active. Traffic may be blocked by client isolation, firewall, or offline peer.',
             remediationAction: connection.phase == PeerConnectionPhase.connected
                 ? null
-                : 'Retry the connection and verify the peer identity pin.',
+                : 'Retry the connection, verify peer identity pin, or enable Bluetooth.',
             technicalDetails:
                 'peer=${_short(peerId)} phase=${connection.phase.name}',
           ),

@@ -75,6 +75,8 @@ class FolderWatcher {
 
   Timer? _timer;
   Timer? _debounceTimer;
+  Timer? _nativeRetryTimer;
+  int _nativeBackoffSeconds = 2;
   StreamSubscription<FileSystemEvent>? _nativeEvents;
   StreamSubscription<void>? _providerEvents;
   final _controller = StreamController<void>.broadcast();
@@ -172,6 +174,8 @@ class FolderWatcher {
     _timer = null;
     _debounceTimer?.cancel();
     _debounceTimer = null;
+    _nativeRetryTimer?.cancel();
+    _nativeRetryTimer = null;
     await _nativeEvents?.cancel();
     _nativeEvents = null;
     await _queueProviderWatchUpdate();
@@ -233,21 +237,51 @@ class FolderWatcher {
       return;
     }
     if (fs.isAndroidSAF) return;
+    _nativeRetryTimer?.cancel();
+    _nativeRetryTimer = null;
     try {
       final root = Directory(rootPath);
-      if (!root.existsSync()) return;
-      _nativeEvents = root.watch(recursive: true).listen((event) {
-        final rel = event.path
-            .substring(rootPath.length)
-            .replaceFirst(RegExp(r'^[\\/]'), '')
-            .replaceAll('\\', '/');
-        if (!_isInternalArtefact(rel)) _signalChange();
-      }, onError: (_) {
-        _nativeEvents = null;
-      });
+      if (!root.existsSync()) {
+        _scheduleNativeRetry();
+        return;
+      }
+      _nativeEvents?.cancel();
+      _nativeEvents = root.watch(recursive: true).listen(
+        (event) {
+          final rel = event.path
+              .substring(rootPath.length)
+              .replaceFirst(RegExp(r'^[\\/]'), '')
+              .replaceAll('\\', '/');
+          if (!_isInternalArtefact(rel)) _signalChange();
+        },
+        onError: (_) {
+          _nativeEvents?.cancel();
+          _nativeEvents = null;
+          _scheduleNativeRetry();
+        },
+        onDone: () {
+          _nativeEvents?.cancel();
+          _nativeEvents = null;
+          _scheduleNativeRetry();
+        },
+      );
+      _nativeBackoffSeconds = 2;
     } catch (_) {
+      _nativeEvents?.cancel();
       _nativeEvents = null;
+      _scheduleNativeRetry();
     }
+  }
+
+  void _scheduleNativeRetry() {
+    if (!_started || fs.isAndroidSAF || fs is FileSystemChangeSource) return;
+    if (_nativeRetryTimer != null && _nativeRetryTimer!.isActive) return;
+    final delay = Duration(seconds: _nativeBackoffSeconds);
+    _nativeBackoffSeconds = (_nativeBackoffSeconds * 2).clamp(2, 30);
+    _nativeRetryTimer = Timer(delay, () {
+      _nativeRetryTimer = null;
+      if (_started) _startNativeEvents();
+    });
   }
 
   Future<void> _queueProviderWatchUpdate() {

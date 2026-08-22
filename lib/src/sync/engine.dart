@@ -118,6 +118,17 @@ enum DeleteDecision {
   nothingToDecide,
 }
 
+/// Reason code for requesting a folder pair reconciliation (SAFE_DURABLE_IMPROVEMENT_PLAN §A1).
+enum ReconcileReason {
+  initialSeed,
+  localChange,
+  peerIndexChanged,
+  peerConnected,
+  replacementSession,
+  manual,
+  periodicSafetyNet,
+}
+
 /// Per-pair sync state surfaced to the UI.
 class PairSyncState {
   final String pairId;
@@ -374,11 +385,10 @@ class SyncEngine {
   /// fetches of different files don't interleave on one stream.
   final _serveStreams = <String, StreamController<Map<String, dynamic>>>{};
 
-  /// Session currently driving each pair's reconcile, plus pairs that need one
-  /// retry because a replacement session became ready before the old
-  /// reconcile had released its scanning lock.
+  /// Session currently driving each pair's reconcile, plus pending reconcile
+  /// triggers queued while a scan was in progress.
   final _activeReconcileSessions = <String, PeerSession?>{};
-  final _pendingReconnectReconciles = <String>{};
+  final _pendingReconcileReasons = <String, Set<ReconcileReason>>{};
   final _restoreBarriers = <String, Completer<void>>{};
   final _lastProgressEmit = <String, DateTime>{};
 
@@ -883,7 +893,8 @@ class SyncEngine {
       final candidate = peerId == null ? null : registry.openSessionFor(peerId);
       final session = candidate?.isLinkReady == true ? candidate : null;
       // Use reconcile's per-pair guard for the initial seed as well.
-      await reconcile(pair, session);
+      await requestReconcile(pair,
+          session: session, reason: ReconcileReason.initialSeed);
       log(pair.id, 'Index seeded', SyncEventLevel.info);
     } finally {
       // The pair may have been removed while the seed was in flight.
@@ -898,7 +909,7 @@ class SyncEngine {
   /// Fires on a long safety-net cadence per pair while a session is live. It is
   /// a no-op when (a) no session exists (nothing to reconcile toward), (b) the
   /// engine is paused, or (c) a reconcile is already running (the re-entrancy
-  /// guard inside [reconcile] also catches this). On an in-sync folder the
+  /// guard inside [requestReconcile] also catches this). On an in-sync folder the
   /// resulting reconcile burns zero sequences, but it can still traverse the
   /// filesystem. Android SAF does not use this timer; its watcher owns the
   /// single fallback path.
@@ -909,7 +920,8 @@ class SyncEngine {
     final session = registry.openSessionFor(peerId);
     if (session == null || !session.isLinkReady) return;
     if (_paused) return;
-    reconcile(pair, session);
+    requestReconcile(pair,
+        session: session, reason: ReconcileReason.periodicSafetyNet);
   }
 
   Future<void> stopPair(String pairId) async {
@@ -942,7 +954,7 @@ class SyncEngine {
     _peerSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _sentSeq.removeWhere((k, _) => k.endsWith('|$pairId'));
     _activeReconcileSessions.remove(pairId);
-    _pendingReconnectReconciles.remove(pairId);
+    _pendingReconcileReasons.remove(pairId);
     // Drop any in-flight block fetches/serve streams for this pair.
     final blockKeys =
         _blockSinks.keys.where((k) => k.startsWith('$pairId|')).toList();
@@ -1426,7 +1438,8 @@ class SyncEngine {
       _setStatus(pair.id, 'Waiting for peer');
       return;
     }
-    await reconcile(pair, session);
+    await requestReconcile(pair,
+        session: session, reason: ReconcileReason.localChange);
   }
 
   /// Called by the app layer when a session becomes available.
@@ -1506,7 +1519,8 @@ class SyncEngine {
     // unrelated folder pairs.
     for (final pair in config.folderPairs) {
       if (pair.peerDeviceId != session.peer.deviceId) continue;
-      reconcile(pair, session);
+      requestReconcile(pair,
+          session: session, reason: ReconcileReason.peerConnected);
     }
     // Phase 0.2: a peer just came online: restore the snappy watcher cadence
     // for every pair bound to it, so a real edit is caught quickly.
@@ -1576,7 +1590,8 @@ class SyncEngine {
       final peerId = pair.peerDeviceId;
       final session = peerId == null ? null : registry.openSessionFor(peerId);
       if (session != null && session.isLinkReady) {
-        reconcile(pair, session);
+        requestReconcile(pair,
+            session: session, reason: ReconcileReason.manual);
       } else {
         _setStatus(pair.id, 'Idle');
       }
@@ -1636,44 +1651,66 @@ class SyncEngine {
 
   // ---- Reconciliation ----------------------------------------------------
 
-  Future<void> reconcile(FolderPair pair, PeerSession? session) async {
+  /// Request a reconciliation pass for [pair] with typed [reason].
+  ///
+  /// Coalesces redundant requests when a scan is active, but queues one
+  /// follow-up pass if [reason] represents potential new state (e.g. local edit,
+  /// peer index change, replacement session). Periodic safety ticks do not loop.
+  Future<void> requestReconcile(
+    FolderPair pair, {
+    PeerSession? session,
+    required ReconcileReason reason,
+  }) async {
     if (session != null && !_sessionOwnsPair(session, pair)) {
       Diag.log(
         'pair_session_mismatch',
         peer: session.peer.deviceId,
         pairId: pair.id,
-        fields: {'expectedPeer': pair.peerDeviceId},
+        fields: {'expectedPeer': pair.peerDeviceId, 'reason': reason.name},
       );
       return;
     }
     final st = _states[pair.id] ??= PairSyncState(pairId: pair.id);
     if (st.scanning) {
-      // A reconnect can complete while the reconcile tied to the dead session
-      // is still unwinding. Do not lose that reconnect trigger: coalesce one
-      // retry for the replacement session and run it as soon as the old scan
-      // releases the lock. Same-session duplicate triggers remain no-ops.
+      // If a replacement session arrived during an active reconcile, record it.
       final activeSession = _activeReconcileSessions[pair.id];
       if (session != null &&
           session.isLinkReady &&
           !identical(activeSession, session)) {
-        _pendingReconnectReconciles.add(pair.id);
+        final pending = _pendingReconcileReasons.putIfAbsent(
+            pair.id, () => <ReconcileReason>{});
+        pending.add(ReconcileReason.replacementSession);
+        Diag.log('reconcile_queued',
+            pairId: pair.id,
+            fields: {'reason': ReconcileReason.replacementSession.name});
+        return;
+      }
+
+      // If reason represents new state, queue one follow-up pass.
+      if (reason != ReconcileReason.periodicSafetyNet) {
+        final pending = _pendingReconcileReasons.putIfAbsent(
+            pair.id, () => <ReconcileReason>{});
+        pending.add(reason);
+        Diag.log('reconcile_queued',
+            pairId: pair.id, fields: {'reason': reason.name});
       }
       return;
     }
-    // Phase 1 pause: don't START a new reconcile while paused. In-flight work
-    // is allowed to finish (this returns before taking the scanning lock only
-    // when nothing is running). Serving inbound block requests is unaffected —
-    // that path doesn't go through reconcile, so a paused device still honors
-    // a peer's pull without re-syncing its own side.
+
+    // Phase 1 pause: don't START a new reconcile while paused.
     if (_paused) {
       st.status = 'Paused';
       if (!_disposed) _stateController.add(st);
       return;
     }
+
     st.scanning = true;
     _activeReconcileSessions[pair.id] = session;
     st.status = 'Scanning';
     _stateController.add(st);
+    Diag.log('reconcile_started',
+        pairId: pair.id, fields: {'reason': reason.name});
+
     try {
       await _reconcileV2(pair, session, st);
     } catch (e) {
@@ -1685,18 +1722,40 @@ class SyncEngine {
       _activeReconcileSessions.remove(pair.id);
       if (!_disposed) _stateController.add(st);
 
-      if (_pendingReconnectReconciles.remove(pair.id) &&
+      final pendingReasons = _pendingReconcileReasons.remove(pair.id);
+      if (pendingReasons != null &&
+          pendingReasons.isNotEmpty &&
           !_disposed &&
           !_paused &&
           config.folderPairs.any((p) => p.id == pair.id)) {
         final peerId = pair.peerDeviceId;
-        final retrySession =
+        final currentSession =
             peerId == null ? null : registry.openSessionFor(peerId);
-        if (retrySession != null && retrySession.isLinkReady) {
-          unawaited(reconcile(pair, retrySession));
-        }
+        final nextReason =
+            pendingReasons.contains(ReconcileReason.replacementSession)
+                ? ReconcileReason.replacementSession
+                : pendingReasons.first;
+        Diag.log('reconcile_drained',
+            pairId: pair.id, fields: {'reason': nextReason.name});
+        Future.microtask(() {
+          if (!_disposed &&
+              !_paused &&
+              config.folderPairs.any((p) => p.id == pair.id)) {
+            unawaited(requestReconcile(
+              pair,
+              session: currentSession,
+              reason: nextReason,
+            ));
+          }
+        });
       }
     }
+  }
+
+  /// Backward-compatible forwarder for [requestReconcile] with [ReconcileReason.manual].
+  Future<void> reconcile(FolderPair pair, PeerSession? session) {
+    return requestReconcile(pair,
+        session: session, reason: ReconcileReason.manual);
   }
 
   // ---- Reconciliation (REDESIGN.md Phase 2) -----------------------------
