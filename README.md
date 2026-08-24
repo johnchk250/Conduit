@@ -128,6 +128,12 @@ flutter build windows --release
 flutter build apk --release
 ```
 
+Or run the interactive release script:
+
+```cmd
+build_release.bat
+```
+
 Outputs:
 
 ```text
@@ -135,8 +141,7 @@ build/windows/x64/runner/Release/
 build/app/outputs/flutter-apk/app-release.apk
 ```
 
-The repository also includes PowerShell and batch wrappers for the locally
-configured toolchain.
+The repository also includes PowerShell and batch wrappers (`build_release.bat`, `_run_build.bat`, `_run_build_apk.bat`) for the locally configured toolchain.
 
 ## Project layout
 

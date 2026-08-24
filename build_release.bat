@@ -1,10 +1,6 @@
 @echo off
 setlocal
 
-echo ============================================================
-echo  Conduit Release Builder (Windows ^& Android APK)
-echo ============================================================
-
 :: Optional overrides. Leave these unset to use Flutter/Java from PATH or the
 :: standard Android Studio installation on the current machine.
 if defined FLUTTER_ROOT set "PATH=%FLUTTER_ROOT%\bin;%PATH%"
@@ -15,23 +11,64 @@ if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
 cd /d "%ROOT%"
 
+:menu
+cls
+echo ============================================================
+echo  Conduit Release Builder
+echo ============================================================
 echo.
-echo [1/3] Verifying environment...
-call flutter doctor
+echo  [1] Build Windows Release (.exe)
+echo  [2] Build Android Release (.apk)
+echo  [3] Build Both (Windows + Android APK)
+echo  [4] Exit
+echo.
+set /p "choice=Select an option [1-4]: "
+
+if "%choice%"=="1" goto build_windows
+if "%choice%"=="2" goto build_apk
+if "%choice%"=="3" goto build_both
+if "%choice%"=="4" goto exit_script
+
+echo.
+echo [ERROR] Invalid selection. Please choose 1, 2, 3, or 4.
+pause
+goto menu
+
+:build_windows
+echo.
+echo ============================================================
+echo  Building Windows Release (.exe)...
+echo ============================================================
+call flutter build windows --release
 if %errorlevel% neq 0 (
-    echo [ERROR] Flutter environment check failed.
+    echo [ERROR] Windows build failed.
     goto :err
 )
-
+echo [SUCCESS] Windows Release built at: build\windows\x64\runner\Release\conduit.exe
 echo.
-echo Cleaning build directories...
-call flutter clean
+pause
+goto menu
+
+:build_apk
+echo.
+echo ============================================================
+echo  Building Android Release APK...
+echo ============================================================
+call flutter build apk --release
 if %errorlevel% neq 0 (
-    echo [WARNING] Flutter clean failed, continuing build...
+    echo [ERROR] Android build failed.
+    goto :err
 )
-
+echo [SUCCESS] Android Release APK built at: build\app\outputs\flutter-apk\app-release.apk
 echo.
-echo [2/3] Building Windows Release (.exe)...
+pause
+goto menu
+
+:build_both
+echo.
+echo ============================================================
+echo  Building Windows Release (.exe)...
+echo ============================================================
 call flutter build windows --release
 if %errorlevel% neq 0 (
     echo [ERROR] Windows build failed.
@@ -40,7 +77,9 @@ if %errorlevel% neq 0 (
 echo [SUCCESS] Windows Release built at: build\windows\x64\runner\Release\conduit.exe
 
 echo.
-echo [3/3] Building Android Release APK...
+echo ============================================================
+echo  Building Android Release APK...
+echo ============================================================
 call flutter build apk --release
 if %errorlevel% neq 0 (
     echo [ERROR] Android build failed.
@@ -50,10 +89,11 @@ echo [SUCCESS] Android Release APK built at: build\app\outputs\flutter-apk\app-r
 
 echo.
 echo ============================================================
-echo  Builds completed successfully!
+echo  Both builds completed successfully!
 echo ============================================================
+echo.
 pause
-exit /b 0
+goto menu
 
 :err
 echo.
@@ -61,4 +101,7 @@ echo ============================================================
 echo  Build process failed with error code %errorlevel%.
 echo ============================================================
 pause
-exit /b %errorlevel%
+goto menu
+
+:exit_script
+exit /b 0
