@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -12,6 +13,8 @@ import '../net/transport.dart';
 import '../platform/saf_access.dart';
 import '../protocol/wire.dart';
 import '../sync/engine.dart';
+import '../sync/manifest.dart';
+import '../transfers/transfer_receipt.dart';
 import '../controllers/app_controllers.dart';
 import 'pairing_screen.dart';
 import 'folder_pairs_screen.dart';
@@ -1476,6 +1479,22 @@ class _SettingsHubPage extends StatelessWidget {
   }
 }
 
+class _DashboardFileItem {
+  final String name;
+  final int? sizeBytes;
+  final DateTime? timestamp;
+  final bool isIncoming;
+  final bool isSynced;
+
+  const _DashboardFileItem({
+    required this.name,
+    this.sizeBytes,
+    this.timestamp,
+    this.isIncoming = true,
+    this.isSynced = false,
+  });
+}
+
 class PhoneSummaryCard extends StatefulWidget {
   const PhoneSummaryCard({super.key, required this.peer});
   final PairedPeer peer;
@@ -1486,6 +1505,263 @@ class PhoneSummaryCard extends StatefulWidget {
 
 class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
   bool _alerting = false;
+  List<_DashboardFileItem> _recentFiles = const [];
+  DateTime? _latestSyncAt;
+  StreamSubscription<void>? _receiptsSub;
+  bool _loadingFiles = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final state = context.read<AppState>();
+      _receiptsSub = state.transferReceipts?.changes.listen((_) {
+        if (mounted) _loadRecentFiles();
+      });
+      _loadRecentFiles();
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant PhoneSummaryCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.peer.deviceId != widget.peer.deviceId) {
+      _loadRecentFiles();
+    }
+  }
+
+  @override
+  void dispose() {
+    _receiptsSub?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadRecentFiles() async {
+    if (!mounted || _loadingFiles) return;
+    _loadingFiles = true;
+    try {
+      final state = context.read<AppState>();
+      final peerId = widget.peer.deviceId;
+
+      DateTime? latestSync;
+      final peerFolders = state.config.folderPairs
+          .where((p) => p.peerDeviceId == peerId)
+          .toList();
+
+      for (final p in peerFolders) {
+        final syncTime = state.stateFor(p.id)?.lastSyncedAt;
+        if (syncTime != null) {
+          if (latestSync == null || syncTime.isAfter(latestSync)) {
+            latestSync = syncTime;
+          }
+        }
+      }
+
+      final receipts =
+          await state.transferReceipts?.forPeer(peerId, limit: 10) ?? const [];
+      final completedReceipts = receipts
+          .where((r) =>
+              r.status == TransferStatus.completed ||
+              r.status == TransferStatus.completedUnconfirmed)
+          .toList();
+
+      final items = <_DashboardFileItem>[];
+      for (final r in completedReceipts) {
+        final t = r.completedAt ?? r.startedAt;
+        if (latestSync == null || t.isAfter(latestSync)) {
+          latestSync = t;
+        }
+        items.add(_DashboardFileItem(
+          name: r.displayName,
+          sizeBytes: r.sizeBytes,
+          timestamp: t,
+          isIncoming: r.direction == TransferDirection.incoming,
+          isSynced: r.kind == TransferKind.folderSync,
+        ));
+        if (items.length >= 3) break;
+      }
+
+      if (items.length < 3 && peerFolders.isNotEmpty) {
+        for (final pair in peerFolders) {
+          if (items.length >= 3) break;
+          try {
+            final fileList = await state.fs.listFiles(pair.localPath);
+            final entries = <FileEntry>[];
+            for (final rel in fileList.take(20)) {
+              final stat = await state.fs.stat(pair.localPath, rel);
+              if (stat != null) {
+                entries.add(stat);
+              }
+            }
+            entries.sort((a, b) => b.mtime.compareTo(a.mtime));
+            for (final entry in entries) {
+              if (items.any((it) =>
+                  it.name == entry.relPath ||
+                  it.name.endsWith(entry.relPath))) {
+                continue;
+              }
+              items.add(_DashboardFileItem(
+                name: entry.relPath,
+                sizeBytes: entry.size,
+                timestamp: entry.mtime > 0
+                    ? DateTime.fromMillisecondsSinceEpoch(entry.mtime)
+                    : null,
+                isIncoming: true,
+                isSynced: true,
+              ));
+              if (items.length >= 3) break;
+            }
+          } catch (_) {}
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _recentFiles = items;
+        _latestSyncAt = latestSync;
+      });
+    } finally {
+      _loadingFiles = false;
+    }
+  }
+
+  IconData _fileIconFor(String fileName) {
+    final ext =
+        fileName.contains('.') ? fileName.split('.').last.toLowerCase() : '';
+    switch (ext) {
+      case 'jpg':
+      case 'jpeg':
+      case 'png':
+      case 'gif':
+      case 'webp':
+      case 'bmp':
+      case 'svg':
+      case 'heic':
+        return Icons.image_outlined;
+      case 'mp4':
+      case 'mov':
+      case 'mkv':
+      case 'avi':
+      case 'webm':
+        return Icons.videocam_outlined;
+      case 'mp3':
+      case 'wav':
+      case 'flac':
+      case 'm4a':
+      case 'aac':
+      case 'ogg':
+        return Icons.audiotrack_outlined;
+      case 'pdf':
+        return Icons.picture_as_pdf_outlined;
+      case 'doc':
+      case 'docx':
+      case 'txt':
+      case 'md':
+      case 'rtf':
+        return Icons.description_outlined;
+      case 'zip':
+      case 'tar':
+      case 'gz':
+      case '7z':
+      case 'rar':
+        return Icons.folder_zip_outlined;
+      case 'dart':
+      case 'js':
+      case 'ts':
+      case 'py':
+      case 'json':
+      case 'html':
+      case 'css':
+        return Icons.code_rounded;
+      case 'apk':
+        return Icons.android_outlined;
+      default:
+        return Icons.insert_drive_file_outlined;
+    }
+  }
+
+  String _formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+
+  String _formatRelativeTime(DateTime dt) {
+    final now = DateTime.now();
+    final diff = now.difference(dt);
+    if (diff.isNegative || diff.inSeconds < 45) {
+      return 'just now';
+    } else if (diff.inMinutes < 60) {
+      return '${diff.inMinutes}m ago';
+    } else if (diff.inHours < 24) {
+      return '${diff.inHours}h ago';
+    } else if (diff.inDays < 7) {
+      return '${diff.inDays}d ago';
+    } else {
+      String two(int n) => n.toString().padLeft(2, '0');
+      return '${dt.year}-${two(dt.month)}-${two(dt.day)}';
+    }
+  }
+
+  Widget _buildFileRow(
+    BuildContext context,
+    _DashboardFileItem item,
+    GlassColors c,
+  ) {
+    final icon = _fileIconFor(item.name);
+    final normalized = item.name.replaceAll(r'\', '/');
+    final basename =
+        normalized.contains('/') ? normalized.split('/').last : normalized;
+
+    final metaParts = <String>[];
+    if (item.sizeBytes != null && item.sizeBytes! > 0) {
+      metaParts.add(_formatFileSize(item.sizeBytes!));
+    }
+    if (item.timestamp != null) {
+      metaParts.add(_formatRelativeTime(item.timestamp!));
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2.5),
+      child: Row(
+        children: [
+          Icon(
+            icon,
+            size: 14,
+            color: c.textTertiary,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              basename,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: c.textSecondary,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+          if (metaParts.isNotEmpty) ...[
+            const SizedBox(width: 10),
+            Text(
+              metaParts.join(' · '),
+              style: TextStyle(
+                color: c.textTertiary,
+                fontSize: 11,
+                fontWeight: FontWeight.w400,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1631,6 +1907,17 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
         .where((p) => p.peerDeviceId == widget.peer.deviceId)
         .toList();
 
+    DateTime? effectiveLatestSync = _latestSyncAt;
+    for (final p in peerFolders) {
+      final syncTime = state.stateFor(p.id)?.lastSyncedAt;
+      if (syncTime != null) {
+        if (effectiveLatestSync == null ||
+            syncTime.isAfter(effectiveLatestSync)) {
+          effectiveLatestSync = syncTime;
+        }
+      }
+    }
+
     Widget folderRollupWidget = const SizedBox.shrink();
     if (peerFolders.isNotEmpty) {
       final pairCount = peerFolders.length;
@@ -1674,19 +1961,38 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
         healthIcon = Icons.check_circle_outline_rounded;
       }
 
+      final String? syncTimeLabel = effectiveLatestSync != null
+          ? 'Synced ${_formatRelativeTime(effectiveLatestSync)}'
+          : (isConnected ? 'Not synced yet' : null);
+
       folderRollupWidget = Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const SizedBox(height: 14),
-          Text(
-            'Sync health',
-            style: AppTypography.manrope(
-              textStyle: TextStyle(
-                color: c.textPrimary,
-                fontSize: 13.5,
-                fontWeight: FontWeight.w700,
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Text(
+                'Sync health',
+                style: AppTypography.manrope(
+                  textStyle: TextStyle(
+                    color: c.textPrimary,
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
               ),
-            ),
+              if (syncTimeLabel != null)
+                Text(
+                  syncTimeLabel,
+                  style: TextStyle(
+                    color: c.textTertiary,
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+            ],
           ),
           const SizedBox(height: 8),
           Row(
@@ -1705,6 +2011,18 @@ class _PhoneSummaryCardState extends State<PhoneSummaryCard> {
               ),
             ],
           ),
+          if (_recentFiles.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            ..._recentFiles.map((file) => _buildFileRow(context, file, c)),
+          ],
+        ],
+      );
+    } else if (_recentFiles.isNotEmpty) {
+      folderRollupWidget = Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SizedBox(height: 14),
+          ..._recentFiles.map((file) => _buildFileRow(context, file, c)),
         ],
       );
     }
