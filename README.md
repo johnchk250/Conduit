@@ -10,7 +10,8 @@ small cross-device tools without accounts, cloud storage, or a relay service.
 
 ## What it does
 
-- Synchronizes folder pairs in two-way, send-only, or receive-only mode.
+- Synchronizes folder pairs in two-way, send-only, receive-only, or
+  authoritative-mirror mode.
 - Connects over LAN when possible and falls back to Bluetooth Classic when LAN
   is unavailable.
 - Automatically upgrades an authenticated Bluetooth session back to LAN.
@@ -70,6 +71,15 @@ Direction meanings:
 - **Two-way:** edits and deletions can propagate in both directions.
 - **Send only:** this device advertises its changes to the peer.
 - **Receive only:** this device receives changes from the peer.
+- **Mirror to peer:** this device is authoritative; the peer is kept as an
+  exact copy. Peer-side additions are removed and peer-side edits or deletions
+  are undone.
+- **Mirror from peer:** the peer is authoritative and this device is kept as
+  the exact copy.
+
+Mirror reconciliation covers additions, edits, and deletions, including large
+deletion batches. Before overwriting or removing replica files, Conduit keeps
+the existing recovery copy in version history.
 
 These modes synchronize state; they are not append-only archive policies.
 

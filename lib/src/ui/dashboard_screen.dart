@@ -1063,6 +1063,14 @@ class _InviteDialogState extends State<_InviteDialog> {
       SyncDirection.receiveOnly =>
         '${widget.invite.peerName} chose "Receive only", so files you put in '
             'this folder will be SENT to them. Their files will NOT come here.',
+      SyncDirection.mirrorToPeer =>
+        '${widget.invite.peerName} chose an authoritative mirror. This folder '
+            'will become an EXACT COPY of theirs: local additions will be '
+            'removed, and local edits or deletions will be undone.',
+      SyncDirection.mirrorFromPeer =>
+        '${widget.invite.peerName} wants their folder to become an exact copy '
+            'of this one. This folder will be AUTHORITATIVE; changes on their '
+            'device cannot modify it.',
     };
     return AlertDialog(
       title: Text('Sync "${widget.invite.name}"?'),

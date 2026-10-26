@@ -178,7 +178,8 @@ A `FolderPair` contains:
 - a shared pair ID;
 - local display name and folder path/grant;
 - the peer device ID;
-- direction: two-way, send-only, or receive-only;
+- direction: two-way, send-only, receive-only, mirror-to-peer, or
+  mirror-from-peer;
 - local ignore globs, ignored extensions, and optional size cap.
 
 The initiating device creates the pair ID and sends it in a folder invitation.
@@ -247,6 +248,11 @@ prevents concurrent scans.
 - `receiveOnly` permits incoming fetches but does not advertise local content
   as an outbound sync source.
 - `sendOnly` advertises local content but does not pull peer content.
+- `mirrorToPeer` is authoritative: it advertises local state and ignores all
+  incoming peer index entries, including tombstones.
+- `mirrorFromPeer` never advertises local state. It compares actual disk bytes
+  with the authoritative peer index, restores changed or deleted source files,
+  and removes files that exist only on the replica.
 
 Direction does not mean permanent backup retention. Tombstones follow the
 allowed synchronization direction.

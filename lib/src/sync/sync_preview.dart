@@ -176,10 +176,10 @@ SyncPreview assembleSyncPreview({
     );
   }
 
-  final incoming = pair.direction == SyncDirection.sendOnly
+  final incoming = !pair.direction.receivesChanges
       ? const <Need>[]
       : indexDiff(localLive: inputs.localLive, peerLive: inputs.peerLive);
-  final outgoing = pair.direction == SyncDirection.receiveOnly
+  final outgoing = !pair.direction.sendsChanges
       ? const <Need>[]
       : indexDiff(localLive: inputs.peerLive, peerLive: inputs.localLive);
   final localByPath = {
@@ -204,7 +204,7 @@ SyncPreview assembleSyncPreview({
         other: peerByPath[need.relPath],
         constrained: constrained,
       ),
-    if (pair.direction != SyncDirection.receiveOnly)
+    if (pair.direction.sendsChanges)
       for (final tombstone in inputs.localTombstones)
         SyncPreviewItem(
           relPath: tombstone.relPath,

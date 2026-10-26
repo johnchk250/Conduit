@@ -335,6 +335,7 @@ class SyncEngine {
   /// wants a flat live map keyed by path, which is cheaper to keep here than to
   /// rebuild from a SQLite query on every reconcile.
   final _peerLive = <String, Map<String, IndexEntry>>{};
+  final _completePeerSnapshots = <String>{};
   final _peerPreviewCache = <String, Map<String, IndexEntry>>{};
   final _localGeneration = <String, int>{};
   final _peerGeneration = <String, int>{};
@@ -498,9 +499,9 @@ class SyncEngine {
   /// warning was raised it is NOT deleted. New disappearances that were not in
   /// the warning snapshot are also not included; they require their own hold.
   Future<int> approveLocalDeletionHold(FolderPair pair) async {
-    if (pair.direction == SyncDirection.receiveOnly) {
+    if (!pair.direction.sendsChanges) {
       throw StateError(
-          'Receive-only folders cannot propagate local deletions.');
+          'This folder direction cannot propagate local deletions.');
     }
     final held = _localDeletionHoldPaths[pair.id];
     final hasPendingBacklog =
@@ -941,6 +942,7 @@ class SyncEngine {
     }
     _vaultLogs.remove(pairId); // no resource to close — just a File ref
     _peerLive.remove(pairId);
+    _completePeerSnapshots.remove(pairId);
     _peerPreviewCache.remove(pairId);
     _localGeneration.remove(pairId);
     _peerGeneration.remove(pairId);
@@ -1118,7 +1120,7 @@ class SyncEngine {
     final session = peerId == null ? null : registry.openSessionFor(peerId);
     final connected = session?.isLinkReady == true;
     if (connected) await reconcile(pair, session);
-    if (pair.direction == SyncDirection.receiveOnly) {
+    if (!pair.direction.sendsChanges) {
       return RestoreResult.restoredLocalOnlyByDirection;
     }
     return connected
@@ -1406,6 +1408,7 @@ class SyncEngine {
   }
 
   void log(String pairId, String msg, SyncEventLevel level) {
+    if (_disposed) return;
     final e = SyncEvent(DateTime.now(), pairId, msg, level);
     _events.insert(0, e);
     if (_events.length > 500) _events.removeRange(500, _events.length);
@@ -1632,6 +1635,7 @@ class SyncEngine {
     }
     for (final pairId in affectedPairs) {
       _peerLive.remove(pairId);
+      _completePeerSnapshots.remove(pairId);
     }
     _peerSeq.removeWhere((k, _) =>
         affectedPairs.any((p) => k.endsWith('|$p')) &&
@@ -1661,6 +1665,7 @@ class SyncEngine {
     PeerSession? session,
     required ReconcileReason reason,
   }) async {
+    if (_disposed) return;
     if (session != null && !_sessionOwnsPair(session, pair)) {
       Diag.log(
         'pair_session_mismatch',
@@ -1796,6 +1801,32 @@ class SyncEngine {
     //    is gone, so subsequent passes are no-ops.
     await _propagateRemoteDeletes(pair);
 
+    // A mirror replica has no local authorship. Once a complete source index
+    // is available, compare the source with the real bytes on disk, overwrite
+    // drift, and remove replica-only files. While offline (or while a paged
+    // source index is incomplete), never guess that absent paths were deleted.
+    if (pair.direction == SyncDirection.mirrorFromPeer) {
+      if (session == null) {
+        st.lastSyncedAt = DateTime.now();
+        st.status = _idleStatus(pair.id, fallback: 'Idle (no peer)');
+        _stateController.add(st);
+        return;
+      }
+      if (!_completePeerSnapshots.contains(pair.id)) {
+        final peerKey = _peerKey(session.peer.deviceId, pair.id);
+        session.send({
+          't': Msg.indexRequest,
+          'pairId': pair.id,
+          'fromSequence': _peerSeq[peerKey] ?? 0,
+        });
+        st.status = 'Requesting authoritative index';
+        _stateController.add(st);
+        return;
+      }
+      await _processNeeds(pair, session, db, st);
+      return;
+    }
+
     // 2. Scan local → DB. upsertLocal/markDeletedLocal are no-ops on unchanged
     //    files, so this burns no sequence on an idle folder (the key invariant
     //    that keeps a no-op reconcile from re-advertising the whole folder).
@@ -1810,6 +1841,7 @@ class SyncEngine {
           ignoreExtensions: pair.ignoreExtensions,
           maxFileSizeBytes: pair.maxFileSizeBytes,
           onDiskSignature: _watchers[pair.id]?.seedSignature,
+          authoritative: pair.direction == SyncDirection.mirrorToPeer,
         ));
     if (scan.changed.isNotEmpty) {
       _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
@@ -1843,7 +1875,19 @@ class SyncEngine {
     //    we've already told THIS peer about, so this is usually a small (often
     //    empty) IndexUpdate. On the very first exchange the watermark is 0 and
     //    the peer treats it as a full Index.
-    await _advertiseDelta(pair, session, db);
+    if (pair.direction.sendsChanges) {
+      await _advertiseDelta(pair, session, db);
+    }
+
+    // Send-only and authoritative-mirror sources never need or apply a peer
+    // index. Their local tree remains the sole source of outgoing truth.
+    if (!pair.direction.receivesChanges) {
+      st.lastSyncedAt = DateTime.now();
+      st.status = _idleStatus(pair.id);
+      st.progress = null;
+      _stateController.add(st);
+      return;
+    }
 
     // 3. If we don't yet have the peer's live snapshot for this pair, ask for
     //    it. Needs can't be computed without it, and fetch can't run without
@@ -1975,16 +2019,34 @@ class SyncEngine {
     // also admitted localSha-confirmed rows, a fetched file stayed excluded
     // forever because a pure fetch never adds our counter, so it was re-
     // fetched every reconcile — the WAL-churn / watcher loop).
-    final localLive = await db.localSnapshot(deviceId);
     final peerLive = _peerLive[pair.id]?.values.toList(growable: false) ??
         const <IndexEntry>[];
-    final needs = indexDiff(localLive: localLive, peerLive: peerLive);
+    late final List<IndexEntry> localLive;
+    late final List<Need> needs;
+    var removedReplicaFiles = 0;
+    if (pair.direction == SyncDirection.mirrorFromPeer) {
+      for (final source in peerLive) {
+        await db.applyMirrorSource(source);
+      }
+      final mirror = await _inspectMirrorReplica(pair, db, peerLive);
+      removedReplicaFiles = mirror.removedReplicaFiles;
+      localLive = await db.localSnapshot(deviceId);
+      needs = mirror.needs;
+    } else {
+      localLive = await db.localSnapshot(deviceId);
+      needs = indexDiff(localLive: localLive, peerLive: peerLive);
+    }
     if (needs.isEmpty) {
       st.lastSyncedAt = DateTime.now();
       st.status = _idleStatus(pair.id);
       st.progress = null;
       _stateController.add(st);
-      log(pair.id, 'V2 in sync (${localLive.length} files)',
+      log(
+          pair.id,
+          pair.direction == SyncDirection.mirrorFromPeer
+              ? 'Mirror in sync (${peerLive.length} files, '
+                  '$removedReplicaFiles replica-only file(s) removed)'
+              : 'V2 in sync (${localLive.length} files)',
           SyncEventLevel.info);
       return;
     }
@@ -2025,7 +2087,7 @@ class SyncEngine {
         // Skip if this direction never pulls. sendOnly = push only; receiveOnly
         // = pull only; twoWay = both. (Push happens implicitly: our advertise
         // above lets the peer compute its own need for the same file.)
-        if (pair.direction == SyncDirection.sendOnly) break;
+        if (!pair.direction.receivesChanges) break;
         try {
           log(pair.id, 'V2 fetching ${need.relPath}', SyncEventLevel.info);
           final sha = await fetchFileBlockLevel(
@@ -2084,7 +2146,12 @@ class SyncEngine {
             );
           }
 
-          await db.confirmLocalObservation(relPath: need.relPath, sha: sha);
+          await db.confirmLocalObservation(
+            relPath: need.relPath,
+            sha: sha,
+            size: finalStat.size,
+            mtime: finalStat.mtime,
+          );
           await transferReceipts?.upsert(TransferReceipt(
             receiptId:
                 'sync-in:${pair.id}:${session.peer.deviceId}:${need.relPath}:$sha',
@@ -2158,6 +2225,105 @@ class SyncEngine {
         SyncEventLevel.info,
       );
     }
+  }
+
+  /// Verify an authoritative mirror replica in one metadata traversal.
+  ///
+  /// A confirmed local SHA plus unchanged size+mtime is a durable witness that
+  /// the bytes are unchanged, so steady-state reconciles never reread every
+  /// file. If metadata changed, hash that file once and refresh its local
+  /// fingerprint when it still matches the source. The same traversal removes
+  /// replica-only files, avoiding a second full tree walk.
+  Future<({List<Need> needs, int removedReplicaFiles})> _inspectMirrorReplica(
+    FolderPair pair,
+    IndexDb db,
+    List<IndexEntry> sourceLive,
+  ) async {
+    final sourceByPath = <String, IndexEntry>{
+      for (final source in sourceLive) source.relPath: source,
+    };
+    final fingerprints = await db.localFingerprints();
+    final diskEntries = await _listMirrorReplicaWithStat(pair.localPath);
+    final seenSourcePaths = <String>{};
+    final needs = <Need>[];
+    var removedReplicaFiles = 0;
+
+    for (final diskEntry in diskEntries) {
+      final relPath = diskEntry.relPath.replaceAll('\\', '/');
+      if (!isSyncableRelativePath(relPath)) continue;
+
+      final source = sourceByPath[relPath];
+      if (source == null) {
+        final vault = await vaultBeforeDestructiveChange(
+          pair: pair,
+          relPath: relPath,
+          reason: VaultReason.peerDelete,
+        );
+        if (vault.status != VaultOutcomeStatus.moved) {
+          await fs.delete(pair.localPath, relPath);
+        }
+        removedReplicaFiles++;
+        log(pair.id, 'Removed replica-only file $relPath', SyncEventLevel.info);
+        continue;
+      }
+
+      seenSourcePaths.add(relPath);
+      if (diskEntry.size != source.size) {
+        needs.add(Need(source, reason: NeedReason.peerVersionNewer));
+        continue;
+      }
+
+      final fingerprint = fingerprints[relPath];
+      if (fingerprint != null &&
+          fingerprint.size == diskEntry.size &&
+          fingerprint.mtime == diskEntry.mtime) {
+        if (source.sha256.isNotEmpty && fingerprint.sha == source.sha256) {
+          continue;
+        }
+        needs.add(Need(source, reason: NeedReason.peerVersionNewer));
+        continue;
+      }
+
+      final localSha = await (hashFileOverride?.call(
+            pair.localPath,
+            relPath,
+          ) ??
+          hashFile(fs, pair.localPath, relPath));
+      if (source.sha256.isEmpty || localSha != source.sha256) {
+        needs.add(Need(
+          source,
+          reason: NeedReason.equalVersionDifferentDiskBytes,
+        ));
+      } else {
+        await db.confirmLocalObservation(
+          relPath: relPath,
+          sha: localSha,
+          size: diskEntry.size,
+          mtime: diskEntry.mtime,
+        );
+      }
+    }
+
+    for (final source in sourceLive) {
+      if (!seenSourcePaths.contains(source.relPath)) {
+        needs.add(Need(source, reason: NeedReason.missingLocally));
+      }
+    }
+
+    return (needs: needs, removedReplicaFiles: removedReplicaFiles);
+  }
+
+  Future<List<FileEntry>> _listMirrorReplicaWithStat(String rootPath) async {
+    if (batchListWithStat != null) {
+      return batchListWithStat!(rootPath);
+    }
+    final entries = <FileEntry>[];
+    final paths = await fs.listFiles(rootPath);
+    for (final relPath in paths) {
+      final stat = await fs.stat(rootPath, relPath);
+      if (stat != null) entries.add(stat);
+    }
+    return entries;
   }
 
   /// Reference-counted transfer tracking for the wake lock (Roadmap Phase 0.4).
@@ -2419,6 +2585,8 @@ class SyncEngine {
         SyncDirection.twoWay => SyncDirection.twoWay,
         SyncDirection.sendOnly => SyncDirection.receiveOnly,
         SyncDirection.receiveOnly => SyncDirection.sendOnly,
+        SyncDirection.mirrorToPeer => SyncDirection.mirrorFromPeer,
+        SyncDirection.mirrorFromPeer => SyncDirection.mirrorToPeer,
       };
 
   /// Decline a pending invite (UI "Cancel" button). Just drops it locally.
@@ -2830,6 +2998,11 @@ class SyncEngine {
     if (pairId == null) return;
     final pair = _pairForSession(session, pairId);
     if (pair == null) return; // unknown or assigned to a different peer
+    if (!pair.direction.receivesChanges) {
+      // A send-only or authoritative-mirror source must never consume peer
+      // metadata, including deletion tombstones.
+      return;
+    }
     final restoreBarrier = _restoreBarriers[pairId];
     if (restoreBarrier != null) await restoreBarrier.future;
     _markPeerAccepted(pairId, session.peer.deviceId);
@@ -2888,7 +3061,9 @@ class SyncEngine {
         // view, but do not persist the tombstone or touch local disk. A
         // peer's empty/newly reinstalled folder is not sufficient authority
         // to delete a whole local tree.
-        live.remove(entry.relPath);
+        if (pair.direction != SyncDirection.mirrorFromPeer) {
+          live.remove(entry.relPath);
+        }
         if (entry.sequence > maxSeq) maxSeq = entry.sequence;
         learned++;
         continue;
@@ -2900,7 +3075,9 @@ class SyncEngine {
       // delete-vs-edit at receive time, BEFORE applyRemote merges the peer's
       // delete-counter into our row (after the merge the dominance test would
       // no longer be clean). See [_applyRemoteTombstone] for the full rule.
-      if (entry.deleted) {
+      if (pair.direction == SyncDirection.mirrorFromPeer) {
+        await _indexDbs[pairId]?.applyMirrorSource(entry);
+      } else if (entry.deleted) {
         final decision = await _applyRemoteTombstone(
           pairId,
           entry,
@@ -2919,7 +3096,9 @@ class SyncEngine {
         }
         // deleteWins OR nothingToDecide: store the tombstone via applyRemote.
       }
-      await _indexDbs[pairId]?.applyRemote(entry);
+      if (pair.direction != SyncDirection.mirrorFromPeer) {
+        await _indexDbs[pairId]?.applyRemote(entry);
+      }
       if (entry.sequence > maxSeq) maxSeq = entry.sequence;
       if (entry.deleted) {
         // Peer's tombstone: drop from the live map so the diff stops offering
@@ -2945,6 +3124,9 @@ class SyncEngine {
           'toSeq': maxSeq,
           'first': entriesRaw.isEmpty,
         });
+    if (msg['more'] != true) {
+      _completePeerSnapshots.add(pairId);
+    }
     if (msg['more'] != true && (maxSeq > priorSeq || wasLiveEmpty)) {
       await reconcile(pair, session);
     }
@@ -2966,6 +3148,17 @@ class SyncEngine {
     if (pair == null) return;
     _markPeerAccepted(pairId, session.peer.deviceId);
     final fromSeq = (msg['fromSequence'] as num?)?.toInt() ?? 0;
+    if (!pair.direction.sendsChanges) {
+      session.send({
+        't': Msg.indexUpdate,
+        'pairId': pairId,
+        'folderId': pairId,
+        'entries': const <Map<String, dynamic>>[],
+        'fromSequence': fromSeq,
+        'more': false,
+      });
+      return;
+    }
     final db = await _indexDbFor(pair);
     // Only send rows WE wrote — the peer already has its own.
     final result = await _sendIndexDeltaFromDb(

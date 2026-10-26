@@ -258,6 +258,39 @@ void main() {
     );
   });
 
+  test('mirror steady state reuses the verified local fingerprint', () async {
+    await h.dispose();
+    h = await _Harness.create(direction: SyncDirection.mirrorFromPeer);
+
+    final content = utf8.encode('authoritative-content');
+    h.bobFs.files['mirror.txt'] = content;
+    await h.alice.startPair(h.pair);
+    final bobEntry = await _scanOne(h.bobFs, h.pair, 'mirror.txt', content);
+    h.connectAlice();
+
+    await h.deliverToAlice({
+      't': Msg.indexUpdate,
+      'pairId': h.pair.id,
+      'folderId': h.pair.id,
+      'entries': [bobEntry.toJson()],
+      'fromSequence': 0,
+      'more': false,
+    });
+    await h.pumpUntil(() =>
+        h.aliceFs.files['mirror.txt'] != null &&
+        h.alice.stateFor(h.pair.id)?.scanning != true);
+
+    h.aliceFs.openReadCalls = 0;
+    await h.alice.reconcile(h.pair, h.session);
+
+    expect(h.alice.stateFor(h.pair.id)?.status, 'Idle');
+    expect(
+      h.aliceFs.openReadCalls,
+      0,
+      reason: 'an unchanged verified mirror must not be re-hashed',
+    );
+  });
+
   test('a failed finalization is not reported as a successful sync', () async {
     final content = utf8.encode('peer-content');
     h.aliceFs.failFinalize = true;
@@ -563,7 +596,9 @@ class _Harness {
   /// [deliverToAlice] call.
   late DateTime _deliverDeadline;
 
-  static Future<_Harness> create() async {
+  static Future<_Harness> create({
+    SyncDirection direction = SyncDirection.twoWay,
+  }) async {
     final tmp = await Directory.systemTemp.createTemp('engine_v2_test_');
 
     final aliceStateDir = Directory(p.join(tmp.path, 'alice', 'support'));
@@ -573,7 +608,7 @@ class _Harness {
       id: 'pair-1',
       name: 'test',
       localPath: 'r',
-      direction: SyncDirection.twoWay,
+      direction: direction,
       peerDeviceId: _bobDeviceId,
     );
 
@@ -922,6 +957,7 @@ class FakeFs implements FileSystemAccess, TemporaryFileFinalizer {
   Completer<void>? listFilesGate;
   Completer<void>? statGate;
   int listFilesCalls = 0;
+  int openReadCalls = 0;
   @override
   bool get isAndroidSAF => false;
 
@@ -948,6 +984,7 @@ class FakeFs implements FileSystemAccess, TemporaryFileFinalizer {
   @override
   Stream<List<int>> openRead(String rootPath, String relPath,
       [int offset = 0]) async* {
+    openReadCalls++;
     final data = files[relPath];
     if (data == null) return;
     yield data.sublist(offset);

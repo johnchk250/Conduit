@@ -30,4 +30,13 @@ void main() {
     expect(pair.direction, SyncDirection.sendOnly);
     expect(pair.ignoreExtensions, ['.tmp']);
   });
+
+  test('authoritative mirror directions expose one-way capabilities', () {
+    expect(SyncDirection.mirrorToPeer.sendsChanges, isTrue);
+    expect(SyncDirection.mirrorToPeer.receivesChanges, isFalse);
+    expect(SyncDirection.mirrorFromPeer.sendsChanges, isFalse);
+    expect(SyncDirection.mirrorFromPeer.receivesChanges, isTrue);
+    expect(SyncDirection.mirrorToPeer.isMirror, isTrue);
+    expect(SyncDirection.mirrorFromPeer.isMirror, isTrue);
+  });
 }

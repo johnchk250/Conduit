@@ -137,13 +137,31 @@ class Msg {
 enum SyncDirection {
   twoWay, // mirror both ways
   receiveOnly, // pull from peer, never push local changes
-  sendOnly; // push local changes, never pull from peer
+  sendOnly, // push local changes, never pull from peer
+  mirrorToPeer, // this device is authoritative; peer is an exact replica
+  mirrorFromPeer; // peer is authoritative; this device is an exact replica
 
   String get label => switch (this) {
         twoWay => 'Two-way',
         receiveOnly => 'Receive only (from peer)',
         sendOnly => 'Send only (to peer)',
+        mirrorToPeer => 'Mirror to peer (this device is authoritative)',
+        mirrorFromPeer => 'Mirror from peer (peer is authoritative)',
       };
+
+  bool get sendsChanges => switch (this) {
+        twoWay || sendOnly || mirrorToPeer => true,
+        receiveOnly || mirrorFromPeer => false,
+      };
+
+  bool get receivesChanges => switch (this) {
+        twoWay || receiveOnly || mirrorFromPeer => true,
+        sendOnly || mirrorToPeer => false,
+      };
+
+  bool get isMirror =>
+      this == SyncDirection.mirrorToPeer ||
+      this == SyncDirection.mirrorFromPeer;
 }
 
 /// Per-folder-pair config. Identified by [id]; both peers must agree on it.

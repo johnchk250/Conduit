@@ -63,9 +63,16 @@ class IndexEntry {
     this.localMtime = 0,
   });
 
-  /// Copy with an updated [localSha] (preserving everything else). Used by the
-  /// scanner/post-fetch path to record what we just observed on disk.
-  IndexEntry withLocalSha(String sha) => IndexEntry(
+  /// Copy with an updated local-disk observation (preserving everything else).
+  /// [observedSize] / [observedMtime] are optional so callers that only know
+  /// the digest keep the prior metadata, while fetch/verification paths can
+  /// refresh the complete fingerprint used by the scanner fast path.
+  IndexEntry withLocalSha(
+    String sha, {
+    int? observedSize,
+    int? observedMtime,
+  }) =>
+      IndexEntry(
         relPath: relPath,
         size: size,
         mtime: mtime,
@@ -76,8 +83,8 @@ class IndexEntry {
         deletionApproved: deletionApproved,
         blockHashes: blockHashes,
         localSha: sha,
-        localSize: localSize,
-        localMtime: localMtime,
+        localSize: observedSize ?? localSize,
+        localMtime: observedMtime ?? localMtime,
       );
 
   /// Copy with an updated [version] (preserving everything else). Used by
@@ -666,6 +673,7 @@ class IndexDb {
     required List<LocalFileObservation> observations,
     required Set<String> seenPaths,
     required String deviceId,
+    bool authoritative = false,
   }) async {
     return _db.transaction((txn) async {
       final rows = await txn.rawQuery('SELECT * FROM files');
@@ -682,7 +690,8 @@ class IndexDb {
         final priorLocalSha = prior?.localSha ?? '';
         if (prior?.deleted != true &&
             observation.sha256 == priorLocalSha &&
-            observation.sha256.isNotEmpty) {
+            observation.sha256.isNotEmpty &&
+            (!authoritative || prior!.sha256 == observation.sha256)) {
           if (prior!.localSize != observation.size ||
               prior.localMtime != observation.mtime) {
             await txn.update(
@@ -840,16 +849,26 @@ class IndexDb {
   Future<void> confirmLocalObservation({
     required String relPath,
     required String sha,
+    int? size,
+    int? mtime,
   }) async {
     await _db.transaction((txn) async {
       final existing = await txn
           .rawQuery('SELECT * FROM files WHERE path = ? LIMIT 1', [relPath]);
       if (existing.isEmpty) return;
       final prior = _rowToEntry(existing.first);
-      if (prior.localSha == sha) return; // already recorded
+      if (prior.localSha == sha &&
+          (size == null || prior.localSize == size) &&
+          (mtime == null || prior.localMtime == mtime)) {
+        return;
+      }
       await txn.insert(
         'files',
-        _entryToRow(prior.withLocalSha(sha)),
+        _entryToRow(prior.withLocalSha(
+          sha,
+          observedSize: size,
+          observedMtime: mtime,
+        )),
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
     });
@@ -1031,6 +1050,39 @@ class IndexDb {
               localMtime: prior.localMtime,
             );
       await txn.insert('files', _entryToRow(merged),
+          conflictAlgorithm: ConflictAlgorithm.replace);
+    });
+  }
+
+  /// Replace the indexed state for one path with the authoritative mirror
+  /// source's state, regardless of local version vectors or sequence numbers.
+  ///
+  /// A mirror replica is not a second author: local edits must be overwritten,
+  /// local deletions must be restored, and source deletions must win. We retain
+  /// only the replica's confirmed on-disk hash so the transfer layer can avoid
+  /// rewriting bytes that already match the source.
+  Future<void> applyMirrorSource(IndexEntry source) async {
+    await _db.transaction((txn) async {
+      final existing = await txn.rawQuery(
+          'SELECT * FROM files WHERE path = ? LIMIT 1', [source.relPath]);
+      final prior = existing.isEmpty ? null : _rowToEntry(existing.first);
+      final live = !source.deleted;
+      final replacement = IndexEntry(
+        relPath: source.relPath,
+        size: source.size,
+        mtime: source.mtime,
+        sha256: source.sha256,
+        version: source.version,
+        sequence: source.sequence,
+        deleted: source.deleted,
+        deletionApproved: source.deleted,
+        blockHashes: source.blockHashes,
+        localSha: live && prior?.deleted != true ? prior?.localSha ?? '' : '',
+        localSize: live && prior?.deleted != true ? prior?.localSize ?? -1 : -1,
+        localMtime:
+            live && prior?.deleted != true ? prior?.localMtime ?? -1 : -1,
+      );
+      await txn.insert('files', _entryToRow(replacement),
           conflictAlgorithm: ConflictAlgorithm.replace);
     });
   }

@@ -46,24 +46,20 @@ class ScanResult {
 ///
 /// Each [scan]:
 ///   1. Lists every file under [rootPath] (via [FileSystemAccess]).
-///   2. For each, hashes it (reusing nothing — see below) and calls
-///      [IndexDb.upsertLocal]. That method is itself a no-op when size+mtime+
-///      sha+blocks are unchanged, so re-scans of an unmodified folder burn zero
+///   2. Reuses the durable local hash when size+mtime are unchanged; otherwise
+///      hashes the file and applies the observation to [IndexDb]. Re-scans of
+///      an unmodified folder therefore avoid content I/O and burn zero
 ///      sequences. THIS IS THE KEY INVARIANT: a no-op re-scan must not bump any
 ///      version, or peers would re-fetch unchanged files forever.
 ///   3. Any live DB path absent from disk → [IndexDb.markDeletedLocal]
 ///      (a tombstone row with bumped version — Phase 4 propagates the delete).
 ///   4. Returns the [ScanResult] = the entries that actually moved.
 ///
-/// Why hash every file on every scan? The scanner reuses a cached hash when
-/// cached hash for unchanged size+mtime? Because the IndexDb fast path is
-/// itself the cache: upsertLocal reads the prior row and compares. Re-hashing
-/// is the cost of correctness — size+mtime can be unchanged while content
-/// differs (rare but real: a same-length rewrite, a copy that preserves mtime).
-/// The legacy manifest cache traded correctness for speed; the new engine does
-/// not. The per-scan hash cost is bounded and, unlike the legacy path, the
-/// result is durable (persists in SQLite across reconnects) so the cost is paid
-/// once per actual change, not once per reconcile.
+/// The size+mtime fingerprint is the same fast path used by all sync
+/// directions, including authoritative mirrors. A metadata change forces a
+/// fresh hash; unchanged metadata reuses the previously verified digest stored
+/// in the Index DB. This keeps steady-state scans cheap while retaining a
+/// durable per-file baseline across reconnects and restarts.
 ///
 /// NOTE on deletes: a vanished file becomes a tombstone in the DB but Phase 2
 /// does NOT propagate deletes to the peer — that's Phase 4 (version-vector
@@ -85,8 +81,8 @@ class IndexScanner {
   /// which costs one ContentResolver query per directory instead of several
   /// per file. When null (every non-Android caller, and any existing test),
   /// behaviour is byte-for-byte identical to before this parameter existed.
-  /// Hashing is unaffected either way — see class docs for why every file is
-  /// still hashed on every scan.
+  /// Hashing is independent of the listing backend and only runs when the
+  /// durable size+mtime fingerprint no longer matches.
   /// [ignoreGlobs], [ignoreExtensions], and [maxFileSizeBytes] are Roadmap
   /// Phase 6.2 (ignore rules) — all optional and default to
   /// empty/null/no-op, so every pre-Phase-6 caller (and every existing
@@ -110,6 +106,7 @@ class IndexScanner {
     List<String> ignoreExtensions = const [],
     int? maxFileSizeBytes,
     void Function(int signature)? onDiskSignature,
+    bool authoritative = false,
   }) async {
     final observations = <LocalFileObservation>[];
     final seenPaths = <String>{};
@@ -181,10 +178,15 @@ class IndexScanner {
     final missingLocalPaths = localPaths
         .where((path) => !seenPaths.contains(path))
         .toList(growable: false);
-    final blockMassDeletion = DeleteSafetyPolicy.shouldHold(
-      deletedCount: missingLocalPaths.length,
-      existingCount: localPaths.length,
-    );
+    // An authoritative mirror source deliberately propagates its complete
+    // state, including large deletion batches. This flag affects delete
+    // authority only; unchanged files still use the same durable size+mtime
+    // fingerprint fast path as two-way and ordinary one-way sync.
+    final blockMassDeletion = !authoritative &&
+        DeleteSafetyPolicy.shouldHold(
+          deletedCount: missingLocalPaths.length,
+          existingCount: localPaths.length,
+        );
     // Preserve all existing local paths in the seen set while the safety hold
     // is active. Present files are still scanned and local edits still enter
     // the index; only the destructive tombstone pass is withheld.
@@ -194,6 +196,7 @@ class IndexScanner {
       observations: observations,
       seenPaths: effectiveSeenPaths,
       deviceId: deviceId,
+      authoritative: authoritative,
     );
     final maxSeq =
         changed.isEmpty ? await db.maxSequence() : changed.last.sequence;

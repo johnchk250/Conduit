@@ -77,7 +77,7 @@ class _VersionHistoryScreenState extends State<VersionHistoryScreen> {
         content: Text(
           'This returns "${entry.relPath}" to the local folder. The current '
           'file is saved first, and this recovery copy remains for 14 days. '
-          '${widget.pair.direction == SyncDirection.receiveOnly ? 'This receive-only pair will keep the resurrection local.' : 'The restored file can sync back to the peer and recreate it on other devices.'}',
+          '${widget.pair.direction == SyncDirection.mirrorFromPeer ? 'The authoritative peer will replace this restored file on the next sync.' : !widget.pair.direction.sendsChanges ? 'This receive-only pair will keep the resurrection local.' : 'The restored file can sync back to the peer and recreate it on other devices.'}',
         ),
         actions: [
           TextButton(

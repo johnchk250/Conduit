@@ -6,6 +6,11 @@ versioning for published application releases.
 
 ## [Unreleased]
 
+- Added an authoritative folder-mirror mode in either direction. The replica
+  restores source files that are edited or deleted locally, removes
+  replica-only files, propagates source deletion batches, and never sends
+  replica changes back to the authoritative device. Destructive replica
+  changes retain recovery copies in version history.
 - Add a Home-screen **Sync all now** action that reconciles every folder pair
   sequentially without enabling connection boost, keeping manual catch-up fast
   while avoiding concurrent Android SAF tree scans.

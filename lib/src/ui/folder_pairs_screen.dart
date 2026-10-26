@@ -28,6 +28,58 @@ PageRoute<T> _fadeRoute<T>(WidgetBuilder builder) => PageRouteBuilder<T>(
       ),
     );
 
+class SyncDirectionDropdownField extends StatelessWidget {
+  const SyncDirectionDropdownField({
+    super.key,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final SyncDirection value;
+  final ValueChanged<SyncDirection> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return DropdownButtonFormField<SyncDirection>(
+      initialValue: value,
+      isExpanded: true,
+      decoration: InputDecoration(
+        labelText: 'Direction',
+        helperText: value.isMirror
+            ? 'Mirror mode removes replica-only files and undoes replica changes.'
+            : null,
+      ),
+      items: SyncDirection.values
+          .map(
+            (direction) => DropdownMenuItem(
+              value: direction,
+              child: Text(
+                direction.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          )
+          .toList(),
+      selectedItemBuilder: (context) => SyncDirection.values
+          .map(
+            (direction) => Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                direction.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          )
+          .toList(),
+      onChanged: (direction) {
+        if (direction != null) onChanged(direction);
+      },
+    );
+  }
+}
+
 /// Folder pairs list + add/invite/accept flow + per-pair detail view.
 ///
 /// NOTE: the folder-invite listener (that shows the accept/decline dialog when
@@ -274,15 +326,9 @@ class _FolderPairsScreenState extends State<FolderPairsScreen> {
                   ],
                 ),
                 const SizedBox(height: 12),
-                DropdownButtonFormField<SyncDirection>(
-                  initialValue: direction,
-                  decoration: const InputDecoration(labelText: 'Direction'),
-                  items: SyncDirection.values
-                      .map((d) =>
-                          DropdownMenuItem(value: d, child: Text(d.label)))
-                      .toList(),
-                  onChanged: (v) =>
-                      setState(() => direction = v ?? SyncDirection.twoWay),
+                SyncDirectionDropdownField(
+                  value: direction,
+                  onChanged: (value) => setState(() => direction = value),
                 ),
                 const SizedBox(height: 12),
                 DropdownButtonFormField<String>(
@@ -731,7 +777,7 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                               ),
                             ],
                           ),
-                          if (p.direction != SyncDirection.receiveOnly) ...[
+                          if (p.direction.sendsChanges) ...[
                             const SizedBox(height: 10),
                             SizedBox(
                               width: double.infinity,
@@ -750,8 +796,8 @@ class _FolderPairCardState extends State<_FolderPairCard> {
                           ] else ...[
                             const SizedBox(height: 6),
                             Text(
-                              'This pair is receive-only, so local deletions '
-                              'cannot be sent to the peer.',
+                              'This direction does not send local deletions '
+                              'to the peer.',
                               style: AppTypography.inter(
                                 textStyle: TextStyle(
                                   color: c.textTertiary,

@@ -133,6 +133,60 @@ void main() {
     expect((await db.get('file_13.txt'))!.deleted, isFalse);
   });
 
+  test('authoritative scans propagate large deletion batches', () async {
+    final fs = FakeFs({
+      for (var i = 0; i < 14; i++) 'file_$i.txt': utf8Bytes('$i'),
+    });
+    await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      authoritative: true,
+    );
+
+    for (var i = 0; i < 10; i++) {
+      fs.files.remove('file_$i.txt');
+    }
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      authoritative: true,
+    );
+
+    expect(result.blockedDeletionCount, 0);
+    expect(result.changed.length, 10);
+    expect(result.changed.every((entry) => entry.deleted), isTrue);
+  });
+
+  test('authoritative scans reuse unchanged size and mtime fingerprints',
+      () async {
+    final fs = FakeFs({'same.txt': utf8Bytes('first')});
+    await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      authoritative: true,
+    );
+    expect(fs.openReadCalls, 1);
+
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      authoritative: true,
+    );
+
+    expect(fs.openReadCalls, 1,
+        reason: 'mirror source should use the same unchanged-file fast path '
+            'as two-way and ordinary one-way sync');
+    expect(result.changed, isEmpty);
+  });
+
   test('a file matching an ignore glob is never indexed at all', () async {
     final fs = FakeFs({
       'a.txt': utf8Bytes('hello'),

@@ -124,4 +124,153 @@ void main() {
     expect(await source.readAsBytes(), bytes);
     expect(await destination.readAsBytes(), bytes);
   });
+
+  test('authoritative mirror repairs replica drift without changing source',
+      () async {
+    final harness = await TwoNodeHarness.create();
+    addTearDown(harness.dispose);
+    await harness.start();
+    await harness.pairFresh();
+
+    final sourceBytes = List<int>.generate(8192, (index) => index % 251);
+    final pairA = await harness.syncFile(
+      relativePath: 'nested/source.txt',
+      bytes: sourceBytes,
+      direction: SyncDirection.mirrorToPeer,
+    );
+    final pairB = harness.nodeB.config.folderPairs
+        .singleWhere((pair) => pair.id == pairA.id);
+    expect(pairB.direction, SyncDirection.mirrorFromPeer);
+
+    final source = File(
+      '${harness.nodeA.source.path}${Platform.pathSeparator}nested'
+      '${Platform.pathSeparator}source.txt',
+    );
+    final replica = File(
+      '${harness.nodeB.destination.path}${Platform.pathSeparator}nested'
+      '${Platform.pathSeparator}source.txt',
+    );
+    final replicaOnly = File(
+      '${harness.nodeB.destination.path}${Platform.pathSeparator}local-only.txt',
+    );
+
+    await replica.writeAsString('replica edit');
+    await replicaOnly.writeAsString('must not survive');
+    await harness.nodeB.engine.reconcile(
+      pairB,
+      harness.nodeB.registry.openSessionFor(harness.nodeA.identity.deviceId),
+    );
+    await waitUntil(
+      () =>
+          replica.existsSync() &&
+          _sameBytes(replica.readAsBytesSync(), sourceBytes) &&
+          !replicaOnly.existsSync(),
+      description: 'replica edit and addition to be repaired',
+    );
+    expect(await source.readAsBytes(), sourceBytes);
+
+    await replica.delete();
+    await harness.nodeB.engine.reconcile(
+      pairB,
+      harness.nodeB.registry.openSessionFor(harness.nodeA.identity.deviceId),
+    );
+    await waitUntil(
+      () =>
+          replica.existsSync() &&
+          _sameBytes(replica.readAsBytesSync(), sourceBytes),
+      description: 'replica deletion to be restored',
+    );
+    expect(await source.readAsBytes(), sourceBytes);
+
+    final updatedBytes = List<int>.generate(4097, (index) => (index * 7) % 251);
+    await source.writeAsBytes(updatedBytes);
+    await harness.nodeA.engine.reconcile(
+      pairA,
+      harness.nodeA.registry.openSessionFor(harness.nodeB.identity.deviceId),
+    );
+    await waitUntil(
+      () =>
+          replica.existsSync() &&
+          _sameBytes(replica.readAsBytesSync(), updatedBytes),
+      description: 'source edit to reach replica',
+    );
+
+    await source.delete();
+    await harness.nodeA.engine.reconcile(
+      pairA,
+      harness.nodeA.registry.openSessionFor(harness.nodeB.identity.deviceId),
+    );
+    await waitUntil(
+      () => !replica.existsSync(),
+      description: 'source deletion to remove replica file',
+    );
+  });
+
+  test('either device can own the authoritative mirror', () async {
+    final harness = await TwoNodeHarness.create();
+    addTearDown(harness.dispose);
+    await harness.start();
+    await harness.pairFresh();
+
+    const pairId = 'reverse-mirror-pair';
+    final replicaPair = FolderPair(
+      id: pairId,
+      name: 'Reverse mirror',
+      localPath: harness.nodeA.source.path,
+      direction: SyncDirection.mirrorFromPeer,
+      peerDeviceId: harness.nodeB.identity.deviceId,
+    );
+    await harness.nodeA.config.upsertPair(replicaPair);
+    await harness.nodeA.engine.startPair(replicaPair);
+    harness.nodeA.engine.sendFolderInvite(replicaPair);
+    await waitUntil(
+      () => harness.nodeB.pendingInvite?.pairId == pairId,
+      description: 'reverse mirror invitation',
+    );
+    await harness.nodeB.engine.acceptFolderInvite(
+      harness.nodeB.pendingInvite!,
+      harness.nodeB.destination.path,
+    );
+    final sourcePair = harness.nodeB.config.folderPairs
+        .singleWhere((pair) => pair.id == pairId);
+    expect(sourcePair.direction, SyncDirection.mirrorToPeer);
+
+    final source = File(
+      '${harness.nodeB.destination.path}${Platform.pathSeparator}phone-source.txt',
+    );
+    final replica = File(
+      '${harness.nodeA.source.path}${Platform.pathSeparator}phone-source.txt',
+    );
+    final bytes = List<int>.generate(3073, (index) => (index * 11) % 251);
+    await source.writeAsBytes(bytes);
+    await harness.nodeB.engine.reconcile(
+      sourcePair,
+      harness.nodeB.registry.openSessionFor(harness.nodeA.identity.deviceId),
+    );
+    await waitUntil(
+      () =>
+          replica.existsSync() && _sameBytes(replica.readAsBytesSync(), bytes),
+      description: 'phone-authoritative file to reach the other device',
+    );
+
+    await replica.writeAsString('replica must not win');
+    await harness.nodeA.engine.reconcile(
+      replicaPair,
+      harness.nodeA.registry.openSessionFor(harness.nodeB.identity.deviceId),
+    );
+    await waitUntil(
+      () =>
+          replica.existsSync() && _sameBytes(replica.readAsBytesSync(), bytes),
+      description: 'reverse replica edit to be repaired',
+    );
+    expect(await source.readAsBytes(), bytes);
+  });
+}
+
+bool _sameBytes(List<int> a, List<int> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
 }

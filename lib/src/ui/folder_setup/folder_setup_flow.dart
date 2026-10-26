@@ -160,6 +160,10 @@ String _directionExplanation(SyncDirection direction) => switch (direction) {
         'This device sends changes outward. The selected peer does not send edits back through this pair.',
       SyncDirection.receiveOnly =>
         'This device receives changes from the peer and does not advertise local edits through this pair.',
+      SyncDirection.mirrorToPeer =>
+        'This folder is authoritative. The peer is kept as an exact copy and cannot change this folder.',
+      SyncDirection.mirrorFromPeer =>
+        'The peer folder is authoritative. Local additions are removed and local edits or deletions are undone.',
     };
 
 IconData _icon(String key) => switch (key) {
