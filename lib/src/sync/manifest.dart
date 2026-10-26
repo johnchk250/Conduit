@@ -152,13 +152,35 @@ abstract interface class TemporaryFileFinalizer {
   );
 }
 
+/// Optional filesystem capability: report whether a sync root is reachable.
+///
+/// An authoritative mirror source must tell "the folder is gone / unmounted"
+/// apart from "the folder is empty". Listing a missing root yields an empty
+/// list, which a scan would otherwise read as "every file was deleted".
+abstract interface class RootAvailabilityChecker {
+  Future<bool> rootAvailable(String rootPath);
+}
+
 /// Standard filesystem access for Windows (and any platform with real File I/O).
 class LocalFileSystemAccess
-    implements FileSystemAccess, BlockFileReader, TemporaryFileFinalizer {
+    implements
+        FileSystemAccess,
+        BlockFileReader,
+        TemporaryFileFinalizer,
+        RootAvailabilityChecker {
   const LocalFileSystemAccess();
 
   @override
   bool get isAndroidSAF => false;
+
+  @override
+  Future<bool> rootAvailable(String rootPath) async {
+    try {
+      return await Directory(_canonicalRoot(rootPath)).exists();
+    } catch (_) {
+      return false;
+    }
+  }
 
   @override
   Future<List<String>> listFiles(String rootPath) async {

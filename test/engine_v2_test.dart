@@ -275,6 +275,7 @@ void main() {
       'entries': [bobEntry.toJson()],
       'fromSequence': 0,
       'more': false,
+      'complete': true,
     });
     await h.pumpUntil(() =>
         h.aliceFs.files['mirror.txt'] != null &&
@@ -289,6 +290,89 @@ void main() {
       0,
       reason: 'an unchanged verified mirror must not be re-hashed',
     );
+  });
+
+  group('mirror replica never wipes on an untrustworthy source index', () {
+    Future<void> startReplica(Map<String, List<int>> replicaFiles) async {
+      await h.dispose();
+      h = await _Harness.create(direction: SyncDirection.mirrorFromPeer);
+      h.aliceFs.files.addAll(replicaFiles);
+      await h.alice.startPair(h.pair);
+      h.connectAlice();
+    }
+
+    Map<String, dynamic> frame(
+      List<Map<String, dynamic>> entries, {
+      required int fromSequence,
+      required bool complete,
+    }) =>
+        {
+          't': Msg.indexUpdate,
+          'pairId': h.pair.id,
+          'folderId': h.pair.id,
+          'entries': entries,
+          'fromSequence': fromSequence,
+          'more': false,
+          'complete': complete,
+        };
+
+    test('an empty incomplete index leaves every replica file', () async {
+      await startReplica({
+        'keep-a.txt': utf8.encode('a'),
+        'keep-b.txt': utf8.encode('b'),
+      });
+
+      await h.deliverToAlice(frame(const [], fromSequence: 0, complete: false));
+      await h.alice.reconcile(h.pair, h.session);
+
+      expect(h.aliceFs.files.keys,
+          containsAll(<String>['keep-a.txt', 'keep-b.txt']));
+    });
+
+    test('a delta with no from-scratch baseline leaves replica files alone',
+        () async {
+      await startReplica({
+        'keep-a.txt': utf8.encode('a'),
+        'keep-b.txt': utf8.encode('b'),
+      });
+      final content = utf8.encode('source-file');
+      h.bobFs.files['src.txt'] = content;
+      final srcEntry = await _scanOne(h.bobFs, h.pair, 'src.txt', content);
+
+      h.session.sent.clear();
+      await h.deliverToAlice(
+          frame([srcEntry.toJson()], fromSequence: 7, complete: true));
+
+      expect(h.aliceFs.files.keys,
+          containsAll(<String>['keep-a.txt', 'keep-b.txt']),
+          reason: 'a delta is not the whole source and must not authorize '
+              'replica-only deletion');
+      expect(
+        h.session.sent.any((m) => m['t'] == Msg.indexRequest),
+        isTrue,
+        reason: 'the replica must re-request the index from sequence 0',
+      );
+    });
+
+    test('a complete from-scratch index still removes replica-only files',
+        () async {
+      final content = utf8.encode('source-file');
+      await startReplica({
+        'src.txt': content,
+        'replica-only.txt': utf8.encode('stale'),
+      });
+      h.bobFs.files['src.txt'] = content;
+      final srcEntry = await _scanOne(h.bobFs, h.pair, 'src.txt', content);
+
+      await h.deliverToAlice(
+          frame([srcEntry.toJson()], fromSequence: 0, complete: true));
+      await h.pumpUntil(() =>
+          !h.aliceFs.files.containsKey('replica-only.txt') &&
+          h.alice.stateFor(h.pair.id)?.scanning != true);
+
+      expect(h.aliceFs.files.containsKey('replica-only.txt'), isFalse);
+      expect(h.aliceFs.files.containsKey('src.txt'), isTrue);
+    });
   });
 
   test('a failed finalization is not reported as a successful sync', () async {

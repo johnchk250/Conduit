@@ -336,6 +336,27 @@ class SyncEngine {
   /// rebuild from a SQLite query on every reconcile.
   final _peerLive = <String, Map<String, IndexEntry>>{};
   final _completePeerSnapshots = <String>{};
+
+  /// Mirror replica side: pairs for which a from-scratch index chain
+  /// (`fromSequence == 0`) has been received on the current session. A delta
+  /// that arrives without this baseline can never be a complete snapshot, so
+  /// it must not authorize replica-only deletions.
+  final _peerBaselineStarted = <String>{};
+
+  /// Mirror source side: pairs whose folder has been scanned successfully in
+  /// this process. Until then the Index DB may be empty or stale (fresh start,
+  /// reset DB), so index replies are marked `complete: false`.
+  final _scannedPairs = <String>{};
+
+  /// Mirror source side: `"$peerId|$pairId"` keys we answered with
+  /// `complete: false`. The next advertise re-sends a (possibly empty)
+  /// `complete: true` frame so the replica learns the snapshot is now final.
+  final _incompleteSent = <String>{};
+
+  /// Delay before an authoritative scan that lists nothing re-lists the folder
+  /// once more. Public only so tests can shorten it.
+  @visibleForTesting
+  Duration emptyListingRecheckDelay = const Duration(seconds: 3);
   final _peerPreviewCache = <String, Map<String, IndexEntry>>{};
   final _localGeneration = <String, int>{};
   final _peerGeneration = <String, int>{};
@@ -943,6 +964,9 @@ class SyncEngine {
     _vaultLogs.remove(pairId); // no resource to close — just a File ref
     _peerLive.remove(pairId);
     _completePeerSnapshots.remove(pairId);
+    _peerBaselineStarted.remove(pairId);
+    _scannedPairs.remove(pairId);
+    _incompleteSent.removeWhere((k) => k.endsWith('|$pairId'));
     _peerPreviewCache.remove(pairId);
     _localGeneration.remove(pairId);
     _peerGeneration.remove(pairId);
@@ -1636,7 +1660,11 @@ class SyncEngine {
     for (final pairId in affectedPairs) {
       _peerLive.remove(pairId);
       _completePeerSnapshots.remove(pairId);
+      _peerBaselineStarted.remove(pairId);
     }
+    _incompleteSent.removeWhere((k) =>
+        affectedPairs.any((p) => k.endsWith('|$p')) &&
+        k.startsWith('$peerDeviceId|'));
     _peerSeq.removeWhere((k, _) =>
         affectedPairs.any((p) => k.endsWith('|$p')) &&
         k.startsWith('$peerDeviceId|'));
@@ -1827,6 +1855,27 @@ class SyncEngine {
       return;
     }
 
+    // An authoritative mirror source must never read "folder unreachable"
+    // (unmounted drive, renamed/moved folder) as "every file was deleted".
+    // Leave the Index DB untouched and skip the scan until the folder is back.
+    if (pair.direction == SyncDirection.mirrorToPeer) {
+      final checker = fs;
+      if (checker is RootAvailabilityChecker &&
+          !await (checker as RootAvailabilityChecker)
+              .rootAvailable(pair.localPath)) {
+        st.status = 'Source folder unavailable';
+        st.progress = null;
+        _stateController.add(st);
+        log(
+          pair.id,
+          'Mirror source folder is unavailable; scan skipped so the replica '
+          'is left untouched',
+          SyncEventLevel.warn,
+        );
+        return;
+      }
+    }
+
     // 2. Scan local → DB. upsertLocal/markDeletedLocal are no-ops on unchanged
     //    files, so this burns no sequence on an idle folder (the key invariant
     //    that keeps a no-op reconcile from re-advertising the whole folder).
@@ -1842,7 +1891,9 @@ class SyncEngine {
           maxFileSizeBytes: pair.maxFileSizeBytes,
           onDiskSignature: _watchers[pair.id]?.seedSignature,
           authoritative: pair.direction == SyncDirection.mirrorToPeer,
+          emptyListingRecheckDelay: emptyListingRecheckDelay,
         ));
+    _scannedPairs.add(pair.id);
     if (scan.changed.isNotEmpty) {
       _localGeneration[pair.id] = (_localGeneration[pair.id] ?? 0) + 1;
     }
@@ -1927,6 +1978,11 @@ class SyncEngine {
     final peerKey = _peerKey(session.peer.deviceId, pair.id);
     final isFirstAdvertise = !_sentSeq.containsKey(peerKey);
     final fromSeq = _sentSeq[peerKey] ?? 0;
+    final complete = _indexComplete(pair);
+    // A peer we previously answered with `complete: false` needs one more
+    // frame (even an empty one) now that the index is final.
+    final sendEmpty =
+        isFirstAdvertise || (complete && _incompleteSent.contains(peerKey));
     // Only advertise rows WE wrote — rows from applyRemote belong to the peer
     // and re-advertising them is wasteful.
     final result = await _sendIndexDeltaFromDb(
@@ -1934,10 +1990,12 @@ class SyncEngine {
       pair.id,
       db,
       fromSeq,
-      sendEmpty: isFirstAdvertise,
+      sendEmpty: sendEmpty,
+      complete: complete,
     );
     final maxSeq = result.maxSequence;
     _sentSeq[peerKey] = maxSeq;
+    if (complete) _incompleteSent.remove(peerKey);
     if (result.sent == 0 && !isFirstAdvertise) return;
     Diag.log('v2_advertise',
         peer: session.peer.deviceId,
@@ -1945,12 +2003,20 @@ class SyncEngine {
         fields: {'sent': result.sent, 'fromSeq': fromSeq, 'toSeq': maxSeq});
   }
 
+  /// An authoritative mirror source may only call its index `complete` once
+  /// the folder has been scanned in this process; before that the Index DB can
+  /// be empty or stale and must not be read as "the source has no files".
+  bool _indexComplete(FolderPair pair) =>
+      pair.direction != SyncDirection.mirrorToPeer ||
+      _scannedPairs.contains(pair.id);
+
   Future<_IndexSendResult> _sendIndexDeltaFromDb(
     PeerSession session,
     String pairId,
     IndexDb db,
     int fromSequence, {
     required bool sendEmpty,
+    required bool complete,
   }) async {
     List<IndexEntry>? pending;
     var sent = 0;
@@ -1958,14 +2024,16 @@ class SyncEngine {
     await for (final page
         in db.changesSinceLocalPages(fromSequence, deviceId)) {
       if (pending != null) {
-        await _sendIndexPage(session, pairId, pending, fromSequence, true);
+        await _sendIndexPage(
+            session, pairId, pending, fromSequence, true, complete);
         sent += pending.length;
         maxSequence = pending.last.sequence;
       }
       pending = page;
     }
     if (pending != null) {
-      await _sendIndexPage(session, pairId, pending, fromSequence, false);
+      await _sendIndexPage(
+          session, pairId, pending, fromSequence, false, complete);
       sent += pending.length;
       maxSequence = pending.last.sequence;
     } else {
@@ -1977,6 +2045,7 @@ class SyncEngine {
           'entries': const <Map<String, dynamic>>[],
           'fromSequence': fromSequence,
           'more': false,
+          'complete': complete,
         });
       }
       maxSequence = await db.maxSequence();
@@ -1990,6 +2059,7 @@ class SyncEngine {
     List<IndexEntry> entries,
     int fromSequence,
     bool more,
+    bool complete,
   ) =>
       session.sendAsync({
         't': Msg.indexUpdate,
@@ -1998,6 +2068,7 @@ class SyncEngine {
         'entries': entries.map((entry) => entry.toJson()).toList(),
         'fromSequence': fromSequence,
         'more': more,
+        'complete': complete,
       });
 
   /// Compute needs from the live snapshots and fetch each one block-by-block.
@@ -2254,6 +2325,10 @@ class SyncEngine {
 
       final source = sourceByPath[relPath];
       if (source == null) {
+        // Files the source explicitly deleted are removed by the tombstone
+        // sweep. Here only never-indexed, replica-only files are removed, and
+        // an empty source index is never treated as authority to wipe them.
+        if (sourceLive.isEmpty) continue;
         final vault = await vaultBeforeDestructiveChange(
           pair: pair,
           relPath: relPath,
@@ -3012,6 +3087,12 @@ class SyncEngine {
     final priorSeq = _peerSeq[peerKey] ?? 0;
     var maxSeq = priorSeq;
     final wasLiveEmpty = !_peerLive.containsKey(pairId);
+    // A replica may only treat absence from the source index as deletion when
+    // the index is provably the whole source: it began at sequence 0 on this
+    // session and the source flagged its final frame `complete`.
+    if (((msg['fromSequence'] as num?)?.toInt() ?? 0) == 0) {
+      _peerBaselineStarted.add(pairId);
+    }
     final live = _peerLive.putIfAbsent(pairId, () => <String, IndexEntry>{});
     final massDeleteFrame = await _isMassDeleteFrame(pair, entriesRaw);
     if (massDeleteFrame) {
@@ -3124,10 +3205,28 @@ class SyncEngine {
           'toSeq': maxSeq,
           'first': entriesRaw.isEmpty,
         });
+    var becameComplete = false;
+    var rebase = false;
     if (msg['more'] != true) {
-      _completePeerSnapshots.add(pairId);
+      if (pair.direction != SyncDirection.mirrorFromPeer) {
+        _completePeerSnapshots.add(pairId);
+      } else if (!_peerBaselineStarted.contains(pairId)) {
+        // A delta arrived without a from-scratch base (for example after our
+        // snapshot state was dropped). It is not the whole source: discard it
+        // and ask again from sequence 0 instead of deleting "missing" files.
+        _peerLive.remove(pairId);
+        _peerSeq.remove(peerKey);
+        rebase = true;
+        Diag.log('v2_mirror_rebase',
+            peer: session.peer.deviceId,
+            pairId: pairId,
+            fields: {'fromSeq': msg['fromSequence']});
+      } else if (msg['complete'] == true) {
+        becameComplete = _completePeerSnapshots.add(pairId);
+      }
     }
-    if (msg['more'] != true && (maxSeq > priorSeq || wasLiveEmpty)) {
+    if (msg['more'] != true &&
+        (maxSeq > priorSeq || wasLiveEmpty || becameComplete || rebase)) {
       await reconcile(pair, session);
     }
   }
@@ -3149,6 +3248,8 @@ class SyncEngine {
     _markPeerAccepted(pairId, session.peer.deviceId);
     final fromSeq = (msg['fromSequence'] as num?)?.toInt() ?? 0;
     if (!pair.direction.sendsChanges) {
+      // This side is not a source for the pair, so an empty answer says
+      // nothing about what the requester's folder should contain.
       session.send({
         't': Msg.indexUpdate,
         'pairId': pairId,
@@ -3156,10 +3257,18 @@ class SyncEngine {
         'entries': const <Map<String, dynamic>>[],
         'fromSequence': fromSeq,
         'more': false,
+        'complete': false,
       });
       return;
     }
     final db = await _indexDbFor(pair);
+    final peerKey = _peerKey(session.peer.deviceId, pairId);
+    final complete = _indexComplete(pair);
+    if (complete) {
+      _incompleteSent.remove(peerKey);
+    } else {
+      _incompleteSent.add(peerKey);
+    }
     // Only send rows WE wrote — the peer already has its own.
     final result = await _sendIndexDeltaFromDb(
       session,
@@ -3167,9 +3276,9 @@ class SyncEngine {
       db,
       fromSeq,
       sendEmpty: true,
+      complete: complete,
     );
     final maxSeq = result.maxSequence;
-    final peerKey = _peerKey(session.peer.deviceId, pairId);
     _sentSeq[peerKey] = maxSeq;
     Diag.log('v2_index_reply',
         peer: session.peer.deviceId,

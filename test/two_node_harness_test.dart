@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:conduit/src/net/peer_session.dart';
 import 'package:conduit/src/protocol/wire.dart';
 
 import 'support/two_node_harness.dart';
@@ -125,12 +126,60 @@ void main() {
     expect(await destination.readAsBytes(), bytes);
   });
 
+  test('mirror source folder vanishing never wipes the replica', () async {
+    final harness = await TwoNodeHarness.create();
+    addTearDown(harness.dispose);
+    await harness.start();
+    await harness.pairFresh();
+    harness.nodeA.engine.emptyListingRecheckDelay =
+        const Duration(milliseconds: 20);
+
+    final bytes = List<int>.generate(2048, (index) => index % 251);
+    final pairA = await harness.syncFile(
+      relativePath: 'keep.txt',
+      bytes: bytes,
+      direction: SyncDirection.mirrorToPeer,
+    );
+    final pairB = harness.nodeB.config.folderPairs
+        .singleWhere((pair) => pair.id == pairA.id);
+    final replica = File(
+      '${harness.nodeB.destination.path}${Platform.pathSeparator}keep.txt',
+    );
+    PeerSession? sessionA() =>
+        harness.nodeA.registry.openSessionFor(harness.nodeB.identity.deviceId);
+    PeerSession? sessionB() =>
+        harness.nodeB.registry.openSessionFor(harness.nodeA.identity.deviceId);
+
+    // The PC folder becomes unreachable (unmounted drive, renamed folder).
+    await harness.nodeA.source.delete(recursive: true);
+    await harness.nodeA.engine.reconcile(pairA, sessionA());
+    await harness.nodeB.engine.reconcile(pairB, sessionB());
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(replica.existsSync(), isTrue,
+        reason: 'an unreachable source must never read as "all deleted"');
+    expect(_sameBytes(replica.readAsBytesSync(), bytes), isTrue);
+
+    // The folder comes back unchanged: the replica is still intact.
+    await harness.nodeA.source.create(recursive: true);
+    await File('${harness.nodeA.source.path}${Platform.pathSeparator}keep.txt')
+        .writeAsBytes(bytes);
+    await harness.nodeA.engine.reconcile(pairA, sessionA());
+    await harness.nodeB.engine.reconcile(pairB, sessionB());
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(replica.existsSync(), isTrue);
+    expect(_sameBytes(replica.readAsBytesSync(), bytes), isTrue);
+  });
+
   test('authoritative mirror repairs replica drift without changing source',
       () async {
     final harness = await TwoNodeHarness.create();
     addTearDown(harness.dispose);
     await harness.start();
     await harness.pairFresh();
+    // The last step deletes the only source file; shorten the empty-listing
+    // re-verification so the test stays fast.
+    harness.nodeA.engine.emptyListingRecheckDelay =
+        const Duration(milliseconds: 20);
 
     final sourceBytes = List<int>.generate(8192, (index) => index % 251);
     final pairA = await harness.syncFile(

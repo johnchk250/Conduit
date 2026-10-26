@@ -107,12 +107,24 @@ class IndexScanner {
     int? maxFileSizeBytes,
     void Function(int signature)? onDiskSignature,
     bool authoritative = false,
+    Duration emptyListingRecheckDelay = const Duration(seconds: 3),
   }) async {
     final observations = <LocalFileObservation>[];
     final seenPaths = <String>{};
     final fingerprints = await db.localFingerprints();
 
-    final diskEntries = await _listWithStat(fs, rootPath, batchListWithStat);
+    var diskEntries = await _listWithStat(fs, rootPath, batchListWithStat);
+    if (authoritative &&
+        diskEntries.isEmpty &&
+        (await db.localLivePaths(deviceId)).isNotEmpty) {
+      // An authoritative source propagates deletions without asking anyone, so
+      // a listing that suddenly returns nothing for a folder we had indexed is
+      // verified once more before it can become a delete-everything tombstone
+      // batch. A transient glitch recovers on the second listing; a folder the
+      // user really emptied is still empty and propagates normally.
+      await Future<void>.delayed(emptyListingRecheckDelay);
+      diskEntries = await _listWithStat(fs, rootPath, batchListWithStat);
+    }
     var signatureCount = 0;
     var signatureSize = 0;
     var signatureNewest = 0;

@@ -161,6 +161,64 @@ void main() {
     expect(result.changed.every((entry) => entry.deleted), isTrue);
   });
 
+  test('authoritative scan re-lists once when a known folder lists empty',
+      () async {
+    final fs = _GlitchFs({
+      for (var i = 0; i < 12; i++) 'file_$i.txt': utf8Bytes('$i'),
+    });
+    await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      authoritative: true,
+    );
+
+    fs.emptyListings = 1; // transient glitch: first listing returns nothing
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      authoritative: true,
+      emptyListingRecheckDelay: Duration.zero,
+    );
+
+    expect(result.changed, isEmpty,
+        reason: 'a one-off empty listing must not tombstone the folder');
+    expect((await db.get('file_0.txt'))!.deleted, isFalse);
+    expect((await db.get('file_11.txt'))!.deleted, isFalse);
+  });
+
+  test('authoritative scan still propagates a folder that really was emptied',
+      () async {
+    final fs = FakeFs({
+      for (var i = 0; i < 12; i++) 'file_$i.txt': utf8Bytes('$i'),
+    });
+    await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      authoritative: true,
+    );
+
+    fs.files.clear();
+    final result = await scanner.scan(
+      fs: fs,
+      db: db,
+      rootPath: 'r',
+      deviceId: 'A',
+      authoritative: true,
+      emptyListingRecheckDelay: Duration.zero,
+    );
+
+    expect(result.blockedDeletionCount, 0,
+        reason: 'no manual approval for a deliberate delete-all');
+    expect(result.changed.length, 12);
+    expect(result.changed.every((entry) => entry.deleted), isTrue);
+  });
+
   test('authoritative scans reuse unchanged size and mtime fingerprints',
       () async {
     final fs = FakeFs({'same.txt': utf8Bytes('first')});
@@ -386,4 +444,20 @@ class FakeFs implements FileSystemAccess {
   @override
   Future<String> moveToVault(String rootPath, String relPath) async =>
       throw UnsupportedError('not needed in scanner tests');
+}
+
+/// [FakeFs] whose next [emptyListings] listings come back empty, simulating a
+/// transient unreadable-folder glitch.
+class _GlitchFs extends FakeFs {
+  _GlitchFs(super.files);
+  int emptyListings = 0;
+
+  @override
+  Future<List<String>> listFiles(String rootPath) async {
+    if (emptyListings > 0) {
+      emptyListings--;
+      return const <String>[];
+    }
+    return super.listFiles(rootPath);
+  }
 }
